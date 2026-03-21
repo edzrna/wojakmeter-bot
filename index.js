@@ -29,6 +29,14 @@ const COIN_MAP = {
   floki: "floki"
 };
 
+let cache = {
+  mood: null,
+  moodTimestamp: 0,
+  coins: new Map()
+};
+
+const CACHE_TIME = 30000;
+
 async function fetchJson(url) {
   const res = await fetch(url, {
     headers: { accept: "application/json" }
@@ -39,58 +47,6 @@ async function fetchJson(url) {
   }
 
   return res.json();
-}
-
-async function getMarketMood() {
-  const json = await fetchJson("https://api.coingecko.com/api/v3/global");
-  const data = json?.data;
-
-  if (!data) {
-    throw new Error("Invalid CoinGecko response");
-  }
-
-  const change = Number(data.market_cap_change_percentage_24h_usd ?? 0);
-  const volume = Number(data.total_volume?.usd ?? 0);
-
-  let mood = "Neutral 😐";
-  let description = "Market waiting... no conviction.";
-
-  if (change > 3) {
-    mood = "Euphoria 🚀";
-    description = "Everyone is a genius.";
-  } else if (change > 1) {
-    mood = "Optimism 🙂";
-    description = "Dip buyers winning.";
-  } else if (change > -1) {
-    mood = "Neutral 😐";
-    description = "No clear direction.";
-  } else if (change > -3) {
-    mood = "Concern ⚠️";
-    description = "People getting nervous.";
-  } else {
-    mood = "Frustration 😡";
-    description = "Pain everywhere.";
-  }
-
-  return { mood, change, volume, description };
-}
-
-async function getCoinData(input) {
-  const normalized = String(input || "").trim().toLowerCase();
-  const coinId = COIN_MAP[normalized] || normalized;
-
-  const url =
-    `https://api.coingecko.com/api/v3/coins/markets` +
-    `?vs_currency=usd&ids=${encodeURIComponent(coinId)}` +
-    `&price_change_percentage=1h,24h,7d`;
-
-  const data = await fetchJson(url);
-
-  if (!Array.isArray(data) || data.length === 0) {
-    throw new Error("Coin not found");
-  }
-
-  return data[0];
 }
 
 function formatUsd(value) {
@@ -116,6 +72,96 @@ function formatCompactUsd(value) {
 function formatPercent(value) {
   if (value == null || Number.isNaN(value)) return "--";
   return `${value >= 0 ? "+" : ""}${Number(value).toFixed(2)}%`;
+}
+
+async function getMarketMood() {
+  const now = Date.now();
+
+  if (cache.mood && now - cache.moodTimestamp < CACHE_TIME) {
+    return cache.mood;
+  }
+
+  try {
+    const json = await fetchJson("https://api.coingecko.com/api/v3/global");
+    const data = json?.data;
+
+    if (!data) {
+      throw new Error("Invalid CoinGecko response");
+    }
+
+    const change = Number(data.market_cap_change_percentage_24h_usd ?? 0);
+    const volume = Number(data.total_volume?.usd ?? 0);
+
+    let mood = "Neutral 😐";
+    let description = "Market waiting... no conviction.";
+
+    if (change > 3) {
+      mood = "Euphoria 🚀";
+      description = "Everyone is a genius.";
+    } else if (change > 1) {
+      mood = "Optimism 🙂";
+      description = "Dip buyers winning.";
+    } else if (change > -1) {
+      mood = "Neutral 😐";
+      description = "No clear direction.";
+    } else if (change > -3) {
+      mood = "Concern ⚠️";
+      description = "People getting nervous.";
+    } else {
+      mood = "Frustration 😡";
+      description = "Pain everywhere.";
+    }
+
+    const result = { mood, change, volume, description };
+
+    cache.mood = result;
+    cache.moodTimestamp = now;
+
+    return result;
+  } catch (error) {
+    if (cache.mood) {
+      return cache.mood;
+    }
+    throw error;
+  }
+}
+
+async function getCoinData(input) {
+  const normalized = String(input || "").trim().toLowerCase();
+  const coinId = COIN_MAP[normalized] || normalized;
+  const now = Date.now();
+
+  const cachedCoin = cache.coins.get(coinId);
+  if (cachedCoin && now - cachedCoin.timestamp < CACHE_TIME) {
+    return cachedCoin.data;
+  }
+
+  const url =
+    `https://api.coingecko.com/api/v3/coins/markets` +
+    `?vs_currency=usd&ids=${encodeURIComponent(coinId)}` +
+    `&price_change_percentage=1h,24h,7d`;
+
+  try {
+    const data = await fetchJson(url);
+
+    if (!Array.isArray(data) || data.length === 0) {
+      throw new Error("Coin not found");
+    }
+
+    const coin = data[0];
+
+    cache.coins.set(coinId, {
+      data: coin,
+      timestamp: now
+    });
+
+    return coin;
+  } catch (error) {
+    if (cachedCoin) {
+      return cachedCoin.data;
+    }
+    throw error;
+  }
 }
 
 bot.onText(/^\/start$/, async (msg) => {
@@ -245,4 +291,3 @@ bot.on("polling_error", (error) => {
 });
 
 console.log("WojakMeter bot running...");
-
