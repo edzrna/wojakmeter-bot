@@ -292,3 +292,4 @@ bot.on("polling_error", (error) => {
 
 console.log("WojakMeter bot running...");
 
+
