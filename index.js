@@ -1,60 +1,68 @@
-import { Telegraf } from "telegraf";
-import fetch from "node-fetch";
-import dotenv from "dotenv";
+import TelegramBot from "node-telegram-bot-api";
 
-dotenv.config();
+const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
-
-const API_BASE = process.env.API_BASE_URL || "https://wojakmeter.com/api";
-
-bot.start((ctx) => {
-  ctx.reply(`🔥 Welcome to WojakMeter
-
-Use:
-/mood → Market mood
-/btc → BTC stats`);
-});
-
-bot.command("mood", async (ctx) => {
+// 🔥 Fetch global crypto data
+async function getMarketMood() {
   try {
-    const res = await fetch(`${API_BASE}/global`);
+    const res = await fetch("https://api.coingecko.com/api/v3/global");
     const data = await res.json();
 
     const change = data.data.market_cap_change_percentage_24h_usd || 0;
-    const score = Math.round(50 + change * 10);
 
     let mood = "Neutral";
-    if (score >= 70) mood = "Optimism";
-    if (score >= 85) mood = "Euphoria";
-    if (score < 45) mood = "Doubt";
-    if (score < 35) mood = "Concern";
-    if (score < 20) mood = "Frustration";
 
-    ctx.reply(`📊 Market Mood: ${mood} (${score}/100)
+    if (change > 3) mood = "Euphoria 🚀";
+    else if (change > 1) mood = "Optimism 🙂";
+    else if (change > -1) mood = "Neutral 😐";
+    else if (change > -3) mood = "Concern ⚠️";
+    else mood = "Frustration 😡";
 
-📉 Change: ${change.toFixed(2)}%`);
-  } catch {
-    ctx.reply("⚠️ Error fetching mood");
+    return {
+      mood,
+      change,
+      volume: data.data.total_volume.usd
+    };
+  } catch (err) {
+    console.error(err);
+    return null;
   }
+}
+
+// 🚀 COMMANDS
+
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(msg.chat.id, "WojakMeter Bot Activated 🚀");
 });
 
-bot.command("btc", async (ctx) => {
+bot.onText(/\/mood/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  const market = await getMarketMood();
+
+  if (!market) {
+    return bot.sendMessage(chatId, "⚠️ Error fetching market data");
+  }
+
+  bot.sendMessage(
+    chatId,
+    `🧠 Market Mood: ${market.mood}
+📉 Change: ${market.change.toFixed(2)}%
+💰 Volume: $${(market.volume / 1e9).toFixed(2)}B`
+  );
+});
+
+bot.onText(/\/btc/, async (msg) => {
+  const chatId = msg.chat.id;
+
   try {
-    const res = await fetch(`${API_BASE}/top-coins`);
+    const res = await fetch(
+      "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
+    );
     const data = await res.json();
 
-    const btc = data.coins.find(c => c.symbol === "btc");
-
-    ctx.reply(`₿ BTC
-
-💰 Price: $${btc.current_price}
-📊 24h: ${btc.price_change_percentage_24h_in_currency.toFixed(2)}%`);
+    bot.sendMessage(chatId, `₿ BTC Price: $${data.bitcoin.usd}`);
   } catch {
-    ctx.reply("⚠️ Error fetching BTC");
+    bot.sendMessage(chatId, "Error fetching BTC price");
   }
 });
-
-bot.launch();
-
-console.log("🚀 Bot running...");
