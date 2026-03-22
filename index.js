@@ -1,4 +1,4 @@
-require("dotenv").config();
+8require("dotenv").config();
 const { Telegraf, Markup } = require("telegraf");
 
 // ===============================
@@ -563,11 +563,10 @@ setInterval(async () => {
 // START
 // ===============================
 (async () => {
-  await warmUpCache();
+  // inicia el bot inmediatamente
   await bot.launch();
   console.log("WojakMeter bot running...");
-})();
 
-// Cierre limpio
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+  // luego carga cache en background
+  warmUpCache().catch(console.error);
+})();
