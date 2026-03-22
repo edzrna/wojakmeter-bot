@@ -11,31 +11,71 @@ if (!token) {
 
 const bot = new TelegramBot(token, { polling: true });
 
-const COIN_MAP = {
-  btc: "bitcoin",
-  eth: "ethereum",
-  sol: "solana",
-  xrp: "ripple",
-  bnb: "binancecoin",
-  ada: "cardano",
-  doge: "dogecoin",
-  ton: "the-open-network",
-  avax: "avalanche-2",
-  trx: "tron",
-  pepe: "pepe",
-  shib: "shiba-inu",
-  wif: "dogwifcoin",
-  bonk: "bonk",
-  floki: "floki"
-};
+const CACHE_TIME = 30000;
+const ALERT_INTERVAL = 60000;
 
 let cache = {
   mood: null,
   moodTimestamp: 0,
-  coins: new Map()
+  top: null,
+  topTimestamp: 0
 };
 
-const CACHE_TIME = 30000;
+const alertSubscribers = new Set();
+
+let alertState = {
+  lastMoodKey: null,
+  lastScore: null
+};
+
+function clamp(num, min, max) {
+  return Math.max(min, Math.min(max, num));
+}
+
+function scoreFromChange(change) {
+  return Math.round(clamp(50 + change * 10, 0, 100));
+}
+
+function getMoodKey(score) {
+  if (score >= 85) return "euphoria";
+  if (score >= 70) return "content";
+  if (score >= 60) return "optimism";
+  if (score >= 45) return "neutral";
+  if (score >= 35) return "doubt";
+  if (score >= 20) return "concern";
+  return "frustration";
+}
+
+function getWojakMood(score) {
+  if (score >= 85) return { name: "Euphoria", emoji: "🚀" };
+  if (score >= 70) return { name: "Content", emoji: "😌" };
+  if (score >= 60) return { name: "Optimism", emoji: "🙂" };
+  if (score >= 45) return { name: "Neutral", emoji: "😐" };
+  if (score >= 35) return { name: "Doubt", emoji: "🤨" };
+  if (score >= 20) return { name: "Concern", emoji: "😰" };
+  return { name: "Frustration", emoji: "😡" };
+}
+
+function buildBar(score) {
+  const total = 10;
+  const filled = Math.round((score / 100) * total);
+  return `[${"█".repeat(filled)}${"░".repeat(total - filled)}] ${score}`;
+}
+
+function formatPercent(value) {
+  if (!Number.isFinite(value)) return "--";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
+
+function formatUsd(value) {
+  if (!Number.isFinite(value)) return "--";
+  return `$${Number(value).toLocaleString()}`;
+}
+
+function formatVolume(v) {
+  if (!Number.isFinite(v)) return "--";
+  return `$${Math.round(v / 1e9)}B`;
+}
 
 async function fetchJson(url) {
   const res = await fetch(url, {
@@ -49,31 +89,6 @@ async function fetchJson(url) {
   return res.json();
 }
 
-function formatUsd(value) {
-  if (value == null || Number.isNaN(value)) return "--";
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: value >= 1000 ? 0 : 2
-  }).format(value);
-}
-
-function formatCompactUsd(value) {
-  if (value == null || Number.isNaN(value)) return "--";
-  const abs = Math.abs(value);
-
-  if (abs >= 1e12) return `$${(value / 1e12).toFixed(2)}T`;
-  if (abs >= 1e9) return `$${(value / 1e9).toFixed(2)}B`;
-  if (abs >= 1e6) return `$${(value / 1e6).toFixed(2)}M`;
-  if (abs >= 1e3) return `$${(value / 1e3).toFixed(2)}K`;
-  return `$${Number(value).toFixed(2)}`;
-}
-
-function formatPercent(value) {
-  if (value == null || Number.isNaN(value)) return "--";
-  return `${value >= 0 ? "+" : ""}${Number(value).toFixed(2)}%`;
-}
-
 async function getMarketMood() {
   const now = Date.now();
 
@@ -83,213 +98,199 @@ async function getMarketMood() {
 
   try {
     const json = await fetchJson("https://api.coingecko.com/api/v3/global");
-    const data = json?.data;
+    const data = json.data;
 
-    if (!data) {
-      throw new Error("Invalid CoinGecko response");
-    }
+    const change = Number(data.market_cap_change_percentage_24h_usd || 0);
+    const volume = Number(data.total_volume.usd || 0);
 
-    const change = Number(data.market_cap_change_percentage_24h_usd ?? 0);
-    const volume = Number(data.total_volume?.usd ?? 0);
+    const score = scoreFromChange(change);
+    const mood = getWojakMood(score);
 
-    let mood = "Neutral 😐";
-    let description = "Market waiting... no conviction.";
-
-    if (change > 3) {
-      mood = "Euphoria 🚀";
-      description = "Everyone is a genius.";
-    } else if (change > 1) {
-      mood = "Optimism 🙂";
-      description = "Dip buyers winning.";
-    } else if (change > -1) {
-      mood = "Neutral 😐";
-      description = "No clear direction.";
-    } else if (change > -3) {
-      mood = "Concern ⚠️";
-      description = "People getting nervous.";
-    } else {
-      mood = "Frustration 😡";
-      description = "Pain everywhere.";
-    }
-
-    const result = { mood, change, volume, description };
+    const result = {
+      ...mood,
+      score,
+      change,
+      volume,
+      description: "Market reacting to price + macro"
+    };
 
     cache.mood = result;
     cache.moodTimestamp = now;
 
     return result;
   } catch (error) {
-    if (cache.mood) {
-      return cache.mood;
-    }
+    if (cache.mood) return cache.mood;
     throw error;
   }
 }
 
-async function getCoinData(input) {
-  const normalized = String(input || "").trim().toLowerCase();
-  const coinId = COIN_MAP[normalized] || normalized;
+async function getTopCoins() {
   const now = Date.now();
 
-  const cachedCoin = cache.coins.get(coinId);
-  if (cachedCoin && now - cachedCoin.timestamp < CACHE_TIME) {
-    return cachedCoin.data;
+  if (cache.top && now - cache.topTimestamp < CACHE_TIME) {
+    return cache.top;
   }
 
-  const url =
-    `https://api.coingecko.com/api/v3/coins/markets` +
-    `?vs_currency=usd&ids=${encodeURIComponent(coinId)}` +
-    `&price_change_percentage=1h,24h,7d`;
-
   try {
-    const data = await fetchJson(url);
+    const coins = await fetchJson(
+      "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=10&page=1&price_change_percentage=24h"
+    );
 
-    if (!Array.isArray(data) || data.length === 0) {
-      throw new Error("Coin not found");
-    }
+    cache.top = coins;
+    cache.topTimestamp = now;
 
-    const coin = data[0];
-
-    cache.coins.set(coinId, {
-      data: coin,
-      timestamp: now
-    });
-
-    return coin;
+    return coins;
   } catch (error) {
-    if (cachedCoin) {
-      return cachedCoin.data;
-    }
+    if (cache.top) return cache.top;
     throw error;
   }
 }
 
-bot.onText(/^\/start$/, async (msg) => {
-  await bot.sendMessage(
+bot.onText(/^\/start$/, (msg) => {
+  bot.sendMessage(
     msg.chat.id,
-    `WojakMeter Bot Activated 🚀
+    `🚀 WojakMeter Bot
 
-Use:
- /mood
- /btc
- /eth
- /sol
- /coin btc
- /coin ethereum
- /coin pepe`
+/mood
+/top
+/alerts_on
+/alerts_off
+
+Or send:
+🤔 😐 🙂 😰 😡 😌 🚀`
   );
 });
 
 bot.onText(/^\/mood$/, async (msg) => {
   try {
-    const market = await getMarketMood();
+    const m = await getMarketMood();
 
     await bot.sendMessage(
       msg.chat.id,
-      `🧠 ${market.mood}
-📉 Change: ${formatPercent(market.change)}
-💰 Volume: ${formatCompactUsd(market.volume)}
+      `🧠 ${m.name} ${m.emoji}
+📉 ${formatPercent(m.change)}
+💰 ${formatVolume(m.volume)}
+${buildBar(m.score)}
 
-"${market.description}"`
+"${m.description}"`
     );
   } catch (error) {
-    await bot.sendMessage(
-      msg.chat.id,
-      `⚠️ Error fetching market data: ${error.message}`
-    );
+    bot.sendMessage(msg.chat.id, `⚠️ Error fetching market mood: ${error.message}`);
   }
 });
 
-bot.onText(/^\/btc$/, async (msg) => {
+bot.onText(/^\/top$/, async (msg) => {
   try {
-    const coin = await getCoinData("btc");
+    const coins = await getTopCoins();
 
-    await bot.sendMessage(
-      msg.chat.id,
-      `₿ BTC
-💰 Price: ${formatUsd(coin.current_price)}
-📈 24h: ${formatPercent(coin.price_change_percentage_24h_in_currency ?? coin.price_change_percentage_24h)}`
-    );
+    let text = "🧠 WOJAKMETER TOP 10\n\n";
+
+    coins.forEach((c, i) => {
+      const change = Number(c.price_change_percentage_24h || 0);
+      const score = scoreFromChange(change);
+      const mood = getWojakMood(score);
+
+      text += `${i + 1}. ${mood.emoji} ${c.symbol.toUpperCase()}
+💰 ${formatUsd(c.current_price)} ${formatPercent(change)}
+${buildBar(score)}\n\n`;
+    });
+
+    bot.sendMessage(msg.chat.id, text);
   } catch (error) {
-    await bot.sendMessage(
-      msg.chat.id,
-      `⚠️ Error fetching BTC price: ${error.message}`
-    );
+    bot.sendMessage(msg.chat.id, `⚠️ Error loading top coins: ${error.message}`);
   }
 });
 
-bot.onText(/^\/eth$/, async (msg) => {
-  try {
-    const coin = await getCoinData("eth");
+const EMOJI_MAP = {
+  "🚀": "euphoria",
+  "😌": "content",
+  "🙂": "optimism",
+  "😐": "neutral",
+  "🤨": "doubt",
+  "😰": "concern",
+  "😡": "frustration"
+};
 
-    await bot.sendMessage(
-      msg.chat.id,
-      `🟦 ETH
-💰 Price: ${formatUsd(coin.current_price)}
-📈 24h: ${formatPercent(coin.price_change_percentage_24h_in_currency ?? coin.price_change_percentage_24h)}`
-    );
-  } catch (error) {
-    await bot.sendMessage(
-      msg.chat.id,
-      `⚠️ Error fetching ETH price: ${error.message}`
-    );
-  }
-});
-
-bot.onText(/^\/sol$/, async (msg) => {
-  try {
-    const coin = await getCoinData("sol");
-
-    await bot.sendMessage(
-      msg.chat.id,
-      `🟣 SOL
-💰 Price: ${formatUsd(coin.current_price)}
-📈 24h: ${formatPercent(coin.price_change_percentage_24h_in_currency ?? coin.price_change_percentage_24h)}`
-    );
-  } catch (error) {
-    await bot.sendMessage(
-      msg.chat.id,
-      `⚠️ Error fetching SOL price: ${error.message}`
-    );
-  }
-});
-
-bot.onText(/^\/coin(?:\s+(.+))?$/, async (msg, match) => {
-  const query = match?.[1]?.trim();
-
-  if (!query) {
-    await bot.sendMessage(
-      msg.chat.id,
-      "Use it like this:\n/coin btc\n/coin ethereum\n/coin pepe"
-    );
-    return;
-  }
+bot.on("message", async (msg) => {
+  const moodKey = EMOJI_MAP[msg.text];
+  if (!moodKey) return;
 
   try {
-    const coin = await getCoinData(query);
+    const coins = await getTopCoins();
 
-    await bot.sendMessage(
-      msg.chat.id,
-      `🪙 ${coin.symbol.toUpperCase()} — ${coin.name}
-💰 Price: ${formatUsd(coin.current_price)}
-📈 1h: ${formatPercent(coin.price_change_percentage_1h_in_currency)}
-📊 24h: ${formatPercent(coin.price_change_percentage_24h_in_currency ?? coin.price_change_percentage_24h)}
-🗓 7d: ${formatPercent(coin.price_change_percentage_7d_in_currency)}
-🏦 Market Cap: ${formatCompactUsd(coin.market_cap)}
-💧 Volume: ${formatCompactUsd(coin.total_volume)}`
-    );
+    const filtered = coins.filter((c) => {
+      const score = scoreFromChange(c.price_change_percentage_24h || 0);
+      return getMoodKey(score) === moodKey;
+    });
+
+    if (!filtered.length) {
+      return bot.sendMessage(msg.chat.id, `${msg.text} No coins in this mood`);
+    }
+
+    let text = `${msg.text} Coins\n\n`;
+
+    filtered.forEach((c) => {
+      const change = Number(c.price_change_percentage_24h || 0);
+      const score = scoreFromChange(change);
+
+      text += `${c.symbol.toUpperCase()} ${formatPercent(change)}
+${buildBar(score)}\n\n`;
+    });
+
+    bot.sendMessage(msg.chat.id, text);
   } catch (error) {
-    await bot.sendMessage(
-      msg.chat.id,
-      `❌ Coin not found: ${query}`
-    );
+    bot.sendMessage(msg.chat.id, `⚠️ Error filtering coins: ${error.message}`);
   }
 });
 
-bot.on("polling_error", (error) => {
-  console.error("Polling error:", error.message);
+bot.onText(/^\/alerts_on$/, (msg) => {
+  alertSubscribers.add(msg.chat.id);
+  bot.sendMessage(msg.chat.id, "🔔 Alerts ON");
 });
 
-console.log("WojakMeter bot running...");
+bot.onText(/^\/alerts_off$/, (msg) => {
+  alertSubscribers.delete(msg.chat.id);
+  bot.sendMessage(msg.chat.id, "🔕 Alerts OFF");
+});
 
+async function checkAlerts() {
+  try {
+    if (alertSubscribers.size === 0) return;
 
+    const m = await getMarketMood();
+    const key = getMoodKey(m.score);
+
+    if (!alertState.lastMoodKey) {
+      alertState.lastMoodKey = key;
+      alertState.lastScore = m.score;
+      return;
+    }
+
+    if (key !== alertState.lastMoodKey) {
+      const prev = getWojakMood(alertState.lastScore || 50);
+
+      for (const chatId of alertSubscribers) {
+        await bot.sendMessage(
+          chatId,
+          `🚨 Market Mood Change
+
+${prev.name} → ${m.name} ${m.emoji}
+${buildBar(m.score)}`
+        );
+      }
+
+      alertState.lastMoodKey = key;
+      alertState.lastScore = m.score;
+    }
+  } catch (error) {
+    console.error("Alert error:", error.message);
+  }
+}
+
+setInterval(checkAlerts, ALERT_INTERVAL);
+
+bot.on("polling_error", (err) => {
+  console.error("Polling error:", err.message);
+});
+
+console.log("🔥 WojakMeter bot running...");
