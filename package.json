@@ -1,14 +1,14 @@
 {
   "name": "wojakmeter-bot",
   "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "main": "index.js",
+  "description": "Telegram bot for WojakMeter crypto moods",
+  "main": "bot.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node bot.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
-    "node-telegram-bot-api": "^0.66.0"
+    "telegraf": "^4.16.3"
   }
 }
