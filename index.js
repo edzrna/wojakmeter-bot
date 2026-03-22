@@ -29,7 +29,7 @@ const GLOBAL_CACHE_TTL = 2 * 60 * 1000;   // 2 min
 
 // Cooldown por usuario para evitar spam
 const userCooldowns = new Map();
-const USER_COOLDOWN_MS = 3500;
+const USER_COOLDOWN_MS = 800;
 
 // ===============================
 // EMOTION MAP
