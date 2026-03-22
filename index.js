@@ -490,42 +490,33 @@ bot.command("losers", sendTopLosers);
 // ===============================
 // TEXT / BUTTON HANDLERS
 // ===============================
+
 bot.on("text", async (ctx) => {
-  const userId = ctx.from?.id;
   const text = (ctx.message?.text || "").trim();
 
-  if (userId && isUserCoolingDown(userId)) {
-    return ctx.reply("⏳ Slow down a bit. Try again in a moment.");
+  if (text.includes("Market")) {
+    return sendMarketOverview(ctx);
+  }
+
+  if (text.includes("Trending")) {
+    return sendTrending(ctx);
+  }
+
+  if (text.includes("Top Gainers")) {
+    return sendTopGainers(ctx);
+  }
+
+  if (text.includes("Top Losers")) {
+    return sendTopLosers(ctx);
   }
 
   if (EMOJI_SET.has(text)) {
     return sendEmotionCoins(ctx, text);
   }
 
-  if (text === "📊 Market") {
-    return sendMarketOverview(ctx);
-  }
-
-  if (text === "🔥 Trending") {
-    return sendTrending(ctx);
-  }
-
-  if (text === "🚀 Top Gainers") {
-    return sendTopGainers(ctx);
-  }
-
-  if (text === "💥 Top Losers") {
-    return sendTopLosers(ctx);
-  }
-
-  return ctx.reply(
-    `🤖 Send an emotion emoji or use the keyboard.\n\n` +
-    `Supported: 🤯 😎 🙂 🤔 😟 😰 😡`,
-    {
-      reply_markup: buildMainKeyboard().reply_markup
-    }
-  );
+  return ctx.reply("Send an emotion or use the buttons.");
 });
+  
 
 // ===============================
 // SAFETY
