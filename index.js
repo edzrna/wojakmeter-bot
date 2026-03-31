@@ -851,3 +851,17 @@ bot.command("testchannel", async (ctx) => {
     await ctx.reply(`Channel error: ${err.message}`);
   }
 });
+
+bot.command("testchannel", async (ctx) => {
+  try {
+    await bot.telegram.sendMessage(
+      process.env.TELEGRAM_CHANNEL_ID,
+      "✅ WojakMeter connected to channel"
+    );
+
+    await ctx.reply("Sent to channel 🚀");
+  } catch (err) {
+    console.error(err);
+    await ctx.reply(`Channel error: ${err.message}`);
+  }
+});
