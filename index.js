@@ -575,3 +575,14 @@ app.listen(PORT, "0.0.0.0", () => {
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
+
+bot.on("sticker", async (ctx) => {
+  const fileId = ctx.message.sticker.file_id;
+
+  console.log("Sticker file_id:", fileId);
+
+  await ctx.reply(
+    `📌 Sticker guardado:\n\n<code>${fileId}</code>`,
+    { parse_mode: "HTML" }
+  );
+});
