@@ -841,3 +841,13 @@ app.listen(PORT, "0.0.0.0", () => {
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
+
+bot.command("testchannel", async (ctx) => {
+  try {
+    await bot.telegram.sendMessage(process.env.TELEGRAM_CHANNEL_ID, "✅ Channel connection test");
+    await ctx.reply("Sent to channel.");
+  } catch (err) {
+    console.error(err);
+    await ctx.reply(`Channel error: ${err.message}`);
+  }
+});
