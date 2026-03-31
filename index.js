@@ -444,15 +444,50 @@ async function sendTopLosers(ctx) {
 
 async function sendTrending(ctx) {
   try {
-    const [trending, markets] = await Promise.all([getTrending(), getMarkets()]);
-    const marketMap = new Map(markets.map((coin) => [(coin.id || "").toLowerCase(), coin]));
-    const text = formatTrendingBlock(trending, marketMap);
+    const [trending, markets] = await Promise.all([
+      getTrending(),
+      getMarkets()
+    ]);
+
+    const marketMap = new Map(
+      markets.map((coin) => [(coin.id || "").toLowerCase(), coin])
+    );
+
+    // 🔥 calcular emoción promedio del trending
+    let totalChange = 0;
+    let count = 0;
+
+    const coins = trending?.coins || [];
+
+    coins.forEach((entry) => {
+      const item = entry.item || {};
+      const marketCoin = marketMap.get((item.id || "").toLowerCase());
+
+      if (marketCoin?.price_change_percentage_24h != null) {
+        totalChange += marketCoin.price_change_percentage_24h;
+        count++;
+      }
+    });
+
+    const avgChange = count ? totalChange / count : 0;
+
+    const emotion = getEmotionByChange(avgChange);
+
+    // 🔥 STICKER PRIMERO
+    await sendEmotionSticker(ctx, emotion.key);
+
+    // 🔥 TEXTO
+    const text =
+      `🔥 <b>Trending Coins</b>\n\n` +
+      `🧠 Mood: <b>${emotion.label}</b>\n\n` +
+      formatTrendingBlock(trending, marketMap);
 
     return ctx.reply(text, {
       parse_mode: "HTML",
       disable_web_page_preview: true,
       reply_markup: buildMainKeyboard().reply_markup
     });
+
   } catch (error) {
     return replyWithError(ctx, error, "Error trending");
   }
