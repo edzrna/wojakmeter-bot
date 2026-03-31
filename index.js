@@ -181,10 +181,13 @@ function buildMainKeyboard() {
     ["🚀 Top Gainers", "💥 Top Losers"],
     ["🤩", "😌", "🙂", "😐"],
     ["🤔", "😟", "😡"],
-    ["/start", "/help", "/teststicker"]
+    ["/start", "/help", "/teststicker", "/testchannel"]
   ]).resize();
 }
 
+// ===============================
+// TELEGRAM SENDERS
+// ===============================
 async function sendEmotionSticker(ctx, emotionKey) {
   const sticker = STICKERS[emotionKey];
   if (!sticker) return;
@@ -733,6 +736,24 @@ bot.command("teststicker", async (ctx) => {
   }
 });
 
+bot.command("testchannel", async (ctx) => {
+  try {
+    await bot.telegram.sendMessage(
+      process.env.TELEGRAM_CHANNEL_ID,
+      "✅ WojakMeter connected to channel"
+    );
+
+    await ctx.reply("Sent to channel 🚀", {
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  } catch (err) {
+    console.error("testchannel error:", err);
+    await ctx.reply(`Channel error: ${err.message}`, {
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  }
+});
+
 // ===============================
 // OPTIONAL: STICKER FILE_ID CAPTURE
 // ===============================
@@ -758,6 +779,8 @@ bot.on("text", async (ctx) => {
   if (userId && isUserCoolingDown(userId)) return;
 
   const text = (ctx.message?.text || "").trim();
+
+  if (text.startsWith("/")) return;
 
   if (text.includes("Market")) return sendMarketOverview(ctx);
   if (text.includes("Trending")) return sendTrending(ctx);
@@ -841,27 +864,3 @@ app.listen(PORT, "0.0.0.0", () => {
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
-
-bot.command("testchannel", async (ctx) => {
-  try {
-    await bot.telegram.sendMessage(process.env.TELEGRAM_CHANNEL_ID, "✅ Channel connection test");
-    await ctx.reply("Sent to channel.");
-  } catch (err) {
-    console.error(err);
-    await ctx.reply(`Channel error: ${err.message}`);
-  }
-});
-
-bot.command("testchannel", async (ctx) => {
-  try {
-    await bot.telegram.sendMessage(
-      process.env.TELEGRAM_CHANNEL_ID,
-      "✅ WojakMeter connected to channel"
-    );
-
-    await ctx.reply("Sent to channel 🚀");
-  } catch (err) {
-    console.error(err);
-    await ctx.reply(`Channel error: ${err.message}`);
-  }
-});
