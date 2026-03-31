@@ -53,6 +53,26 @@ const EMOTION_CONFIG = [
 const EMOJI_SET = new Set(EMOTION_CONFIG.map((x) => x.emoji));
 
 // ===============================
+// STICKERS
+// ===============================
+const STICKERS = {
+  neutral:
+    "CAACAgEAAyEFAATmxqKVAAMOacqfUf3DRg38M5qkF5xEj7Yfy9wAApsHAALr6vlFgB1nkRz_pCE6BA",
+  doubt:
+    "CAACAgEAAyEFAATmxqKVAAMRacszmrKnW5boElS5jTdyqyyXYg4AAsUIAAJR3QFGLjvJYqtHGhs6BA",
+  concern:
+    "CAACAgEAAxkBAAO6acwnkAR8NX71iBqA8bAMpA9urO8AAogFAAJjiAFGAq6TbPTFdlk6BA",
+  frustration:
+    "CAACAgEAAxkBAAO8acwnksdZ-MrbFXq4D00oMo7UATgAAgYHAAIDbvhFuGNc3FD6Lp06BA",
+  optimism:
+    "CAACAgEAAyEFAATmxqKVAAMMacoQtkrNsG_LbVCu8mCwBMXUGg8AAuwIAAJu1PhFv1J4NpRaVTw6BA",
+  content:
+    "CAACAgEAAxkBAAPAacwnmJisGL8Y0D5VsjFwAWyAbZ4AAkoHAAIS0fhFDFuW0lJ-yoA6BA",
+  euphoria:
+    "CAACAgEAAxkBAAPCacwnmnVuXSZUWgrr8k_bMQuzqgIAAigHAALfhPlFr0lV7KnXvGE6BA",
+};
+
+// ===============================
 // HELPERS
 // ===============================
 function sleep(ms) {
@@ -123,6 +143,19 @@ function buildMainKeyboard() {
     ["😟", "😰", "😡"],
     ["/start", "/help"]
   ]).resize();
+}
+
+async function sendEmotionSticker(ctx, emotionKey) {
+  const sticker = STICKERS[emotionKey];
+  if (!sticker) return;
+
+  try {
+    await ctx.replyWithSticker(sticker, {
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  } catch (e) {
+    console.error("Sticker error:", e.message);
+  }
 }
 
 // ===============================
@@ -279,14 +312,15 @@ function formatMarketOverview(globalData) {
   const emotion = getEmotionByChange(change);
 
   return (
-    `🌍 <b>WojakMeter Market Overview</b>\n\n` +
-    `${emotion.emoji} Mood: <b>${emotion.label}</b>\n` +
+    `🧠 <b>WojakMeter Market Mood</b>\n\n` +
+    `${emotion.emoji} <b>${emotion.label}</b>\n\n` +
+    `📊 24h Change: <b>${formatPercent(change)}</b>\n` +
     `💰 Market Cap: <b>${formatUsd(totalMcap)}</b>\n` +
-    `📊 24h Move: <b>${formatPercent(change)}</b>\n` +
     `💸 Volume 24h: <b>${formatUsd(totalVol)}</b>\n` +
     `₿ BTC Dominance: <b>${btcDom.toFixed(2)}%</b>\n` +
     `🪙 Active Coins: <b>${active}</b>\n` +
-    `🏦 Markets: <b>${markets}</b>`
+    `🏦 Markets: <b>${markets}</b>\n\n` +
+    `⚡ The market is feeling <b>${emotion.label.toLowerCase()}</b>.`
   );
 }
 
@@ -427,6 +461,14 @@ async function sendTrending(ctx) {
 async function sendMarketOverview(ctx) {
   try {
     const global = await getGlobal();
+    const data = global?.data || {};
+    const change = data.market_cap_change_percentage_24h_usd ?? 0;
+
+    const emotion = getEmotionByChange(change);
+
+    // Sticker primero
+    await sendEmotionSticker(ctx, emotion.key);
+
     const text = formatMarketOverview(global);
 
     return ctx.reply(text, {
@@ -491,6 +533,27 @@ bot.command("market", sendMarketOverview);
 bot.command("trending", sendTrending);
 bot.command("gainers", sendTopGainers);
 bot.command("losers", sendTopLosers);
+bot.command("id", async (ctx) => {
+  await ctx.reply(`Chat ID: <code>${ctx.chat.id}</code>`, {
+    parse_mode: "HTML",
+    reply_markup: buildMainKeyboard().reply_markup
+  });
+});
+
+// ===============================
+// TEMP: STICKER FILE_ID CAPTURE
+// Puedes quitar esto después si ya no lo necesitas
+// ===============================
+bot.on("sticker", async (ctx) => {
+  const fileId = ctx.message.sticker.file_id;
+
+  console.log("Sticker file_id:", fileId);
+
+  await ctx.reply(
+    `📌 Sticker guardado:\n\n<code>${fileId}</code>`,
+    { parse_mode: "HTML" }
+  );
+});
 
 // ===============================
 // TEXT / BUTTON HANDLERS
@@ -505,7 +568,13 @@ bot.on("text", async (ctx) => {
   if (text.includes("Trending")) return sendTrending(ctx);
   if (text.includes("Top Gainers")) return sendTopGainers(ctx);
   if (text.includes("Top Losers")) return sendTopLosers(ctx);
-  if (EMOJI_SET.has(text)) return sendEmotionCoins(ctx, text);
+
+  if (EMOJI_SET.has(text)) {
+    const emotion = matchEmotionByEmoji(text);
+
+    await sendEmotionSticker(ctx, emotion.key);
+    return sendEmotionCoins(ctx, text);
+  }
 
   return ctx.reply("Send an emotion or use the buttons.", {
     reply_markup: buildMainKeyboard().reply_markup
@@ -575,14 +644,3 @@ app.listen(PORT, "0.0.0.0", () => {
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
-
-bot.on("sticker", async (ctx) => {
-  const fileId = ctx.message.sticker.file_id;
-
-  console.log("Sticker file_id:", fileId);
-
-  await ctx.reply(
-    `📌 Sticker guardado:\n\n<code>${fileId}</code>`,
-    { parse_mode: "HTML" }
-  );
-});
