@@ -1,4 +1,5 @@
 require("dotenv").config();
+const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
 
 // ===============================
@@ -8,6 +9,11 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
   throw new Error("Falta BOT_TOKEN en .env");
 }
+
+const PORT = process.env.PORT || 3000;
+
+const app = express();
+app.use(express.json());
 
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -23,9 +29,9 @@ const cache = {
 };
 
 // TTLs
-const MARKET_CACHE_TTL = 60 * 1000;   // 1 min
-const TRENDING_CACHE_TTL = 2 * 60 * 1000; // 2 min
-const GLOBAL_CACHE_TTL = 2 * 60 * 1000;   // 2 min
+const MARKET_CACHE_TTL = 60 * 1000;
+const TRENDING_CACHE_TTL = 2 * 60 * 1000;
+const GLOBAL_CACHE_TTL = 2 * 60 * 1000;
 
 // Cooldown por usuario para evitar spam
 const userCooldowns = new Map();
@@ -34,7 +40,6 @@ const USER_COOLDOWN_MS = 800;
 // ===============================
 // EMOTION MAP
 // ===============================
-// Puedes ajustar rangos a tu estilo WojakMeter
 const EMOTION_CONFIG = [
   { emoji: "🤯", key: "euphoria", label: "Euphoria", min: 12, max: 9999 },
   { emoji: "😎", key: "content", label: "Content", min: 6, max: 11.9999 },
@@ -490,33 +495,22 @@ bot.command("losers", sendTopLosers);
 // ===============================
 // TEXT / BUTTON HANDLERS
 // ===============================
-
 bot.on("text", async (ctx) => {
+  const userId = ctx.from?.id;
+  if (userId && isUserCoolingDown(userId)) return;
+
   const text = (ctx.message?.text || "").trim();
 
-  if (text.includes("Market")) {
-    return sendMarketOverview(ctx);
-  }
+  if (text.includes("Market")) return sendMarketOverview(ctx);
+  if (text.includes("Trending")) return sendTrending(ctx);
+  if (text.includes("Top Gainers")) return sendTopGainers(ctx);
+  if (text.includes("Top Losers")) return sendTopLosers(ctx);
+  if (EMOJI_SET.has(text)) return sendEmotionCoins(ctx, text);
 
-  if (text.includes("Trending")) {
-    return sendTrending(ctx);
-  }
-
-  if (text.includes("Top Gainers")) {
-    return sendTopGainers(ctx);
-  }
-
-  if (text.includes("Top Losers")) {
-    return sendTopLosers(ctx);
-  }
-
-  if (EMOJI_SET.has(text)) {
-    return sendEmotionCoins(ctx, text);
-  }
-
-  return ctx.reply("Send an emotion or use the buttons.");
+  return ctx.reply("Send an emotion or use the buttons.", {
+    reply_markup: buildMainKeyboard().reply_markup
+  });
 });
-  
 
 // ===============================
 // SAFETY
@@ -540,7 +534,6 @@ async function warmUpCache() {
   }
 }
 
-// Refresca cache suave cada 90s
 setInterval(async () => {
   try {
     await Promise.allSettled([getMarkets(true), getTrending(true), getGlobal(true)]);
@@ -551,13 +544,34 @@ setInterval(async () => {
 }, 90 * 1000);
 
 // ===============================
+// HEALTHCHECK SERVER FOR RAILWAY
+// ===============================
+app.get("/", (req, res) => {
+  res.status(200).send("WojakMeter bot is running");
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "wojakmeter-bot",
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`HTTP server listening on port ${PORT}`);
+});
+
+// ===============================
 // START
 // ===============================
 (async () => {
-  // inicia el bot inmediatamente
   await bot.launch();
   console.log("WojakMeter bot running...");
 
-  // luego carga cache en background
   warmUpCache().catch(console.error);
 })();
+
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
