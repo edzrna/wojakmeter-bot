@@ -42,6 +42,11 @@ const userCooldowns = new Map();
 const USER_COOLDOWN_MS = 800;
 
 // ===============================
+// WATCHLISTS (IN-MEMORY)
+// ===============================
+const userWatchlists = new Map();
+
+// ===============================
 // AUTO BROADCAST STATE
 // ===============================
 let lastBroadcastState = {
@@ -57,6 +62,7 @@ let lastBroadcastState = {
 const BROADCAST_INTERVAL_MS = 2 * 60 * 1000;
 const MIN_BROADCAST_GAP_MS = 10 * 60 * 1000;
 const SCORE_SHIFT_THRESHOLD = 8;
+const BREAKING_SCORE_SHIFT_THRESHOLD = 15;
 
 // ===============================
 // EMOTIONS
@@ -94,7 +100,7 @@ const STICKERS = {
 };
 
 // ===============================
-// NARRATIVE VARIANTS
+// NARRATIVES
 // ===============================
 const NARRATIVE_VARIANTS = {
   euphoria: [
@@ -227,10 +233,23 @@ function buildMainKeyboard() {
     ["🔥 Trending", "🌟 Spotlight"],
     ["⚠️ Risk", "₿ BTC Mood"],
     ["🚀 Top Gainers", "💥 Top Losers"],
+    ["/coin btc", "/daily"],
+    ["/mywatchlist"],
     ["🤩", "😌", "🙂", "😐"],
     ["🤔", "😟", "😡"],
     ["/start", "/help", "/teststicker", "/testchannel"]
   ]).resize();
+}
+
+function normalizeCoinKey(input) {
+  return String(input || "").trim().toLowerCase();
+}
+
+function getUserWatchlist(userId) {
+  if (!userWatchlists.has(userId)) {
+    userWatchlists.set(userId, new Set());
+  }
+  return userWatchlists.get(userId);
 }
 
 // ===============================
@@ -395,7 +414,7 @@ async function getGlobal(force = false) {
 }
 
 // ===============================
-// FORMATTERS / BUILDERS
+// BUILDERS / FORMATTERS
 // ===============================
 function formatCoinLine(coin, index) {
   const symbol = (coin.symbol || "").toUpperCase();
@@ -494,6 +513,19 @@ function buildVolumeSpikeAlert({ emotion, score, change, btcDom, volume, prevVol
   );
 }
 
+function buildBreakingAlert({ emotion, score, change, btcDom, volume }) {
+  return (
+    `🚨 <b>BREAKING SIGNAL</b>\n\n` +
+    `${emotion.emoji} <b>${emotion.label}</b>\n` +
+    `📊 Score: <b>${score}/100</b>\n` +
+    `📉 Move: <b>${formatPercent(change)}</b>\n` +
+    `₿ BTC.D: <b>${btcDom.toFixed(2)}%</b>\n` +
+    `💸 Volume: <b>${formatUsd(volume)}</b>\n\n` +
+    `⚡ ${getEmotionNarrative(emotion.key)}\n\n` +
+    `🌐 wojakmeter.com`
+  );
+}
+
 function buildCoinSpotlight(title, coin) {
   if (!coin) return null;
 
@@ -507,6 +539,53 @@ function buildCoinSpotlight(title, coin) {
     `📉 24h: <b>${formatPercent(change)}</b>\n` +
     `💰 MCap: <b>${formatUsd(coin.market_cap)}</b>\n` +
     `💸 Volume: <b>${formatUsd(coin.total_volume)}</b>\n\n` +
+    `⚡ ${getEmotionNarrative(emotion.key)}`
+  );
+}
+
+function buildCoinExtremeAlert(coin) {
+  const change = safe(coin.price_change_percentage_24h);
+  const emotion = getEmotionByChange(change);
+  const score = scoreFromChange(change);
+
+  const title = score >= 85 ? "Coin Euphoria" : "Coin Panic";
+
+  return (
+    `🚨 <b>${title}</b>\n\n` +
+    `${emotion.emoji} <b>${escapeHTML(coin.name)}</b> (${escapeHTML((coin.symbol || "").toUpperCase())})\n` +
+    `📊 Score: <b>${score}/100</b>\n` +
+    `💵 Price: <b>${formatUsd(coin.current_price)}</b>\n` +
+    `📉 24h: <b>${formatPercent(change)}</b>\n` +
+    `💸 Volume: <b>${formatUsd(coin.total_volume)}</b>\n\n` +
+    `⚡ ${getEmotionNarrative(emotion.key)}`
+  );
+}
+
+function buildDailyWrap(globalData, markets) {
+  const data = globalData?.data || {};
+  const change = safe(data.market_cap_change_percentage_24h_usd);
+  const score = scoreFromChange(change);
+  const emotion = getEmotionByChange(change);
+
+  const gainers = [...markets]
+    .filter((c) => c.price_change_percentage_24h != null)
+    .sort((a, b) => safe(b.price_change_percentage_24h) - safe(a.price_change_percentage_24h))
+    .slice(0, 3);
+
+  const losers = [...markets]
+    .filter((c) => c.price_change_percentage_24h != null)
+    .sort((a, b) => safe(a.price_change_percentage_24h) - safe(b.price_change_percentage_24h))
+    .slice(0, 3);
+
+  return (
+    `🧾 <b>WojakMeter Daily Wrap</b>\n\n` +
+    `${emotion.emoji} <b>${emotion.label}</b>\n` +
+    `📊 Score: <b>${score}/100</b>\n` +
+    `📉 Market: <b>${formatPercent(change)}</b>\n` +
+    `₿ BTC.D: <b>${safe(data.market_cap_percentage?.btc).toFixed(2)}%</b>\n` +
+    `💸 Volume: <b>${formatUsd(safe(data.total_volume?.usd))}</b>\n\n` +
+    `🚀 <b>Top Gainers</b>\n${gainers.map((c) => `• ${(c.symbol || "").toUpperCase()} ${formatPercent(safe(c.price_change_percentage_24h))}`).join("\n")}\n\n` +
+    `💥 <b>Top Losers</b>\n${losers.map((c) => `• ${(c.symbol || "").toUpperCase()} ${formatPercent(safe(c.price_change_percentage_24h))}`).join("\n")}\n\n` +
     `⚡ ${getEmotionNarrative(emotion.key)}`
   );
 }
@@ -589,6 +668,13 @@ function getSpotlights(markets = []) {
     topLoser: losers[0] || null,
     volumeLeader: volumeLeaders[0] || null
   };
+}
+
+function getCoinAlertType(change) {
+  const score = scoreFromChange(change);
+  if (score >= 85) return "coin_euphoria";
+  if (score <= 20) return "coin_panic";
+  return null;
 }
 
 // ===============================
@@ -749,6 +835,63 @@ async function sendBtcMood(ctx) {
     );
   } catch (error) {
     return replyWithError(ctx, error, "Error moodbtc");
+  }
+}
+
+async function sendCoinSignal(ctx, symbolOrId) {
+  try {
+    const markets = await getMarkets();
+    const query = String(symbolOrId || "").trim().toLowerCase();
+
+    const coin = markets.find((c) =>
+      (c.symbol || "").toLowerCase() === query ||
+      (c.id || "").toLowerCase() === query ||
+      (c.name || "").toLowerCase() === query
+    );
+
+    if (!coin) {
+      return ctx.reply(`⚠️ Coin not found: <b>${escapeHTML(query)}</b>`, {
+        parse_mode: "HTML",
+        reply_markup: buildMainKeyboard().reply_markup
+      });
+    }
+
+    const change = safe(coin.price_change_percentage_24h);
+    const score = scoreFromChange(change);
+    const emotion = getEmotionByChange(change);
+
+    const text =
+      `🪙 <b>${escapeHTML(coin.name)}</b> (${escapeHTML((coin.symbol || "").toUpperCase())})\n\n` +
+      `${emotion.emoji} <b>${emotion.label}</b>\n` +
+      `📊 Score: <b>${score}/100</b>\n` +
+      `💵 Price: <b>${formatUsd(coin.current_price)}</b>\n` +
+      `📉 24h: <b>${formatPercent(change)}</b>\n` +
+      `💰 MCap: <b>${formatUsd(coin.market_cap)}</b>\n` +
+      `💸 Volume: <b>${formatUsd(coin.total_volume)}</b>\n\n` +
+      `⚡ ${getEmotionNarrative(emotion.key)}`;
+
+    await sendEmotionSticker(ctx, emotion.key);
+
+    return ctx.reply(text, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  } catch (error) {
+    return replyWithError(ctx, error, "Error coin signal");
+  }
+}
+
+async function sendDaily(ctx) {
+  try {
+    const [global, markets] = await Promise.all([getGlobal(), getMarkets()]);
+    return ctx.reply(buildDailyWrap(global, markets), {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  } catch (error) {
+    return replyWithError(ctx, error, "Error daily");
   }
 }
 
@@ -1009,6 +1152,24 @@ async function runChannelBroadcast() {
       }
     }
 
+    const scoreJump = Math.abs(score - safe(lastBroadcastState.score));
+    if (scoreJump >= BREAKING_SCORE_SHIFT_THRESHOLD) {
+      await sendMessageToChannel(
+        buildBreakingAlert({ emotion, score, change, btcDom, volume })
+      );
+      await sleep(1200);
+    }
+
+    const strongest = getStrongestMover(markets);
+    if (strongest) {
+      const coinAlertType = getCoinAlertType(strongest.price_change_percentage_24h);
+      if (coinAlertType && strongest.id !== lastBroadcastState.spotlightCoinId) {
+        await sendMessageToChannel(buildCoinExtremeAlert(strongest));
+        lastBroadcastState.spotlightCoinId = strongest.id;
+        await sleep(1200);
+      }
+    }
+
     const spotlights = getSpotlights(markets);
 
     if (score <= 20 && spotlights.topLoser) {
@@ -1036,7 +1197,7 @@ bot.start(async (ctx) => {
     `Hi, <b>${firstName}</b>.\n` +
     `Use the buttons or commands to read the market mood.\n\n` +
     `<b>Main:</b>\n` +
-    `🧠 Signal\n📊 Market\n🔥 Trending\n🌟 Spotlight\n⚠️ Risk\n₿ BTC Mood`;
+    `🧠 Signal\n📊 Market\n🔥 Trending\n🌟 Spotlight\n⚠️ Risk\n₿ BTC Mood\n🪙 /coin btc\n🧾 /daily`;
 
   await ctx.reply(text, {
     parse_mode: "HTML",
@@ -1054,11 +1215,14 @@ bot.help(async (ctx) => {
     `🌟 Spotlight → strongest coin move\n` +
     `⚠️ Risk → current risk tone\n` +
     `₿ BTC Mood → Bitcoin emotional read\n` +
+    `🪙 /coin btc → signal by coin\n` +
+    `🧾 /daily → premium daily wrap\n` +
     `🚀 Top Gainers → strongest coins in 24h\n` +
     `💥 Top Losers → weakest coins in 24h\n\n` +
+    `<b>Watchlist:</b>\n` +
+    `/watch btc\n/unwatch btc\n/mywatchlist\n\n` +
     `<b>Emotions:</b>\n` +
-    `🤩 😌 🙂 😐 🤔 😟 😡\n\n` +
-    `The bot uses cache to reduce API calls and avoid 429 errors.`;
+    `🤩 😌 🙂 😐 🤔 😟 😡`;
 
   await ctx.reply(text, {
     parse_mode: "HTML",
@@ -1072,8 +1236,83 @@ bot.command("trending", sendTrending);
 bot.command("spotlight", sendSpotlight);
 bot.command("risk", sendRisk);
 bot.command("moodbtc", sendBtcMood);
+bot.command("daily", sendDaily);
 bot.command("gainers", sendTopGainers);
 bot.command("losers", sendTopLosers);
+
+bot.command("coin", async (ctx) => {
+  const parts = (ctx.message.text || "").split(" ").filter(Boolean);
+  const query = parts.slice(1).join(" ");
+
+  if (!query) {
+    return ctx.reply("Usage: /coin btc", {
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  }
+
+  return sendCoinSignal(ctx, query);
+});
+
+bot.command("watch", async (ctx) => {
+  const userId = ctx.from?.id;
+  const parts = (ctx.message.text || "").split(" ").filter(Boolean);
+  const query = normalizeCoinKey(parts[1]);
+
+  if (!userId || !query) {
+    return ctx.reply("Usage: /watch btc", {
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  }
+
+  const list = getUserWatchlist(userId);
+  list.add(query);
+
+  return ctx.reply(`👁 Added <b>${escapeHTML(query.toUpperCase())}</b> to your watchlist.`, {
+    parse_mode: "HTML",
+    reply_markup: buildMainKeyboard().reply_markup
+  });
+});
+
+bot.command("unwatch", async (ctx) => {
+  const userId = ctx.from?.id;
+  const parts = (ctx.message.text || "").split(" ").filter(Boolean);
+  const query = normalizeCoinKey(parts[1]);
+
+  if (!userId || !query) {
+    return ctx.reply("Usage: /unwatch btc", {
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  }
+
+  const list = getUserWatchlist(userId);
+  list.delete(query);
+
+  return ctx.reply(`🗑 Removed <b>${escapeHTML(query.toUpperCase())}</b> from your watchlist.`, {
+    parse_mode: "HTML",
+    reply_markup: buildMainKeyboard().reply_markup
+  });
+});
+
+bot.command("mywatchlist", async (ctx) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const list = [...getUserWatchlist(userId)];
+
+  if (!list.length) {
+    return ctx.reply("Your watchlist is empty.", {
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  }
+
+  return ctx.reply(
+    `👁 <b>Your Watchlist</b>\n\n${list.map((x, i) => `${i + 1}. ${escapeHTML(x.toUpperCase())}`).join("\n")}`,
+    {
+      parse_mode: "HTML",
+      reply_markup: buildMainKeyboard().reply_markup
+    }
+  );
+});
 
 bot.command("id", async (ctx) => {
   await ctx.reply(`Chat ID: <code>${ctx.chat.id}</code>`, {
@@ -1147,8 +1386,6 @@ bot.on("text", async (ctx) => {
   if (text.includes("Spotlight")) return sendSpotlight(ctx);
   if (text.includes("Risk")) return sendRisk(ctx);
   if (text.includes("BTC Mood")) return sendBtcMood(ctx);
-  if (text.includes("Top Gainers")) return sendTopGainers(ctx);
-  if (text.includes("Top Losers")) return sendTopLosers(ctx);
 
   if (EMOJI_SET.has(text)) {
     const emotion = matchEmotionByEmoji(text);
