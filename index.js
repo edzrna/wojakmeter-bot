@@ -48,6 +48,9 @@ let lastBroadcastState = {
   emotionKey: null,
   score: null,
   change: null,
+  btcDom: null,
+  volume: null,
+  spotlightCoinId: null,
   ts: 0
 };
 
@@ -91,6 +94,47 @@ const STICKERS = {
 };
 
 // ===============================
+// NARRATIVE VARIANTS
+// ===============================
+const NARRATIVE_VARIANTS = {
+  euphoria: [
+    "Momentum is overheated. Traders are leaning aggressively risk-on.",
+    "Market confidence is surging fast. Risk appetite is elevated.",
+    "Buyers are in control and sentiment is running hot."
+  ],
+  content: [
+    "The market is constructive. Confidence is present without extreme euphoria.",
+    "Conditions look stable and bullish without feeling stretched.",
+    "Traders are comfortable holding risk, but not chasing hard."
+  ],
+  optimism: [
+    "Sentiment is improving. Buyers are gaining confidence.",
+    "Momentum is recovering and optimism is building.",
+    "The market is leaning positive with early conviction."
+  ],
+  neutral: [
+    "The market is balanced. No strong emotional edge yet.",
+    "Price action is undecided. Emotion is still centered.",
+    "The market feels calm, but not committed."
+  ],
+  doubt: [
+    "Confidence is weakening. Traders are becoming hesitant.",
+    "The market is losing conviction and second-guessing itself.",
+    "Buyers are slowing down and hesitation is growing."
+  ],
+  concern: [
+    "Pressure is building. Sentiment is turning defensive.",
+    "The market is getting uncomfortable and more reactive.",
+    "Risk appetite is fading as pressure increases."
+  ],
+  frustration: [
+    "The market is under stress. Emotion is clearly risk-off.",
+    "Panic is rising and traders are losing patience.",
+    "This is a heavy emotional drawdown environment."
+  ]
+};
+
+// ===============================
 // HELPERS
 // ===============================
 function sleep(ms) {
@@ -111,6 +155,10 @@ function clamp(n, min, max) {
 function safe(v, fallback = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function pickRandom(arr = []) {
+  return arr[Math.floor(Math.random() * arr.length)] || "";
 }
 
 function scoreFromChange(change) {
@@ -162,22 +210,22 @@ function isUserCoolingDown(userId) {
 }
 
 function getEmotionNarrative(emotionKey) {
-  const map = {
-    euphoria: "Momentum is overheated. Traders are leaning aggressively risk-on.",
-    content: "The market is constructive. Confidence is present without extreme euphoria.",
-    optimism: "Sentiment is improving. Buyers are gaining confidence.",
-    neutral: "The market is balanced. No strong emotional edge yet.",
-    doubt: "Confidence is weakening. Traders are becoming hesitant.",
-    concern: "Pressure is building. Sentiment is turning defensive.",
-    frustration: "The market is under stress. Emotion is clearly risk-off."
-  };
+  return pickRandom(NARRATIVE_VARIANTS[emotionKey]) || "The emotional state of the market is shifting.";
+}
 
-  return map[emotionKey] || "The emotional state of the market is shifting.";
+function getAlertLevel(score) {
+  if (score >= 85) return { key: "extreme_bull", label: "Extreme Bullish", icon: "🟢" };
+  if (score >= 70) return { key: "bullish", label: "Bullish", icon: "🟩" };
+  if (score >= 45) return { key: "balanced", label: "Balanced", icon: "⚪" };
+  if (score >= 20) return { key: "risk_off", label: "Risk-Off", icon: "🟧" };
+  return { key: "panic", label: "Panic", icon: "🔴" };
 }
 
 function buildMainKeyboard() {
   return Markup.keyboard([
-    ["📊 Market", "🔥 Trending"],
+    ["🧠 Signal", "📊 Market"],
+    ["🔥 Trending", "🌟 Spotlight"],
+    ["⚠️ Risk", "₿ BTC Mood"],
     ["🚀 Top Gainers", "💥 Top Losers"],
     ["🤩", "😌", "🙂", "😐"],
     ["🤔", "😟", "😡"],
@@ -347,7 +395,7 @@ async function getGlobal(force = false) {
 }
 
 // ===============================
-// FORMATTERS
+// FORMATTERS / BUILDERS
 // ===============================
 function formatCoinLine(coin, index) {
   const symbol = (coin.symbol || "").toUpperCase();
@@ -369,6 +417,100 @@ function formatCoinsBlock(title, coins) {
   return `📌 <b>${escapeHTML(title)}</b>\n\n${lines.join("\n\n")}`;
 }
 
+function buildPrettyAlert({ title, emotion, score, change, btcDom, volume, narrative }) {
+  const level = getAlertLevel(score);
+
+  return (
+    `${level.icon} <b>${title}</b>\n\n` +
+    `${emotion.emoji} <b>${emotion.label}</b>\n` +
+    `📊 Score: <b>${score}/100</b>\n` +
+    `📉 Move: <b>${formatPercent(change)}</b>\n` +
+    `₿ BTC.D: <b>${btcDom.toFixed(2)}%</b>\n` +
+    `💸 Volume: <b>${formatUsd(volume)}</b>\n\n` +
+    `⚡ ${narrative}\n\n` +
+    `🌐 wojakmeter.com`
+  );
+}
+
+function buildEmotionShiftAlert({
+  prevEmotion,
+  nextEmotion,
+  prevScore,
+  nextScore,
+  change,
+  btcDom,
+  volume
+}) {
+  return (
+    `🚨 <b>Emotion Shift</b>\n\n` +
+    `${prevEmotion.emoji} <b>${prevEmotion.label}</b> → ${nextEmotion.emoji} <b>${nextEmotion.label}</b>\n` +
+    `📊 Score: <b>${prevScore}</b> → <b>${nextScore}</b>\n` +
+    `📉 Market: <b>${formatPercent(change)}</b>\n` +
+    `₿ BTC.D: <b>${btcDom.toFixed(2)}%</b>\n` +
+    `💸 Volume: <b>${formatUsd(volume)}</b>\n\n` +
+    `⚡ ${getEmotionNarrative(nextEmotion.key)}\n\n` +
+    `🌐 wojakmeter.com`
+  );
+}
+
+function buildPanicAlert({ emotion, score, change, btcDom, volume }) {
+  return (
+    `🔴 <b>Panic Alert</b>\n\n` +
+    `${emotion.emoji} <b>${emotion.label}</b>\n` +
+    `📊 Score collapsed to <b>${score}/100</b>\n` +
+    `📉 Move: <b>${formatPercent(change)}</b>\n` +
+    `₿ BTC.D: <b>${btcDom.toFixed(2)}%</b>\n` +
+    `💸 Volume: <b>${formatUsd(volume)}</b>\n\n` +
+    `⚡ Risk-off conditions are taking control.\n\n` +
+    `🌐 wojakmeter.com`
+  );
+}
+
+function buildEuphoriaAlert({ emotion, score, change, btcDom, volume }) {
+  return (
+    `🟢 <b>Euphoria Alert</b>\n\n` +
+    `${emotion.emoji} <b>${emotion.label}</b>\n` +
+    `📊 Score reached <b>${score}/100</b>\n` +
+    `📈 Move: <b>${formatPercent(change)}</b>\n` +
+    `₿ BTC.D: <b>${btcDom.toFixed(2)}%</b>\n` +
+    `💸 Volume: <b>${formatUsd(volume)}</b>\n\n` +
+    `⚡ Momentum is overheating. Traders are chasing hard.\n\n` +
+    `🌐 wojakmeter.com`
+  );
+}
+
+function buildVolumeSpikeAlert({ emotion, score, change, btcDom, volume, prevVolume }) {
+  const jump = prevVolume > 0 ? ((volume - prevVolume) / prevVolume) * 100 : 0;
+
+  return (
+    `💥 <b>Volume Spike</b>\n\n` +
+    `${emotion.emoji} <b>${emotion.label}</b>\n` +
+    `📊 Score: <b>${score}/100</b>\n` +
+    `📉 Move: <b>${formatPercent(change)}</b>\n` +
+    `💸 Volume: <b>${formatUsd(volume)}</b>\n` +
+    `📈 Spike: <b>${formatPercent(jump)}</b>\n\n` +
+    `⚡ Activity just accelerated. Something is moving.\n\n` +
+    `🌐 wojakmeter.com`
+  );
+}
+
+function buildCoinSpotlight(title, coin) {
+  if (!coin) return null;
+
+  const change = safe(coin.price_change_percentage_24h);
+  const emotion = getEmotionByChange(change);
+
+  return (
+    `🌟 <b>${title}</b>\n\n` +
+    `${emotion.emoji} <b>${escapeHTML(coin.name)}</b> (${escapeHTML((coin.symbol || "").toUpperCase())})\n` +
+    `💵 Price: <b>${formatUsd(coin.current_price)}</b>\n` +
+    `📉 24h: <b>${formatPercent(change)}</b>\n` +
+    `💰 MCap: <b>${formatUsd(coin.market_cap)}</b>\n` +
+    `💸 Volume: <b>${formatUsd(coin.total_volume)}</b>\n\n` +
+    `⚡ ${getEmotionNarrative(emotion.key)}`
+  );
+}
+
 function formatMarketOverview(globalData) {
   const data = globalData?.data || {};
   const totalMcap = data.total_market_cap?.usd ?? 0;
@@ -380,15 +522,16 @@ function formatMarketOverview(globalData) {
 
   const emotion = getEmotionByChange(change);
   const score = scoreFromChange(change);
+  const level = getAlertLevel(score);
 
   return (
-    `🧠 <b>WojakMeter Market Mood</b>\n\n` +
+    `${level.icon} <b>WojakMeter Signal</b>\n\n` +
     `${emotion.emoji} <b>${emotion.label}</b>\n` +
     `📊 Score: <b>${score}/100</b>\n` +
     `📉 24h Change: <b>${formatPercent(change)}</b>\n` +
+    `₿ BTC Dominance: <b>${btcDom.toFixed(2)}%</b>\n` +
     `💰 Market Cap: <b>${formatUsd(totalMcap)}</b>\n` +
     `💸 Volume 24h: <b>${formatUsd(totalVol)}</b>\n` +
-    `₿ BTC Dominance: <b>${btcDom.toFixed(2)}%</b>\n` +
     `🪙 Active Coins: <b>${active}</b>\n` +
     `🏦 Markets: <b>${markets}</b>\n\n` +
     `⚡ ${getEmotionNarrative(emotion.key)}`
@@ -416,22 +559,65 @@ function formatTrendingLines(trendingData, marketMap) {
   }).join("\n");
 }
 
-function buildBroadcastMessage({ emotion, score, change, globalData }) {
-  const btcDom = safe(globalData?.market_cap_percentage?.btc);
-  const marketCap = globalData?.total_market_cap?.usd;
-  const volume = globalData?.total_volume?.usd;
+function getStrongestMover(markets = []) {
+  if (!Array.isArray(markets) || !markets.length) return null;
 
-  return (
-    `🧠 <b>WojakMeter Signal</b>\n\n` +
-    `${emotion.emoji} <b>${emotion.label}</b>\n` +
-    `📊 Score: <b>${score}/100</b>\n` +
-    `📉 24h Change: <b>${formatPercent(change)}</b>\n` +
-    `₿ BTC Dominance: <b>${btcDom.toFixed(2)}%</b>\n` +
-    `💰 Market Cap: <b>${formatUsd(marketCap)}</b>\n` +
-    `💸 Volume: <b>${formatUsd(volume)}</b>\n\n` +
-    `⚡ ${getEmotionNarrative(emotion.key)}\n\n` +
-    `🌐 wojakmeter.com`
+  const sorted = [...markets]
+    .filter((c) => c.price_change_percentage_24h != null)
+    .sort((a, b) => Math.abs(safe(b.price_change_percentage_24h, 0)) - Math.abs(safe(a.price_change_percentage_24h, 0)));
+
+  return sorted[0] || null;
+}
+
+function getSpotlights(markets = []) {
+  const valid = markets.filter((c) => c.price_change_percentage_24h != null);
+
+  const gainers = [...valid].sort(
+    (a, b) => safe(b.price_change_percentage_24h) - safe(a.price_change_percentage_24h)
   );
+
+  const losers = [...valid].sort(
+    (a, b) => safe(a.price_change_percentage_24h) - safe(b.price_change_percentage_24h)
+  );
+
+  const volumeLeaders = [...valid].sort(
+    (a, b) => safe(b.total_volume) - safe(a.total_volume)
+  );
+
+  return {
+    topGainer: gainers[0] || null,
+    topLoser: losers[0] || null,
+    volumeLeader: volumeLeaders[0] || null
+  };
+}
+
+// ===============================
+// EVENT DETECTION
+// ===============================
+function detectMarketEvents(prev, next) {
+  const events = [];
+
+  if (!prev.emotionKey || prev.emotionKey !== next.emotionKey) {
+    events.push({ type: "emotion_shift" });
+  }
+
+  if (next.score <= 20 && safe(prev.score, 100) > 20) {
+    events.push({ type: "panic_alert" });
+  }
+
+  if (next.score >= 85 && safe(prev.score, 0) < 85) {
+    events.push({ type: "euphoria_alert" });
+  }
+
+  if (next.volume && prev.volume && next.volume > prev.volume * 1.18) {
+    events.push({ type: "volume_spike" });
+  }
+
+  if (Math.abs(safe(next.btcDom) - safe(prev.btcDom)) >= 0.6) {
+    events.push({ type: "btc_dominance_shift" });
+  }
+
+  return events;
 }
 
 // ===============================
@@ -448,6 +634,122 @@ async function replyWithError(ctx, error, prefix = "Error") {
   try {
     await ctx.reply(msg, { reply_markup: buildMainKeyboard().reply_markup });
   } catch (_) {}
+}
+
+async function sendSignal(ctx) {
+  try {
+    const global = await getGlobal();
+    const data = global?.data || {};
+    const change = safe(data.market_cap_change_percentage_24h_usd);
+    const score = scoreFromChange(change);
+    const emotion = getEmotionByChange(change);
+
+    const text = buildPrettyAlert({
+      title: "WojakMeter Signal",
+      emotion,
+      score,
+      change,
+      btcDom: safe(data.market_cap_percentage?.btc),
+      volume: safe(data.total_volume?.usd),
+      narrative: getEmotionNarrative(emotion.key)
+    });
+
+    await sendEmotionSticker(ctx, emotion.key);
+
+    return ctx.reply(text, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  } catch (error) {
+    return replyWithError(ctx, error, "Error signal");
+  }
+}
+
+async function sendSpotlight(ctx) {
+  try {
+    const markets = await getMarkets();
+    const coin = getStrongestMover(markets);
+
+    if (!coin) {
+      return ctx.reply("⚠️ No spotlight coin available right now.", {
+        reply_markup: buildMainKeyboard().reply_markup
+      });
+    }
+
+    const emotion = getEmotionByChange(coin.price_change_percentage_24h);
+    await sendEmotionSticker(ctx, emotion.key);
+
+    return ctx.reply(buildCoinSpotlight("Coin Spotlight", coin), {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  } catch (error) {
+    return replyWithError(ctx, error, "Error spotlight");
+  }
+}
+
+async function sendRisk(ctx) {
+  try {
+    const global = await getGlobal();
+    const data = global?.data || {};
+    const change = safe(data.market_cap_change_percentage_24h_usd);
+    const score = scoreFromChange(change);
+
+    let label = "Balanced";
+    if (score <= 20) label = "Panic";
+    else if (score <= 34) label = "Defensive";
+    else if (score <= 44) label = "Hesitation";
+    else if (score >= 85) label = "Overheated";
+    else if (score >= 70) label = "Constructive";
+    else if (score >= 60) label = "Positive";
+
+    return ctx.reply(
+      `⚠️ <b>Risk Tone</b>\n\n` +
+      `📊 Score: <b>${score}/100</b>\n` +
+      `🧠 Tone: <b>${label}</b>\n` +
+      `📉 Move: <b>${formatPercent(change)}</b>`,
+      {
+        parse_mode: "HTML",
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
+  } catch (error) {
+    return replyWithError(ctx, error, "Error risk");
+  }
+}
+
+async function sendBtcMood(ctx) {
+  try {
+    const markets = await getMarkets();
+    const btc = markets.find((c) => (c.symbol || "").toLowerCase() === "btc");
+
+    if (!btc) {
+      return ctx.reply("⚠️ BTC data unavailable.", {
+        reply_markup: buildMainKeyboard().reply_markup
+      });
+    }
+
+    const change = safe(btc.price_change_percentage_24h);
+    const emotion = getEmotionByChange(change);
+    const score = scoreFromChange(change);
+
+    return ctx.reply(
+      `₿ <b>BTC Mood</b>\n\n` +
+      `${emotion.emoji} <b>${emotion.label}</b>\n` +
+      `📊 Score: <b>${score}/100</b>\n` +
+      `💵 Price: <b>${formatUsd(btc.current_price)}</b>\n` +
+      `📉 24h: <b>${formatPercent(change)}</b>\n\n` +
+      `⚡ ${getEmotionNarrative(emotion.key)}`,
+      {
+        parse_mode: "HTML",
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
+  } catch (error) {
+    return replyWithError(ctx, error, "Error moodbtc");
+  }
 }
 
 async function sendEmotionCoins(ctx, emotionEmoji) {
@@ -589,7 +891,6 @@ async function sendMarketOverview(ctx) {
     const change = data.market_cap_change_percentage_24h_usd ?? 0;
 
     const emotion = getEmotionByChange(change);
-
     await sendEmotionSticker(ctx, emotion.key);
 
     const text = formatMarketOverview(global);
@@ -616,9 +917,11 @@ function shouldBroadcast(nextState) {
   const scoreShift =
     Math.abs(safe(nextState.score) - safe(lastBroadcastState.score)) >= SCORE_SHIFT_THRESHOLD;
 
+  const panicEntered = nextState.score <= 20 && safe(lastBroadcastState.score) > 20;
+  const euphoriaEntered = nextState.score >= 85 && safe(lastBroadcastState.score) < 85;
   const enoughTimePassed = now - lastBroadcastState.ts >= MIN_BROADCAST_GAP_MS;
 
-  return emotionChanged || (scoreShift && enoughTimePassed);
+  return emotionChanged || panicEntered || euphoriaEntered || (scoreShift && enoughTimePassed);
 }
 
 async function runChannelBroadcast() {
@@ -626,38 +929,97 @@ async function runChannelBroadcast() {
     if (!TELEGRAM_CHANNEL_ID) return;
 
     const global = await getGlobal();
+    const markets = await getMarkets();
+
     const data = global?.data || {};
     const change = safe(data.market_cap_change_percentage_24h_usd);
     const score = scoreFromChange(change);
     const emotion = getEmotionByChange(change);
+    const btcDom = safe(data.market_cap_percentage?.btc);
+    const volume = safe(data.total_volume?.usd);
 
     const nextState = {
       emotionKey: emotion.key,
       score,
       change,
+      btcDom,
+      volume,
       ts: Date.now()
     };
 
     if (!shouldBroadcast(nextState)) return;
 
+    const events = detectMarketEvents(lastBroadcastState, nextState);
+    if (!events.length) return;
+
     await sendStickerToChannel(emotion.key);
 
-    const message = buildBroadcastMessage({
-      emotion,
-      score,
-      change,
-      globalData: data
-    });
+    for (const event of events) {
+      let msg = null;
 
-    await sendMessageToChannel(message);
+      if (event.type === "emotion_shift") {
+        const prevEmotion =
+          EMOTION_CONFIG.find((e) => e.key === lastBroadcastState.emotionKey) ||
+          { emoji: "⚪", label: "Unknown" };
+
+        msg = buildEmotionShiftAlert({
+          prevEmotion,
+          nextEmotion: emotion,
+          prevScore: safe(lastBroadcastState.score),
+          nextScore: score,
+          change,
+          btcDom,
+          volume
+        });
+      }
+
+      if (event.type === "panic_alert") {
+        msg = buildPanicAlert({ emotion, score, change, btcDom, volume });
+      }
+
+      if (event.type === "euphoria_alert") {
+        msg = buildEuphoriaAlert({ emotion, score, change, btcDom, volume });
+      }
+
+      if (event.type === "volume_spike") {
+        msg = buildVolumeSpikeAlert({
+          emotion,
+          score,
+          change,
+          btcDom,
+          volume,
+          prevVolume: safe(lastBroadcastState.volume)
+        });
+      }
+
+      if (event.type === "btc_dominance_shift") {
+        msg =
+          `₿ <b>BTC Dominance Shift</b>\n\n` +
+          `📊 Score: <b>${score}/100</b>\n` +
+          `₿ BTC.D: <b>${btcDom.toFixed(2)}%</b>\n` +
+          `↕ Previous: <b>${safe(lastBroadcastState.btcDom).toFixed(2)}%</b>\n` +
+          `📉 Market Move: <b>${formatPercent(change)}</b>\n\n` +
+          `⚡ Bitcoin dominance is moving fast. Rotation risk is rising.\n\n` +
+          `🌐 wojakmeter.com`;
+      }
+
+      if (msg) {
+        await sendMessageToChannel(msg);
+        await sleep(1200);
+      }
+    }
+
+    const spotlights = getSpotlights(markets);
+
+    if (score <= 20 && spotlights.topLoser) {
+      await sendMessageToChannel(buildCoinSpotlight("Stress Spotlight", spotlights.topLoser));
+    } else if (score >= 85 && spotlights.topGainer) {
+      await sendMessageToChannel(buildCoinSpotlight("Momentum Spotlight", spotlights.topGainer));
+    }
 
     lastBroadcastState = nextState;
 
-    console.log("Broadcast sent:", {
-      emotion: emotion.key,
-      score,
-      change
-    });
+    console.log("Broadcast events:", events.map((e) => e.type));
   } catch (err) {
     console.error("Broadcast loop error:", err.message);
   }
@@ -672,20 +1034,9 @@ bot.start(async (ctx) => {
   const text =
     `🤖 <b>Welcome to WojakMeter Bot</b>\n\n` +
     `Hi, <b>${firstName}</b>.\n` +
-    `Use the buttons or send an emotion emoji to filter coins by market mood.\n\n` +
-    `<b>Supported emotions:</b>\n` +
-    `🤩 Euphoria\n` +
-    `😌 Content\n` +
-    `🙂 Optimism\n` +
-    `😐 Neutral\n` +
-    `🤔 Doubt\n` +
-    `😟 Concern\n` +
-    `😡 Frustration\n\n` +
-    `<b>Quick actions:</b>\n` +
-    `📊 Market\n` +
-    `🔥 Trending\n` +
-    `🚀 Top Gainers\n` +
-    `💥 Top Losers`;
+    `Use the buttons or commands to read the market mood.\n\n` +
+    `<b>Main:</b>\n` +
+    `🧠 Signal\n📊 Market\n🔥 Trending\n🌟 Spotlight\n⚠️ Risk\n₿ BTC Mood`;
 
   await ctx.reply(text, {
     parse_mode: "HTML",
@@ -696,13 +1047,17 @@ bot.start(async (ctx) => {
 bot.help(async (ctx) => {
   const text =
     `🛠 <b>WojakMeter Bot Help</b>\n\n` +
-    `Send one of these emojis to filter coins by mood:\n` +
-    `🤩 😌 🙂 😐 🤔 😟 😡\n\n` +
-    `<b>Buttons:</b>\n` +
-    `📊 Market → global market overview\n` +
-    `🔥 Trending → trending coins\n` +
+    `<b>Main:</b>\n` +
+    `🧠 Signal → live emotional market signal\n` +
+    `📊 Market → full global market overview\n` +
+    `🔥 Trending → trending coins + mood\n` +
+    `🌟 Spotlight → strongest coin move\n` +
+    `⚠️ Risk → current risk tone\n` +
+    `₿ BTC Mood → Bitcoin emotional read\n` +
     `🚀 Top Gainers → strongest coins in 24h\n` +
     `💥 Top Losers → weakest coins in 24h\n\n` +
+    `<b>Emotions:</b>\n` +
+    `🤩 😌 🙂 😐 🤔 😟 😡\n\n` +
     `The bot uses cache to reduce API calls and avoid 429 errors.`;
 
   await ctx.reply(text, {
@@ -711,8 +1066,12 @@ bot.help(async (ctx) => {
   });
 });
 
+bot.command("signal", sendSignal);
 bot.command("market", sendMarketOverview);
 bot.command("trending", sendTrending);
+bot.command("spotlight", sendSpotlight);
+bot.command("risk", sendRisk);
+bot.command("moodbtc", sendBtcMood);
 bot.command("gainers", sendTopGainers);
 bot.command("losers", sendTopLosers);
 
@@ -782,8 +1141,12 @@ bot.on("text", async (ctx) => {
 
   if (text.startsWith("/")) return;
 
+  if (text.includes("Signal")) return sendSignal(ctx);
   if (text.includes("Market")) return sendMarketOverview(ctx);
   if (text.includes("Trending")) return sendTrending(ctx);
+  if (text.includes("Spotlight")) return sendSpotlight(ctx);
+  if (text.includes("Risk")) return sendRisk(ctx);
+  if (text.includes("BTC Mood")) return sendBtcMood(ctx);
   if (text.includes("Top Gainers")) return sendTopGainers(ctx);
   if (text.includes("Top Losers")) return sendTopLosers(ctx);
 
