@@ -11,6 +11,30 @@ if (!BOT_TOKEN) throw new Error("Falta BOT_TOKEN en .env");
 const PORT = process.env.PORT || 3000;
 const TELEGRAM_CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID || null;
 
+// ===============================
+// PERSONAL PLAN CONFIG
+// ===============================
+const PERSONAL_ALERTS_ENABLED = process.env.PERSONAL_ALERTS_ENABLED === "true";
+const PRIVATE_TELEGRAM_USER_ID = process.env.PRIVATE_TELEGRAM_USER_ID || null;
+
+const PERSONAL_PLAN = {
+  balance: Number(process.env.PERSONAL_BALANCE || 53),
+  riskPerTrade: Number(process.env.PERSONAL_RISK_PER_TRADE || 0.75),
+  maxDailyLoss: Number(process.env.PERSONAL_MAX_DAILY_LOSS || 1.5),
+  dailyProfitLock: Number(process.env.PERSONAL_DAILY_PROFIT_LOCK || 2.5),
+  maxTradesPerDay: Number(process.env.PERSONAL_MAX_TRADES_PER_DAY || 2),
+  defaultLeverage: Number(process.env.PERSONAL_DEFAULT_LEVERAGE || 5),
+  maxLeverage: Number(process.env.PERSONAL_MAX_LEVERAGE || 7),
+  minSignalScore: Number(process.env.PERSONAL_MIN_SIGNAL_SCORE || 80)
+};
+
+let personalTradingState = {
+  date: new Date().toISOString().slice(0, 10),
+  tradesToday: 0,
+  pnlToday: 0,
+  coolingDown: false
+};
+
 const app = express();
 app.use(express.json());
 
@@ -42,7 +66,7 @@ const userCooldowns = new Map();
 const USER_COOLDOWN_MS = 800;
 
 // ===============================
-// WATCHLISTS (IN-MEMORY)
+// WATCHLISTS IN MEMORY
 // ===============================
 const userWatchlists = new Map();
 
@@ -315,6 +339,123 @@ function getAlertLevel(score) {
   return { key: "panic", label: "Panic", icon: "🔴" };
 }
 
+function isPrivateOwner(ctx) {
+  if (!PRIVATE_TELEGRAM_USER_ID) return false;
+  return String(ctx.from?.id || "") === String(PRIVATE_TELEGRAM_USER_ID);
+}
+
+async function replyOwnerOnly(ctx) {
+  return ctx.reply("🚫 This command is private.", {
+    reply_markup: buildMainKeyboard().reply_markup
+  });
+}
+
+function resetPersonalStateIfNewDay() {
+  const today = new Date().toISOString().slice(0, 10);
+
+  if (personalTradingState.date !== today) {
+    personalTradingState = {
+      date: today,
+      tradesToday: 0,
+      pnlToday: 0,
+      coolingDown: false
+    };
+  }
+}
+
+function canSendPersonalAlert(score) {
+  resetPersonalStateIfNewDay();
+
+  if (!PERSONAL_ALERTS_ENABLED) return false;
+  if (!PRIVATE_TELEGRAM_USER_ID) return false;
+  if (score < PERSONAL_PLAN.minSignalScore) return false;
+  if (personalTradingState.coolingDown) return false;
+  if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) return false;
+  if (personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)) return false;
+  if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) return false;
+
+  return true;
+}
+
+function buildMyPlanMessage() {
+  resetPersonalStateIfNewDay();
+
+  return (
+    `🧠 <b>My WojakMeter Trading Plan</b>\n\n` +
+    `💼 Balance: <b>$${PERSONAL_PLAN.balance.toFixed(2)}</b>\n` +
+    `🎯 Risk per trade: <b>$${PERSONAL_PLAN.riskPerTrade.toFixed(2)}</b>\n` +
+    `🛑 Max daily loss: <b>-$${PERSONAL_PLAN.maxDailyLoss.toFixed(2)}</b>\n` +
+    `🔒 Daily profit lock: <b>+$${PERSONAL_PLAN.dailyProfitLock.toFixed(2)}</b>\n` +
+    `📌 Max trades per day: <b>${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
+    `⚙️ Default leverage: <b>${PERSONAL_PLAN.defaultLeverage}x</b>\n` +
+    `🚫 Max leverage: <b>${PERSONAL_PLAN.maxLeverage}x</b>\n` +
+    `🧪 Min personal signal score: <b>${PERSONAL_PLAN.minSignalScore}/100</b>\n\n` +
+
+    `📊 <b>Today</b>\n` +
+    `Trades: <b>${personalTradingState.tradesToday}/${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
+    `PnL: <b>${personalTradingState.pnlToday >= 0 ? "+" : ""}$${personalTradingState.pnlToday.toFixed(2)}</b>\n` +
+    `Cooling down: <b>${personalTradingState.coolingDown ? "Yes" : "No"}</b>\n\n` +
+
+    `🧠 <b>Rule</b>\n` +
+    `No trade is valid without defined risk, stop loss and emotional control.\n\n` +
+    `🌐 wojakmeter.com`
+  );
+}
+
+function buildPersonalAlertMessage(coin, title = "Personal Watchlist Alert") {
+  resetPersonalStateIfNewDay();
+
+  const change = safe(coin.price_change_percentage_24h);
+  const score = scoreFromChange(change);
+  const emotion = getEmotionByChange(change);
+  const symbol = (coin.symbol || "").toUpperCase();
+  const links = buildTradeLinksFromSymbol(symbol);
+
+  return (
+    `🔥 <b>WOJAKMETER PERSONAL ALERT</b>\n\n` +
+    `Type: <b>${escapeHTML(title)}</b>\n` +
+    `Pair: <b>${escapeHTML(links.pair)}</b>\n` +
+    `${emotion.emoji} Mood: <b>${emotion.label}</b>\n` +
+    `Score: <b>${score}/100</b>\n` +
+    `Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n\n` +
+
+    `💵 Price: <b>${formatUsd(coin.current_price)}</b>\n` +
+    `📉 24h: <b>${formatPercent(change)}</b>\n` +
+    `💸 Volume: <b>${formatUsd(coin.total_volume)}</b>\n\n` +
+
+    `🧠 <b>Your Plan</b>\n` +
+    `Risk max: <b>$${PERSONAL_PLAN.riskPerTrade.toFixed(2)}</b>\n` +
+    `Suggested leverage: <b>3x-${PERSONAL_PLAN.defaultLeverage}x</b>\n` +
+    `Max leverage: <b>${PERSONAL_PLAN.maxLeverage}x</b>\n` +
+    `Trades today: <b>${personalTradingState.tradesToday}/${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
+    `PnL today: <b>${personalTradingState.pnlToday >= 0 ? "+" : ""}$${personalTradingState.pnlToday.toFixed(2)}</b>\n\n` +
+
+    `⚠️ <b>Discipline</b>\n` +
+    `This is not a direct entry. Wait for confirmation. Do not chase. Define stop loss first.` +
+    buildTradeLinksBlock(symbol) +
+    `\n\n🌐 wojakmeter.com`
+  );
+}
+
+async function sendPersonalAlert(coin, title = "Personal Watchlist Alert") {
+  try {
+    if (!coin) return;
+
+    const score = scoreFromChange(coin.price_change_percentage_24h);
+
+    if (!canSendPersonalAlert(score)) return;
+
+    const msg = buildPersonalAlertMessage(coin, title);
+
+    await bot.telegram.sendMessage(PRIVATE_TELEGRAM_USER_ID, msg, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true
+    });
+  } catch (err) {
+    console.error("Personal alert error:", err.message);
+  }
+}
+
 function buildMainKeyboard() {
   return Markup.keyboard([
     ["🧠 Signal", "📊 Market"],
@@ -322,6 +463,7 @@ function buildMainKeyboard() {
     ["⚠️ Risk", "₿ BTC Mood"],
     ["🚀 Top Gainers", "💥 Top Losers"],
     ["🧪 Radar", "🧠 Discipline"],
+    ["📋 My Plan"],
     ["/coin btc", "/daily"],
     ["/mywatchlist"],
     ["🤩", "😌", "🙂", "😐"],
@@ -1403,8 +1545,17 @@ async function runChannelBroadcast() {
     const strongest = getStrongestMover(markets);
     if (strongest) {
       const coinAlertType = getCoinAlertType(strongest.price_change_percentage_24h);
+
       if (coinAlertType && strongest.id !== lastBroadcastState.spotlightCoinId) {
         await sendMessageToChannel(buildCoinExtremeAlert(strongest));
+
+        await sendPersonalAlert(
+          strongest,
+          coinAlertType === "coin_euphoria"
+            ? "FOMO Watch / Strong Mover"
+            : "Capitulation Watch / Heavy Drop"
+        );
+
         lastBroadcastState.spotlightCoinId = strongest.id;
         await sleep(1200);
       }
@@ -1414,8 +1565,10 @@ async function runChannelBroadcast() {
 
     if (score <= 20 && spotlights.topLoser) {
       await sendMessageToChannel(buildCoinSpotlight("Stress Spotlight", spotlights.topLoser));
+      await sendPersonalAlert(spotlights.topLoser, "Stress Spotlight / Capitulation Watch");
     } else if (score >= 85 && spotlights.topGainer) {
       await sendMessageToChannel(buildCoinSpotlight("Momentum Spotlight", spotlights.topGainer));
+      await sendPersonalAlert(spotlights.topGainer, "Momentum Spotlight / FOMO Watch");
     }
 
     lastBroadcastState = nextState;
@@ -1447,6 +1600,7 @@ bot.start(async (ctx) => {
     `💥 Top Losers\n` +
     `🧪 Radar\n` +
     `🧠 Discipline\n` +
+    `📋 My Plan private\n` +
     `🪙 /coin btc\n` +
     `🧾 /daily`;
 
@@ -1470,6 +1624,7 @@ bot.help(async (ctx) => {
     `💥 Top Losers → weakest coins in 24h\n` +
     `🧪 Radar → public market radar with trade links\n` +
     `🧠 Discipline → trading discipline checklist\n` +
+    `📋 My Plan → private owner plan\n` +
     `🪙 /coin btc → signal by coin\n` +
     `🧾 /daily → premium daily wrap\n\n` +
     `<b>Commands:</b>\n` +
@@ -1485,6 +1640,12 @@ bot.help(async (ctx) => {
     `/discipline\n` +
     `/coin btc\n` +
     `/daily\n\n` +
+    `<b>Private Owner Commands:</b>\n` +
+    `/myplan\n` +
+    `/trade win 1.25\n` +
+    `/trade loss 0.75\n` +
+    `/cooldown\n` +
+    `/resetday\n\n` +
     `<b>Watchlist:</b>\n` +
     `/watch btc\n/unwatch btc\n/mywatchlist\n\n` +
     `<b>Emotions:</b>\n` +
@@ -1507,6 +1668,104 @@ bot.command("gainers", sendTopGainers);
 bot.command("losers", sendTopLosers);
 bot.command("radar", sendRadar);
 bot.command("discipline", sendDiscipline);
+
+bot.command("myplan", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  return ctx.reply(buildMyPlanMessage(), {
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: buildMainKeyboard().reply_markup
+  });
+});
+
+bot.command("trade", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  resetPersonalStateIfNewDay();
+
+  const parts = (ctx.message.text || "").split(" ").filter(Boolean);
+  const result = (parts[1] || "").toLowerCase();
+  const amount = Number(parts[2] || 0);
+
+  if (!["win", "loss"].includes(result) || !Number.isFinite(amount) || amount <= 0) {
+    return ctx.reply(
+      `Usage:\n` +
+      `/trade win 1.25\n` +
+      `/trade loss 0.75`,
+      {
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
+  }
+
+  personalTradingState.tradesToday += 1;
+
+  if (result === "win") {
+    personalTradingState.pnlToday += amount;
+  } else {
+    personalTradingState.pnlToday -= amount;
+  }
+
+  let status = `✅ Trade logged.\n\n`;
+
+  if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) {
+    personalTradingState.coolingDown = true;
+    status += `🔒 Daily profit lock reached. Stop trading for today.\n\n`;
+  }
+
+  if (personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)) {
+    personalTradingState.coolingDown = true;
+    status += `🛑 Max daily loss reached. Stop trading for today.\n\n`;
+  }
+
+  if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) {
+    personalTradingState.coolingDown = true;
+    status += `📌 Max trades reached. Stop trading for today.\n\n`;
+  }
+
+  return ctx.reply(status + buildMyPlanMessage(), {
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: buildMainKeyboard().reply_markup
+  });
+});
+
+bot.command("cooldown", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  resetPersonalStateIfNewDay();
+  personalTradingState.coolingDown = true;
+
+  return ctx.reply(
+    `🧊 Cooling down activated.\n\n` + buildMyPlanMessage(),
+    {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: buildMainKeyboard().reply_markup
+    }
+  );
+});
+
+bot.command("resetday", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  personalTradingState = {
+    date: new Date().toISOString().slice(0, 10),
+    tradesToday: 0,
+    pnlToday: 0,
+    coolingDown: false
+  };
+
+  return ctx.reply(
+    `🔄 Day reset.\n\n` + buildMyPlanMessage(),
+    {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: buildMainKeyboard().reply_markup
+    }
+  );
+});
 
 bot.command("coin", async (ctx) => {
   const parts = (ctx.message.text || "").split(" ").filter(Boolean);
@@ -1583,7 +1842,7 @@ bot.command("mywatchlist", async (ctx) => {
 });
 
 bot.command("id", async (ctx) => {
-  await ctx.reply(`Chat ID: <code>${ctx.chat.id}</code>`, {
+  await ctx.reply(`Chat ID: <code>${ctx.chat.id}</code>\nUser ID: <code>${ctx.from?.id}</code>`, {
     parse_mode: "HTML",
     reply_markup: buildMainKeyboard().reply_markup
   });
@@ -1621,7 +1880,7 @@ bot.command("testchannel", async (ctx) => {
 });
 
 // ===============================
-// OPTIONAL: STICKER FILE_ID CAPTURE
+// OPTIONAL STICKER FILE_ID CAPTURE
 // ===============================
 bot.on("sticker", async (ctx) => {
   const fileId = ctx.message.sticker.file_id;
@@ -1658,6 +1917,16 @@ bot.on("text", async (ctx) => {
   if (text.includes("Top Losers")) return sendTopLosers(ctx);
   if (text.includes("Radar")) return sendRadar(ctx);
   if (text.includes("Discipline")) return sendDiscipline(ctx);
+
+  if (text.includes("My Plan")) {
+    if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+    return ctx.reply(buildMyPlanMessage(), {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  }
 
   if (EMOJI_SET.has(text)) {
     const emotion = matchEmotionByEmoji(text);
