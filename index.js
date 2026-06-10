@@ -39,6 +39,7 @@ let personalTradingState = {
 // BINANCE PERSONAL SCANNER CONFIG
 // ===============================
 const BINANCE_FUTURES_BASE = "https://fapi.binance.com";
+
 const BINANCE_PERSONAL_SCANNER_ENABLED =
   process.env.BINANCE_PERSONAL_SCANNER_ENABLED === "true";
 
@@ -53,6 +54,7 @@ const BINANCE_SCAN_SYMBOLS = String(
   .filter(Boolean);
 
 const BINANCE_MIN_SIGNAL_SCORE = Number(process.env.BINANCE_MIN_SIGNAL_SCORE || 80);
+
 const PERSONAL_BINANCE_ALERT_COOLDOWN_MS = Number(
   process.env.PERSONAL_BINANCE_ALERT_COOLDOWN_MS || 20 * 60 * 1000
 );
@@ -640,6 +642,7 @@ function detectBinanceSetup(symbol, interval, candles) {
     direction = "LONG WATCH";
     mood = "Optimism / Recovery";
     score = 72;
+
     if (volRatio >= 1.8) score += 8;
     if (breakingHigh) score += 8;
     if (rsi >= 50 && rsi <= 62) score += 5;
@@ -666,6 +669,7 @@ function detectBinanceSetup(symbol, interval, candles) {
     direction = "SHORT WATCH";
     mood = "Concern / Breakdown";
     score = 72;
+
     if (volRatio >= 1.8) score += 8;
     if (losingLow) score += 8;
     if (rsi >= 38 && rsi <= 50) score += 5;
@@ -709,6 +713,7 @@ function buildBinancePersonalSignalMessage(signal) {
   resetPersonalStateIfNewDay();
 
   const links = buildTradeLinksFromSymbol(signal.symbol);
+
   const reasonLines = signal.reason.length
     ? signal.reason.map((r) => `• ${escapeHTML(r)}`).join("\n")
     : "• Market movement detected.";
@@ -756,7 +761,15 @@ function canSendBinancePersonalSignal(signal) {
   resetPersonalStateIfNewDay();
 
   if (!BINANCE_PERSONAL_SCANNER_ENABLED) return false;
-  if (!canSendPersonalAlert(signal.score)) return false;
+  if (!PERSONAL_ALERTS_ENABLED) return false;
+  if (!PRIVATE_TELEGRAM_USER_ID) return false;
+
+  if (signal.score < BINANCE_MIN_SIGNAL_SCORE) return false;
+
+  if (personalTradingState.coolingDown) return false;
+  if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) return false;
+  if (personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)) return false;
+  if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) return false;
 
   const key = `${signal.symbol}:${signal.interval}:${signal.type}`;
   const last = lastPersonalBinanceAlerts.get(key) || 0;
@@ -834,6 +847,7 @@ function buildMainKeyboard() {
     ["📋 My Plan"],
     ["/coin btc", "/daily"],
     ["/mywatchlist", "/scan"],
+    ["/scandebug", "/testsignal"],
     ["🤩", "😌", "🙂", "😐"],
     ["🤔", "😟", "😡"],
     ["/start", "/help", "/teststicker", "/testchannel"]
@@ -1971,7 +1985,9 @@ bot.start(async (ctx) => {
     `📋 My Plan private\n` +
     `🪙 /coin btc\n` +
     `🧾 /daily\n` +
-    `🧪 /scan private Binance scanner`;
+    `🧪 /scan private Binance scanner\n` +
+    `🧪 /scandebug private scanner debug\n` +
+    `✅ /testsignal private test signal`;
 
   await ctx.reply(text, {
     parse_mode: "HTML",
@@ -2015,7 +2031,9 @@ bot.help(async (ctx) => {
     `/trade loss 0.75\n` +
     `/cooldown\n` +
     `/resetday\n` +
-    `/scan\n\n` +
+    `/scan\n` +
+    `/scandebug\n` +
+    `/testsignal\n\n` +
     `<b>Watchlist:</b>\n` +
     `/watch btc\n/unwatch btc\n/mywatchlist\n\n` +
     `<b>Emotions:</b>\n` +
@@ -2038,6 +2056,166 @@ bot.command("gainers", sendTopGainers);
 bot.command("losers", sendTopLosers);
 bot.command("radar", sendRadar);
 bot.command("discipline", sendDiscipline);
+
+bot.command("testsignal", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  if (!PRIVATE_TELEGRAM_USER_ID) {
+    return ctx.reply("⚠️ PRIVATE_TELEGRAM_USER_ID is missing.", {
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  }
+
+  const fakeSignal = {
+    symbol: "BTCUSDT",
+    interval: "15m",
+    type: "TEST SIGNAL",
+    direction: "LONG WATCH",
+    mood: "Test / Bot working",
+    score: 99,
+    close: 65000,
+    move1: 0.35,
+    move5: 1.25,
+    move20: 2.8,
+    volRatio: 2.1,
+    rsi: 58.4,
+    ema9: 65000,
+    ema21: 64500,
+    recentHigh: 65100,
+    recentLow: 64000,
+    reason: [
+      "This is a manual test signal.",
+      "If you see this message, private Binance alerts are working."
+    ],
+    warning: "This is only a test. Do not trade this."
+  };
+
+  try {
+    await bot.telegram.sendMessage(
+      PRIVATE_TELEGRAM_USER_ID,
+      buildBinancePersonalSignalMessage(fakeSignal),
+      {
+        parse_mode: "HTML",
+        disable_web_page_preview: true
+      }
+    );
+
+    return ctx.reply("✅ Test signal sent to your private Telegram.", {
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  } catch (err) {
+    console.error("Test signal error:", err.message);
+
+    return ctx.reply(
+      `⚠️ Test signal failed:\n\n${err.message}`,
+      {
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
+  }
+});
+
+bot.command("scandebug", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  resetPersonalStateIfNewDay();
+
+  await ctx.reply("🧪 Running Binance scan debug...", {
+    reply_markup: buildMainKeyboard().reply_markup
+  });
+
+  const intervals = ["5m", "15m", "1h"];
+  let checked = 0;
+  let found = [];
+  let errors = [];
+  let blockedReasons = [];
+
+  if (!BINANCE_PERSONAL_SCANNER_ENABLED) blockedReasons.push("BINANCE_PERSONAL_SCANNER_ENABLED is false");
+  if (!PERSONAL_ALERTS_ENABLED) blockedReasons.push("PERSONAL_ALERTS_ENABLED is false");
+  if (!PRIVATE_TELEGRAM_USER_ID) blockedReasons.push("PRIVATE_TELEGRAM_USER_ID is missing");
+  if (personalTradingState.coolingDown) blockedReasons.push("Cooling down is active");
+  if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) blockedReasons.push("Max trades reached");
+  if (personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)) blockedReasons.push("Max daily loss reached");
+  if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) blockedReasons.push("Daily profit lock reached");
+
+  for (const symbol of BINANCE_SCAN_SYMBOLS) {
+    for (const interval of intervals) {
+      try {
+        checked++;
+
+        const candles = await getBinanceKlines(symbol, interval, 80);
+
+        if (!candles || candles.length < 40) {
+          errors.push(`${symbol} ${interval}: not enough candles`);
+          continue;
+        }
+
+        const signal = detectBinanceSetup(symbol, interval, candles);
+
+        if (signal) {
+          found.push(signal);
+        }
+
+        await sleep(300);
+      } catch (err) {
+        errors.push(`${symbol} ${interval}: ${err.message}`);
+        console.error(`Scan debug error ${symbol} ${interval}:`, err.message);
+      }
+    }
+  }
+
+  const topSignals = found
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8)
+    .map((s, i) =>
+      `${i + 1}. <b>${escapeHTML(s.symbol)}</b> ${escapeHTML(s.interval)}\n` +
+      `Type: <b>${escapeHTML(s.type)}</b>\n` +
+      `Direction: <b>${escapeHTML(s.direction)}</b>\n` +
+      `Score: <b>${s.score}/100</b>\n` +
+      `Move 5 candles: <b>${formatPercent(s.move5)}</b>\n` +
+      `Volume: <b>${s.volRatio.toFixed(2)}x</b>\n` +
+      `RSI: <b>${s.rsi.toFixed(1)}</b>`
+    )
+    .join("\n\n");
+
+  const blockText = blockedReasons.length
+    ? blockedReasons.map((r) => `• ${escapeHTML(r)}`).join("\n")
+    : "• No global block detected.";
+
+  const errorText = errors.length
+    ? errors.slice(0, 8).map((e) => `• ${escapeHTML(e)}`).join("\n")
+    : "• No API errors.";
+
+  const message =
+    `✅ <b>Binance Scan Debug Complete</b>\n\n` +
+    `⚙️ <b>Debug Config</b>\n` +
+    `BINANCE_PERSONAL_SCANNER_ENABLED: <b>${BINANCE_PERSONAL_SCANNER_ENABLED ? "true" : "false"}</b>\n` +
+    `PERSONAL_ALERTS_ENABLED: <b>${PERSONAL_ALERTS_ENABLED ? "true" : "false"}</b>\n` +
+    `PRIVATE_TELEGRAM_USER_ID: <b>${PRIVATE_TELEGRAM_USER_ID ? "set" : "missing"}</b>\n` +
+    `BINANCE_MIN_SIGNAL_SCORE: <b>${BINANCE_MIN_SIGNAL_SCORE}</b>\n` +
+    `PERSONAL_MIN_SIGNAL_SCORE: <b>${PERSONAL_PLAN.minSignalScore}</b>\n` +
+    `Cooling down: <b>${personalTradingState.coolingDown ? "Yes" : "No"}</b>\n` +
+    `Trades today: <b>${personalTradingState.tradesToday}/${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
+    `PnL today: <b>${personalTradingState.pnlToday >= 0 ? "+" : ""}$${personalTradingState.pnlToday.toFixed(2)}</b>\n\n` +
+    `📊 <b>Results</b>\n` +
+    `Pairs checked: <b>${checked}</b>\n` +
+    `Signals found: <b>${found.length}</b>\n\n` +
+    `🚧 <b>Possible Blocks</b>\n` +
+    `${blockText}\n\n` +
+    `⚠️ <b>API / Data Errors</b>\n` +
+    `${errorText}\n\n` +
+    (
+      found.length
+        ? `🔥 <b>Top Signals Found</b>\n${topSignals}`
+        : `🧠 <b>No signals found</b>\nNo pair met the current setup filters. Try temporarily lowering BINANCE_MIN_SIGNAL_SCORE or wait for stronger market movement.`
+    );
+
+  return ctx.reply(message, {
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: buildMainKeyboard().reply_markup
+  });
+});
 
 bot.command("scan", async (ctx) => {
   if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
