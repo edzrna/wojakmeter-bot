@@ -35,6 +35,30 @@ let personalTradingState = {
   coolingDown: false
 };
 
+// ===============================
+// BINANCE PERSONAL SCANNER CONFIG
+// ===============================
+const BINANCE_FUTURES_BASE = "https://fapi.binance.com";
+const BINANCE_PERSONAL_SCANNER_ENABLED =
+  process.env.BINANCE_PERSONAL_SCANNER_ENABLED === "true";
+
+const BINANCE_SCAN_INTERVAL_MS = Number(process.env.BINANCE_SCAN_INTERVAL_MS || 60000);
+
+const BINANCE_SCAN_SYMBOLS = String(
+  process.env.BINANCE_SCAN_SYMBOLS ||
+    "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,NEARUSDT,PEPEUSDT,WIFUSDT"
+)
+  .split(",")
+  .map((s) => s.trim().toUpperCase())
+  .filter(Boolean);
+
+const BINANCE_MIN_SIGNAL_SCORE = Number(process.env.BINANCE_MIN_SIGNAL_SCORE || 80);
+const PERSONAL_BINANCE_ALERT_COOLDOWN_MS = Number(
+  process.env.PERSONAL_BINANCE_ALERT_COOLDOWN_MS || 20 * 60 * 1000
+);
+
+let lastPersonalBinanceAlerts = new Map();
+
 const app = express();
 app.use(express.json());
 
@@ -456,6 +480,350 @@ async function sendPersonalAlert(coin, title = "Personal Watchlist Alert") {
   }
 }
 
+// ===============================
+// BINANCE FUTURES PERSONAL SCANNER
+// ===============================
+async function getBinanceKlines(symbol, interval = "15m", limit = 80) {
+  const url =
+    `${BINANCE_FUTURES_BASE}/fapi/v1/klines` +
+    `?symbol=${encodeURIComponent(symbol)}` +
+    `&interval=${encodeURIComponent(interval)}` +
+    `&limit=${encodeURIComponent(limit)}`;
+
+  const data = await fetchJSON(url, { maxRetries: 2, timeoutMs: 10000 });
+  if (!Array.isArray(data)) return [];
+
+  return data.map((k) => ({
+    openTime: Number(k[0]),
+    open: Number(k[1]),
+    high: Number(k[2]),
+    low: Number(k[3]),
+    close: Number(k[4]),
+    volume: Number(k[5]),
+    closeTime: Number(k[6]),
+    quoteVolume: Number(k[7]),
+    trades: Number(k[8]),
+    takerBuyBaseVolume: Number(k[9]),
+    takerBuyQuoteVolume: Number(k[10])
+  }));
+}
+
+function calculateRSI(closes = [], period = 14) {
+  if (!Array.isArray(closes) || closes.length < period + 2) return 50;
+
+  let gains = 0;
+  let losses = 0;
+
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff >= 0) gains += diff;
+    else losses += Math.abs(diff);
+  }
+
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+
+  if (avgLoss === 0) return 100;
+
+  const rs = avgGain / avgLoss;
+  return 100 - 100 / (1 + rs);
+}
+
+function calculateEMA(values = [], period = 9) {
+  if (!Array.isArray(values) || values.length < period) return null;
+
+  const k = 2 / (period + 1);
+  let ema = values.slice(0, period).reduce((sum, v) => sum + v, 0) / period;
+
+  for (let i = period; i < values.length; i++) {
+    ema = values[i] * k + ema * (1 - k);
+  }
+
+  return ema;
+}
+
+function average(values = []) {
+  const valid = values.filter((v) => Number.isFinite(Number(v)));
+  if (!valid.length) return 0;
+  return valid.reduce((sum, v) => sum + Number(v), 0) / valid.length;
+}
+
+function percentMove(from, to) {
+  if (!from || !to) return 0;
+  return ((to - from) / from) * 100;
+}
+
+function getRecentHigh(candles = [], lookback = 20) {
+  const recent = candles.slice(-lookback);
+  if (!recent.length) return 0;
+  return Math.max(...recent.map((c) => c.high));
+}
+
+function getRecentLow(candles = [], lookback = 20) {
+  const recent = candles.slice(-lookback);
+  if (!recent.length) return 0;
+  return Math.min(...recent.map((c) => c.low));
+}
+
+function detectBinanceSetup(symbol, interval, candles) {
+  if (!candles || candles.length < 40) return null;
+
+  const closes = candles.map((c) => c.close);
+  const volumes = candles.map((c) => c.quoteVolume || c.volume);
+
+  const last = candles[candles.length - 1];
+  const prev = candles[candles.length - 2];
+
+  const close = last.close;
+  const open = last.open;
+
+  const move1 = percentMove(prev.close, close);
+  const move5 = percentMove(candles[candles.length - 6].close, close);
+  const move20 = percentMove(candles[candles.length - 21].close, close);
+
+  const avgVol20 = average(volumes.slice(-21, -1));
+  const volRatio = avgVol20 > 0 ? (last.quoteVolume || last.volume) / avgVol20 : 1;
+
+  const rsi = calculateRSI(closes, 14);
+  const ema9 = calculateEMA(closes, 9);
+  const ema21 = calculateEMA(closes, 21);
+
+  const recentHigh = getRecentHigh(candles.slice(0, -1), 20);
+  const recentLow = getRecentLow(candles.slice(0, -1), 20);
+
+  const bullishCandle = close > open;
+  const bearishCandle = close < open;
+
+  const breakingHigh = recentHigh > 0 && close > recentHigh;
+  const losingLow = recentLow > 0 && close < recentLow;
+
+  const trendBullish = ema9 && ema21 && ema9 > ema21;
+  const trendBearish = ema9 && ema21 && ema9 < ema21;
+
+  let type = "Observation";
+  let direction = "WAIT";
+  let mood = "Neutral";
+  let score = 50;
+  let reason = [];
+  let warning = "This is a watchlist alert, not a direct entry.";
+
+  if (move5 >= 1.2 && volRatio >= 1.8 && bullishCandle) {
+    type = "FOMO Watch / Strong Mover";
+    direction = "WAIT FOR PULLBACK";
+    mood = "Euphoria / Overheat";
+    score = 70 + Math.min(20, move5 * 4) + Math.min(10, volRatio * 2);
+    reason.push(`Strong ${interval} momentum: ${formatPercent(move5)}`);
+    reason.push(`Volume spike: ${volRatio.toFixed(2)}x average`);
+    warning = "Avoid chasing. Wait for pullback or retest.";
+  }
+
+  if (move5 <= -1.2 && volRatio >= 1.8 && bearishCandle) {
+    type = "Capitulation Watch / Heavy Drop";
+    direction = "WAIT FOR STABILIZATION";
+    mood = "Panic / Sell Pressure";
+    score = 70 + Math.min(20, Math.abs(move5) * 4) + Math.min(10, volRatio * 2);
+    reason.push(`Heavy ${interval} drop: ${formatPercent(move5)}`);
+    reason.push(`Volume spike: ${volRatio.toFixed(2)}x average`);
+    warning = "Do not catch the knife. Wait for stabilization.";
+  }
+
+  if (
+    trendBullish &&
+    bullishCandle &&
+    volRatio >= 1.25 &&
+    rsi >= 45 &&
+    rsi <= 68 &&
+    move1 > 0.15 &&
+    move5 > -0.8
+  ) {
+    type = "Possible LONG Setup";
+    direction = "LONG WATCH";
+    mood = "Optimism / Recovery";
+    score = 72;
+    if (volRatio >= 1.8) score += 8;
+    if (breakingHigh) score += 8;
+    if (rsi >= 50 && rsi <= 62) score += 5;
+    if (move20 > 0) score += 5;
+
+    reason.push("EMA trend improving: EMA9 above EMA21");
+    reason.push(`Buyer candle with volume: ${volRatio.toFixed(2)}x average`);
+    reason.push(`RSI healthy: ${rsi.toFixed(1)}`);
+    if (breakingHigh) reason.push("Price is breaking recent high");
+
+    warning = "Wait for confirmation or retest. Do not enter late.";
+  }
+
+  if (
+    trendBearish &&
+    bearishCandle &&
+    volRatio >= 1.25 &&
+    rsi >= 32 &&
+    rsi <= 55 &&
+    move1 < -0.15 &&
+    move5 < 0.8
+  ) {
+    type = "Possible SHORT Setup";
+    direction = "SHORT WATCH";
+    mood = "Concern / Breakdown";
+    score = 72;
+    if (volRatio >= 1.8) score += 8;
+    if (losingLow) score += 8;
+    if (rsi >= 38 && rsi <= 50) score += 5;
+    if (move20 < 0) score += 5;
+
+    reason.push("EMA trend weakening: EMA9 below EMA21");
+    reason.push(`Seller candle with volume: ${volRatio.toFixed(2)}x average`);
+    reason.push(`RSI weak: ${rsi.toFixed(1)}`);
+    if (losingLow) reason.push("Price is losing recent low");
+
+    warning = "Wait for confirmation. Avoid shorting after an extended dump.";
+  }
+
+  score = Math.round(clamp(score, 0, 100));
+
+  if (score < BINANCE_MIN_SIGNAL_SCORE) return null;
+
+  return {
+    symbol,
+    interval,
+    type,
+    direction,
+    mood,
+    score,
+    close,
+    move1,
+    move5,
+    move20,
+    volRatio,
+    rsi,
+    ema9,
+    ema21,
+    recentHigh,
+    recentLow,
+    reason,
+    warning
+  };
+}
+
+function buildBinancePersonalSignalMessage(signal) {
+  resetPersonalStateIfNewDay();
+
+  const links = buildTradeLinksFromSymbol(signal.symbol);
+  const reasonLines = signal.reason.length
+    ? signal.reason.map((r) => `• ${escapeHTML(r)}`).join("\n")
+    : "• Market movement detected.";
+
+  return (
+    `🔥 <b>WOJAKMETER PERSONAL SIGNAL</b>\n\n` +
+    `Pair: <b>${escapeHTML(signal.symbol)}</b>\n` +
+    `Timeframe: <b>${escapeHTML(signal.interval)}</b>\n` +
+    `Type: <b>${escapeHTML(signal.type)}</b>\n` +
+    `Direction: <b>${escapeHTML(signal.direction)}</b>\n` +
+    `Mood: <b>${escapeHTML(signal.mood)}</b>\n` +
+    `Score: <b>${signal.score}/100</b>\n\n` +
+
+    `📊 <b>Market Data</b>\n` +
+    `Price: <b>${formatUsd(signal.close)}</b>\n` +
+    `Last candle: <b>${formatPercent(signal.move1)}</b>\n` +
+    `Recent move: <b>${formatPercent(signal.move5)}</b>\n` +
+    `Trend move: <b>${formatPercent(signal.move20)}</b>\n` +
+    `Volume: <b>${signal.volRatio.toFixed(2)}x avg</b>\n` +
+    `RSI: <b>${signal.rsi.toFixed(1)}</b>\n\n` +
+
+    `🧠 <b>Why it triggered</b>\n` +
+    `${reasonLines}\n\n` +
+
+    `⚠️ <b>Execution Warning</b>\n` +
+    `${escapeHTML(signal.warning)}\n\n` +
+
+    `🧠 <b>Your Plan</b>\n` +
+    `Risk max: <b>$${PERSONAL_PLAN.riskPerTrade.toFixed(2)}</b>\n` +
+    `Suggested leverage: <b>3x-${PERSONAL_PLAN.defaultLeverage}x</b>\n` +
+    `Max leverage: <b>${PERSONAL_PLAN.maxLeverage}x</b>\n` +
+    `Trades today: <b>${personalTradingState.tradesToday}/${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
+    `PnL today: <b>${personalTradingState.pnlToday >= 0 ? "+" : ""}$${personalTradingState.pnlToday.toFixed(2)}</b>\n\n` +
+
+    `🔗 <b>Trade / Chart</b>\n` +
+    `<a href="${links.binanceFutures}">Binance Futures</a> · ` +
+    `<a href="${links.tradingView}">TradingView</a>\n\n` +
+
+    `🚫 This is not financial advice. Wait for confirmation and define stop loss first.\n\n` +
+    `🌐 wojakmeter.com`
+  );
+}
+
+function canSendBinancePersonalSignal(signal) {
+  resetPersonalStateIfNewDay();
+
+  if (!BINANCE_PERSONAL_SCANNER_ENABLED) return false;
+  if (!canSendPersonalAlert(signal.score)) return false;
+
+  const key = `${signal.symbol}:${signal.interval}:${signal.type}`;
+  const last = lastPersonalBinanceAlerts.get(key) || 0;
+  const now = Date.now();
+
+  if (now - last < PERSONAL_BINANCE_ALERT_COOLDOWN_MS) return false;
+
+  lastPersonalBinanceAlerts.set(key, now);
+  return true;
+}
+
+async function sendBinancePersonalSignal(signal) {
+  try {
+    if (!canSendBinancePersonalSignal(signal)) return;
+
+    const msg = buildBinancePersonalSignalMessage(signal);
+
+    await bot.telegram.sendMessage(PRIVATE_TELEGRAM_USER_ID, msg, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true
+    });
+
+    console.log(
+      `Personal Binance signal sent: ${signal.symbol} ${signal.interval} ${signal.type} score ${signal.score}`
+    );
+  } catch (err) {
+    console.error("Send Binance personal signal error:", err.message);
+  }
+}
+
+async function scanBinancePersonalSignals() {
+  try {
+    if (!BINANCE_PERSONAL_SCANNER_ENABLED) return;
+    if (!PERSONAL_ALERTS_ENABLED) return;
+    if (!PRIVATE_TELEGRAM_USER_ID) return;
+
+    resetPersonalStateIfNewDay();
+
+    if (personalTradingState.coolingDown) return;
+    if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) return;
+    if (personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)) return;
+    if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) return;
+
+    const intervals = ["5m", "15m", "1h"];
+
+    for (const symbol of BINANCE_SCAN_SYMBOLS) {
+      for (const interval of intervals) {
+        try {
+          const candles = await getBinanceKlines(symbol, interval, 80);
+          const signal = detectBinanceSetup(symbol, interval, candles);
+
+          if (signal) {
+            await sendBinancePersonalSignal(signal);
+            await sleep(750);
+          }
+        } catch (err) {
+          console.error(`Binance scan error ${symbol} ${interval}:`, err.message);
+        }
+      }
+
+      await sleep(500);
+    }
+  } catch (err) {
+    console.error("Binance personal scanner error:", err.message);
+  }
+}
+
 function buildMainKeyboard() {
   return Markup.keyboard([
     ["🧠 Signal", "📊 Market"],
@@ -465,7 +833,7 @@ function buildMainKeyboard() {
     ["🧪 Radar", "🧠 Discipline"],
     ["📋 My Plan"],
     ["/coin btc", "/daily"],
-    ["/mywatchlist"],
+    ["/mywatchlist", "/scan"],
     ["🤩", "😌", "🙂", "😐"],
     ["🤔", "😟", "😡"],
     ["/start", "/help", "/teststicker", "/testchannel"]
@@ -1602,7 +1970,8 @@ bot.start(async (ctx) => {
     `🧠 Discipline\n` +
     `📋 My Plan private\n` +
     `🪙 /coin btc\n` +
-    `🧾 /daily`;
+    `🧾 /daily\n` +
+    `🧪 /scan private Binance scanner`;
 
   await ctx.reply(text, {
     parse_mode: "HTML",
@@ -1645,7 +2014,8 @@ bot.help(async (ctx) => {
     `/trade win 1.25\n` +
     `/trade loss 0.75\n` +
     `/cooldown\n` +
-    `/resetday\n\n` +
+    `/resetday\n` +
+    `/scan\n\n` +
     `<b>Watchlist:</b>\n` +
     `/watch btc\n/unwatch btc\n/mywatchlist\n\n` +
     `<b>Emotions:</b>\n` +
@@ -1668,6 +2038,20 @@ bot.command("gainers", sendTopGainers);
 bot.command("losers", sendTopLosers);
 bot.command("radar", sendRadar);
 bot.command("discipline", sendDiscipline);
+
+bot.command("scan", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  await ctx.reply("🧪 Running Binance personal scanner now...", {
+    reply_markup: buildMainKeyboard().reply_markup
+  });
+
+  await scanBinancePersonalSignals();
+
+  return ctx.reply("✅ Scan complete.", {
+    reply_markup: buildMainKeyboard().reply_markup
+  });
+});
 
 bot.command("myplan", async (ctx) => {
   if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
@@ -1971,6 +2355,7 @@ setInterval(async () => {
 }, 90 * 1000);
 
 setInterval(runChannelBroadcast, BROADCAST_INTERVAL_MS);
+setInterval(scanBinancePersonalSignals, BINANCE_SCAN_INTERVAL_MS);
 
 // ===============================
 // HEALTHCHECK SERVER FOR RAILWAY
@@ -2001,6 +2386,7 @@ app.listen(PORT, "0.0.0.0", () => {
 
   await warmUpCache().catch(console.error);
   await runChannelBroadcast().catch(console.error);
+  await scanBinancePersonalSignals().catch(console.error);
 })();
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
