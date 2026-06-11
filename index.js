@@ -1045,9 +1045,11 @@ async function fetchJSON(url, options = {}) {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), timeoutMs);
     try {
+      const headers = { Accept: "application/json", "User-Agent": "WojakMeterBot/1.0" };
+      if (process.env.COINGECKO_API_KEY) headers["x-cg-demo-api-key"] = process.env.COINGECKO_API_KEY;
       const res = await fetch(url, {
         method: "GET",
-        headers: { Accept: "application/json", "User-Agent": "WojakMeterBot/1.0" },
+        headers,
         signal: controller.signal,
       });
       clearTimeout(t);
