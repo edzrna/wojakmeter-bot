@@ -2073,24 +2073,24 @@ app.listen(PORT, "0.0.0.0", () => console.log(`HTTP server listening on port ${P
 // ===============================
 // START
 // ===============================
+// Iniciar EmoTrader independientemente del bot de Telegram
+emotionTrader.start({
+  bot,
+  PERSONAL_PLAN,
+  personalTradingState,
+  resetPersonalStateIfNewDay,
+  PRIVATE_TELEGRAM_USER_ID,
+  binanceApiKey:    BINANCE_API_KEY,
+  binanceApiSecret: BINANCE_API_SECRET,
+  useTestnet:       USE_TESTNET,
+});
+
 (async () => {
   await bot.launch({ dropPendingUpdates: true, allowedUpdates: [] });
   console.log("WojakMeter bot running...");
   await warmUpCache().catch(console.error);
   await runChannelBroadcast().catch(console.error);
   await scanMarketPersonalSignals().catch(console.error);
-
-  // Iniciar EmoTrader
-  emotionTrader.start({
-    bot,
-    PERSONAL_PLAN,
-    personalTradingState,
-    resetPersonalStateIfNewDay,
-    PRIVATE_TELEGRAM_USER_ID,
-    binanceApiKey:    BINANCE_API_KEY,
-    binanceApiSecret: BINANCE_API_SECRET,
-    useTestnet:       USE_TESTNET,
-  });
 })();
 
 process.once("SIGINT",  () => bot.stop("SIGINT"));
