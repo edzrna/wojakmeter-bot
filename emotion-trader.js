@@ -162,10 +162,33 @@ async function fetchAllTickers() {
 async function pollLoop() {
   console.log("[EmoTrader] Iniciando poll REST...");
 
+  // Primer poll inmediato al arrancar
+  try {
+    console.log("[EmoTrader] Primer poll inmediato...");
+    const firstTickers = await fetchAllTickers();
+    console.log(`[EmoTrader] Primer poll resultado: ${firstTickers.length} tickers`);
+    if (firstTickers.length > 0) {
+      const tickerMap = new Map(firstTickers.map((t) => [t.symbol, t]));
+      for (const symbol of EMOTION_TRADE_PAIRS) {
+        const ticker = tickerMap.get(symbol);
+        if (!ticker) continue;
+        const pct   = parseFloat(ticker.priceChangePercent || 0);
+        const price = parseFloat(ticker.lastPrice || 0);
+        pairState.set(symbol, { emotion: getEmotion(pct).key, prevEmotion: null, pct, price, ts: Date.now() });
+      }
+      console.log(`[EmoTrader] Estado inicial cargado: ${pairState.size} pares`);
+    }
+  } catch (err) {
+    console.error("[EmoTrader] Error en primer poll:", err.message);
+  }
+
   setInterval(async () => {
     try {
       const tickers = await fetchAllTickers();
-      if (!tickers.length) return;
+      if (!tickers.length) {
+        console.warn("[EmoTrader] Poll sin datos");
+        return;
+      }
 
       // Crear mapa rápido symbol → ticker
       const tickerMap = new Map(tickers.map((t) => [t.symbol, t]));
@@ -617,7 +640,7 @@ function start(config) {
   });
 
   pollLoop();
-  console.log(`[EmoTrader] Iniciado — ${EMOTION_TRADE_PAIRS.length} pares | poll cada ${POLL_INTERVAL_MS / 1000}s`);
+  console.log(`[EmoTrader] ===== INICIADO ===== ${EMOTION_TRADE_PAIRS.length} pares | poll cada ${POLL_INTERVAL_MS / 1000}s | testnet: ${config.useTestnet}`);
 }
 
 // ===============================
