@@ -2074,7 +2074,7 @@ app.listen(PORT, "0.0.0.0", () => console.log(`HTTP server listening on port ${P
 // START
 // ===============================
 (async () => {
-  await bot.launch();
+  await bot.launch({ dropPendingUpdates: true, allowedUpdates: [] });
   console.log("WojakMeter bot running...");
   await warmUpCache().catch(console.error);
   await runChannelBroadcast().catch(console.error);
