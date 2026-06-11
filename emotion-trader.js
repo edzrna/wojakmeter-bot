@@ -1,39 +1,10 @@
 // ===============================
-// WOJAKMETER — EMOTION TRADER
-// Sistema de auto-trade basado en estados emocionales
-// y transiciones entre ellos via WebSocket de Binance
-//
-// INTEGRACIÓN EN index.js:
-//   1. Al inicio del archivo:
-//      const emotionTrader = require("./emotion-trader");
-//
-//   2. Al final del bloque de inicio (después de bot.launch()):
-//      emotionTrader.start({
-//        bot,
-//        PERSONAL_PLAN,
-//        personalTradingState,
-//        resetPersonalStateIfNewDay,
-//        PRIVATE_TELEGRAM_USER_ID: process.env.PRIVATE_TELEGRAM_USER_ID,
-//        binanceApiKey: process.env.BINANCE_API_KEY,
-//        binanceApiSecret: process.env.BINANCE_API_SECRET,
-//        useTestnet: process.env.BINANCE_TESTNET !== "false",
-//      });
-//
-//   3. Nuevos commands en index.js:
-//      bot.command("emostatus",  (ctx) => emotionTrader.handleEmoStatus(ctx));
-//      bot.command("emohistory", (ctx) => emotionTrader.handleEmoHistory(ctx));
-//      bot.command("emopairs",   (ctx) => emotionTrader.handleEmoPairs(ctx));
-//
-//   4. En buildMainKeyboard() añadir:
-//      ["🧬 Emo Status", "📜 Emo History"],
-//
-//   5. En el handler de texto:
-//      if (text.includes("Emo Status"))  return emotionTrader.handleEmoStatus(ctx);
-//      if (text.includes("Emo History")) return emotionTrader.handleEmoHistory(ctx);
+// WOJAKMETER — EMOTION TRADER v2
+// REST polling en lugar de WebSocket
+// Más confiable en hosting cloud (Railway, Heroku, etc.)
 // ===============================
 
-const WebSocket = require("ws");
-const Binance   = require("node-binance-api");
+const Binance = require("node-binance-api");
 
 // ===============================
 // PAIRS — 27 pares monitoreados
@@ -54,85 +25,71 @@ const EMOTION_TRADE_PAIRS = [
 // EMOTION CONFIG
 // ===============================
 const EMOTIONS = [
-  { key: "euphoria",    emoji: "🤩", label: "Euphoria",    minPct: 12    },
-  { key: "content",     emoji: "😌", label: "Content",     minPct: 6     },
-  { key: "optimism",    emoji: "🙂", label: "Optimism",    minPct: 2     },
-  { key: "neutral",     emoji: "😐", label: "Neutral",     minPct: -2    },
-  { key: "doubt",       emoji: "🤔", label: "Doubt",       minPct: -5    },
-  { key: "concern",     emoji: "😟", label: "Concern",     minPct: -8    },
-  { key: "frustration", emoji: "😡", label: "Frustration", minPct: -9999 },
+  { key: "euphoria",    emoji: "🤩", label: "Euphoria",    minPct:  12    },
+  { key: "content",     emoji: "😌", label: "Content",     minPct:   6    },
+  { key: "optimism",    emoji: "🙂", label: "Optimism",    minPct:   2    },
+  { key: "neutral",     emoji: "😐", label: "Neutral",     minPct:  -2    },
+  { key: "doubt",       emoji: "🤔", label: "Doubt",       minPct:  -5    },
+  { key: "concern",     emoji: "😟", label: "Concern",     minPct:  -8    },
+  { key: "frustration", emoji: "😡", label: "Frustration", minPct: -9999  },
 ];
 
-// Orden numérico: 0=euphoria ... 6=frustration
 const EMOTION_ORDER = EMOTIONS.map((e) => e.key);
 
 // ===============================
 // TRANSITION RULES
-// Qué hacer cuando el mercado transiciona entre estados
 // ===============================
 const TRANSITION_RULES = {
-  // Entradas LONG (mercado mejorando)
-  "neutral→optimism":    { action: "LONG",  leverage: 3, strength: "medium", note: "Mercado despertando al alza" },
-  "optimism→content":    { action: "LONG",  leverage: 4, strength: "strong", note: "Momentum confirmado" },
-  "doubt→neutral":       { action: "LONG",  leverage: 3, strength: "medium", note: "Presión bajista cediendo" },
-  "frustration→concern": { action: "LONG",  leverage: 3, strength: "medium", note: "Posible suelo emocional" },
-  "concern→doubt":       { action: "LONG",  leverage: 4, strength: "strong", note: "Reversión desde pánico" },
-
-  // Entradas SHORT (mercado deteriorando)
-  "neutral→doubt":       { action: "SHORT", leverage: 3, strength: "medium", note: "Mercado perdiendo convicción" },
-  "doubt→concern":       { action: "SHORT", leverage: 4, strength: "strong", note: "Presión bajista confirmada" },
-  "optimism→neutral":    { action: "SHORT", leverage: 3, strength: "medium", note: "Momentum alcista perdiendo fuerza" },
-  "euphoria→content":    { action: "SHORT", leverage: 3, strength: "medium", note: "Posible techo emocional" },
-  "content→optimism":    { action: "SHORT", leverage: 3, strength: "weak",   note: "Enfriamiento desde zona alta" },
-
-  // Señales de cierre (no abrir, cerrar si hay posición)
-  "optimism→euphoria":   { action: "CLOSE_LONG",  leverage: 0, strength: "exit", note: "Euforia — cerrar LONG, no perseguir" },
-  "concern→frustration": { action: "CLOSE_SHORT", leverage: 0, strength: "exit", note: "Pánico extremo — cerrar SHORT" },
+  "neutral→optimism":    { action: "LONG",        leverage: 3, strength: "medium", note: "Mercado despertando al alza" },
+  "optimism→content":    { action: "LONG",        leverage: 4, strength: "strong", note: "Momentum alcista confirmado" },
+  "doubt→neutral":       { action: "LONG",        leverage: 3, strength: "medium", note: "Presión bajista cediendo" },
+  "frustration→concern": { action: "LONG",        leverage: 3, strength: "medium", note: "Posible suelo emocional" },
+  "concern→doubt":       { action: "LONG",        leverage: 4, strength: "strong", note: "Reversión desde pánico" },
+  "neutral→doubt":       { action: "SHORT",       leverage: 3, strength: "medium", note: "Mercado perdiendo convicción" },
+  "doubt→concern":       { action: "SHORT",       leverage: 4, strength: "strong", note: "Presión bajista confirmada" },
+  "optimism→neutral":    { action: "SHORT",       leverage: 3, strength: "medium", note: "Momentum alcista perdiendo fuerza" },
+  "euphoria→content":    { action: "SHORT",       leverage: 3, strength: "medium", note: "Posible techo emocional" },
+  "content→optimism":    { action: "SHORT",       leverage: 3, strength: "weak",   note: "Enfriamiento desde zona alta" },
+  "optimism→euphoria":   { action: "CLOSE_LONG",  leverage: 0, strength: "exit",   note: "Euforia — cerrar LONG, no perseguir" },
+  "concern→frustration": { action: "CLOSE_SHORT", leverage: 0, strength: "exit",   note: "Pánico extremo — cerrar SHORT" },
 };
 
 // ===============================
 // CONFLUENCE THRESHOLDS
-// Cuántos pares necesitan alinearse para disparar señal
 // ===============================
-const CONFLUENCE = {
-  weak:   1,   // solo alerta, no opera
-  medium: 3,   // avisa + pide confirmación
-  strong: 6,   // señal fuerte
-};
+const CONFLUENCE = { weak: 1, medium: 3, strong: 6 };
+
+// ===============================
+// POLL INTERVAL
+// ===============================
+const POLL_INTERVAL_MS = 30 * 1000; // cada 30 segundos
 
 // ===============================
 // STATE
 // ===============================
-let _config       = null;
-let _binance      = null;
-let _ws           = null;
-let _wsReconnectTimer = null;
+let _config  = null;
+let _binance = null;
 
-// Estado emocional actual por par
-// { "BTCUSDT": { emotion, prevEmotion, pct5m, pct1m, price, ts } }
+// { symbol: { emotion, prevEmotion, pct, price, ts } }
 const pairState = new Map();
 
-// Historial de transiciones recientes
 const transitionHistory = [];
 const MAX_HISTORY = 50;
 
-// Última señal enviada (cooldown)
-let lastSignalTs  = 0;
-const SIGNAL_COOLDOWN_MS = 15 * 60 * 1000; // 15 min entre señales
+let lastSignalTs = 0;
+const SIGNAL_COOLDOWN_MS = 15 * 60 * 1000;
 
-// Precios de ticker acumulados para calcular % de movimiento
-// { "BTCUSDT": [ {price, ts}, ... ] }
-const priceBuffer = new Map();
-const BUFFER_WINDOW_MS = 5 * 60 * 1000; // 5 minutos
-
-// Posición activa del emotion trader
-let emoPosition = null;
+let emoPosition      = null;
+let _pendingEmoTrade = null;
 
 // ===============================
 // HELPERS
 // ===============================
 function escapeHTML(str = "") {
-  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 function formatUsd(n) {
@@ -152,62 +109,179 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function getEmotion(pct5m) {
-  const n = Number(pct5m) || 0;
+function getEmotion(pct) {
+  const n = Number(pct) || 0;
   for (const e of EMOTIONS) {
     if (n >= e.minPct) return e;
   }
   return EMOTIONS[EMOTIONS.length - 1];
 }
 
-function getEmotionIndex(key) {
-  return EMOTION_ORDER.indexOf(key);
-}
-
-function isMovingBullish(prevKey, nextKey) {
-  return getEmotionIndex(nextKey) < getEmotionIndex(prevKey);
-}
-
-function isMovingBearish(prevKey, nextKey) {
-  return getEmotionIndex(nextKey) > getEmotionIndex(prevKey);
-}
-
-function getTransitionKey(prevKey, nextKey) {
-  return `${prevKey}→${nextKey}`;
-}
-
-// Calcula % de cambio en los últimos N ms
-function calcPctChange(symbol, windowMs = BUFFER_WINDOW_MS) {
-  const buf = priceBuffer.get(symbol);
-  if (!buf || buf.length < 2) return 0;
-
-  const now    = Date.now();
-  const cutoff = now - windowMs;
-  const recent = buf.filter((p) => p.ts >= cutoff);
-
-  if (recent.length < 2) return 0;
-
-  const oldest = recent[0].price;
-  const newest = recent[recent.length - 1].price;
-
-  if (!oldest) return 0;
-  return ((newest - oldest) / oldest) * 100;
-}
-
-function pushPrice(symbol, price) {
-  if (!priceBuffer.has(symbol)) priceBuffer.set(symbol, []);
-  const buf = priceBuffer.get(symbol);
-  buf.push({ price: Number(price), ts: Date.now() });
-
-  // Limpiar entradas viejas (más de 10 min)
-  const cutoff = Date.now() - 10 * 60 * 1000;
-  while (buf.length > 0 && buf[0].ts < cutoff) buf.shift();
+function getTransitionKey(prev, next) {
+  return `${prev}→${next}`;
 }
 
 // ===============================
-// BINANCE FUTURES ORDER (reutiliza lógica del index.js)
+// FETCH PRICES FROM BINANCE REST
+// Usa el endpoint público de futuros — no requiere API key
 // ===============================
-async function setLeverage(symbol, leverage) {
+async function fetchAllTickers() {
+  try {
+    const url = "https://fapi.binance.com/fapi/v1/ticker/24hr";
+    const res  = await fetch(url, {
+      headers: { "User-Agent": "WojakMeterBot/2.0" },
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch (err) {
+    console.error("[EmoTrader] fetchAllTickers error:", err.message);
+    return [];
+  }
+}
+
+// ===============================
+// POLL LOOP — cada 30 segundos
+// ===============================
+async function pollLoop() {
+  console.log("[EmoTrader] Iniciando poll REST...");
+
+  setInterval(async () => {
+    try {
+      const tickers = await fetchAllTickers();
+      if (!tickers.length) return;
+
+      // Crear mapa rápido symbol → ticker
+      const tickerMap = new Map(tickers.map((t) => [t.symbol, t]));
+
+      for (const symbol of EMOTION_TRADE_PAIRS) {
+        const ticker = tickerMap.get(symbol);
+        if (!ticker) continue;
+
+        const pct   = parseFloat(ticker.priceChangePercent || 0);
+        const price = parseFloat(ticker.lastPrice || 0);
+        const emotion = getEmotion(pct);
+
+        const existing    = pairState.get(symbol);
+        const prevEmotion = existing?.emotion || null;
+
+        pairState.set(symbol, {
+          emotion:     emotion.key,
+          prevEmotion,
+          pct,
+          price,
+          ts: Date.now(),
+        });
+
+        // Detectar transición
+        if (prevEmotion && prevEmotion !== emotion.key) {
+          await processTransition(symbol, prevEmotion, emotion.key, pct, price);
+        }
+      }
+
+      console.log(`[EmoTrader] Poll OK — ${pairState.size} pares actualizados`);
+    } catch (err) {
+      console.error("[EmoTrader] pollLoop error:", err.message);
+    }
+  }, POLL_INTERVAL_MS);
+}
+
+// ===============================
+// PROCESS TRANSITION
+// ===============================
+async function processTransition(symbol, prevEmotion, nextEmotion, pct, price) {
+  const transitionKey = getTransitionKey(prevEmotion, nextEmotion);
+  const rule          = TRANSITION_RULES[transitionKey];
+
+  if (!rule) return;
+
+  transitionHistory.unshift({ symbol, transitionKey, action: rule.action, strength: rule.strength, pct, ts: Date.now() });
+  if (transitionHistory.length > MAX_HISTORY) transitionHistory.pop();
+
+  console.log(`[EmoTrader] ${symbol}: ${transitionKey} → ${rule.action} (${rule.strength})`);
+
+  // Señales de cierre
+  if (rule.action === "CLOSE_LONG" && emoPosition?.side === "BUY") {
+    await closeEmoPosition(`Señal emocional: ${transitionKey}`);
+    return;
+  }
+  if (rule.action === "CLOSE_SHORT" && emoPosition?.side === "SELL") {
+    await closeEmoPosition(`Señal emocional: ${transitionKey}`);
+    return;
+  }
+
+  if (rule.action !== "LONG" && rule.action !== "SHORT") return;
+
+  if (Date.now() - lastSignalTs < SIGNAL_COOLDOWN_MS) return;
+  if (emoPosition) return;
+  if (_pendingEmoTrade) return;
+
+  // Medir confluencia
+  const confluencePairs = [];
+  for (const [sym, state] of pairState.entries()) {
+    if (!state.prevEmotion || !state.emotion) continue;
+    if (getTransitionKey(state.prevEmotion, state.emotion) === transitionKey) {
+      const emo = EMOTIONS.find((e) => e.key === state.emotion);
+      confluencePairs.push({ symbol: sym, emoji: emo?.emoji || "❓", transition: transitionKey, pct: state.pct });
+    }
+  }
+
+  const count = confluencePairs.length;
+  let signalLevel = null;
+  if (count >= CONFLUENCE.strong) signalLevel = "strong";
+  else if (count >= CONFLUENCE.medium) signalLevel = "medium";
+  else if (count >= CONFLUENCE.weak) signalLevel = "weak";
+
+  if (!signalLevel) return;
+
+  // Solo alertar para señales débiles
+  if (signalLevel === "weak") {
+    await sendPrivate(
+      `🟡 <b>EmoTrader — Señal Débil</b>\n\n` +
+      `Transición: <b>${escapeHTML(transitionKey)}</b>\n` +
+      `Par: <b>${escapeHTML(symbol)}</b>\n` +
+      `Precio: <b>${formatUsd(price)}</b>\n` +
+      `Movimiento 24h: <b>${formatPct(pct)}</b>\n` +
+      `Confluencia: <b>${count} par(es)</b>\n\n` +
+      `ℹ️ Señal insuficiente para operar. Monitoreando...`
+    );
+    return;
+  }
+
+  // Señal media o fuerte → proponer trade
+  const side       = rule.action === "LONG" ? "BUY" : "SELL";
+  const bestPair   = confluencePairs.sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct))[0];
+  const tradeSymbol = bestPair?.symbol || symbol;
+
+  await executeEmoTrade(tradeSymbol, side, rule.leverage, rule, {
+    transitionKey,
+    pairs: confluencePairs,
+    signalLevel,
+  });
+}
+
+// ===============================
+// SEND PRIVATE
+// ===============================
+async function sendPrivate(text) {
+  if (!_config?.bot || !_config?.PRIVATE_TELEGRAM_USER_ID) return;
+  try {
+    await _config.bot.telegram.sendMessage(_config.PRIVATE_TELEGRAM_USER_ID, text, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    });
+  } catch (err) {
+    console.error("[EmoTrader] sendPrivate:", err.message);
+  }
+}
+
+// ===============================
+// BINANCE FUTURES ORDERS
+// ===============================
+async function atSetLeverage(symbol, leverage) {
   return new Promise((resolve, reject) => {
     _binance.futuresLeverage(symbol, leverage, (err, res) => {
       if (err) return reject(new Error(err.body || err.message || JSON.stringify(err)));
@@ -216,7 +290,7 @@ async function setLeverage(symbol, leverage) {
   });
 }
 
-async function getMarkPrice(symbol) {
+async function atGetMarkPrice(symbol) {
   return new Promise((resolve, reject) => {
     _binance.futuresMarkPrice(symbol, (err, res) => {
       if (err) return reject(new Error(err.body || err.message || JSON.stringify(err)));
@@ -225,7 +299,7 @@ async function getMarkPrice(symbol) {
   });
 }
 
-async function getExchangeInfo(symbol) {
+async function atGetExchangeInfo(symbol) {
   return new Promise((resolve, reject) => {
     _binance.futuresExchangeInfo((err, info) => {
       if (err) return reject(new Error(err.body || err.message || JSON.stringify(err)));
@@ -244,7 +318,7 @@ function roundQty(qty, stepSize) {
   return parseFloat(qty.toFixed(precision));
 }
 
-async function placeMarketOrder(symbol, side, qty) {
+async function atPlaceMarketOrder(symbol, side, qty) {
   return new Promise((resolve, reject) => {
     _binance.futuresOrder(side, symbol, qty, false, { type: "MARKET" }, (err, res) => {
       if (err) return reject(new Error(err.body || err.message || JSON.stringify(err)));
@@ -253,14 +327,15 @@ async function placeMarketOrder(symbol, side, qty) {
   });
 }
 
-async function placeSlTp(symbol, side, qty, entryPrice, slPct = 1.5, tpEmotion = null) {
+async function atPlaceSlTp(symbol, side, qty, entryPrice) {
   const oppSide = side === "BUY" ? "SELL" : "BUY";
+  const slPct   = Number(process.env.AUTO_TRADE_SL_PCT || 1.5);
+  const tpPct   = Number(process.env.AUTO_TRADE_TP_PCT || 3.0);
+
   const slPrice = side === "BUY"
     ? parseFloat((entryPrice * (1 - slPct / 100)).toFixed(2))
     : parseFloat((entryPrice * (1 + slPct / 100)).toFixed(2));
 
-  // TP dinámico basado en emoción objetivo si se provee, sino fijo 3%
-  const tpPct   = 3.0;
   const tpPrice = side === "BUY"
     ? parseFloat((entryPrice * (1 + tpPct / 100)).toFixed(2))
     : parseFloat((entryPrice * (1 - tpPct / 100)).toFixed(2));
@@ -282,28 +357,10 @@ async function placeSlTp(symbol, side, qty, entryPrice, slPct = 1.5, tpEmotion =
   return { slPrice, tpPrice, slOrderId: slOrder.orderId, tpOrderId: tpOrder.orderId };
 }
 
-async function cancelOrder(symbol, orderId) {
+async function atCancelOrder(symbol, orderId) {
   return new Promise((resolve) => {
-    _binance.futuresCancel(symbol, { orderId }, (err) => {
-      if (err) console.error("[EmoTrader] cancelOrder:", err.message);
-      resolve();
-    });
+    _binance.futuresCancel(symbol, { orderId }, () => resolve());
   });
-}
-
-// ===============================
-// SEND PRIVATE MESSAGE
-// ===============================
-async function sendPrivate(text) {
-  if (!_config?.bot || !_config?.PRIVATE_TELEGRAM_USER_ID) return;
-  try {
-    await _config.bot.telegram.sendMessage(_config.PRIVATE_TELEGRAM_USER_ID, text, {
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-    });
-  } catch (err) {
-    console.error("[EmoTrader] sendPrivate:", err.message);
-  }
 }
 
 // ===============================
@@ -317,17 +374,16 @@ async function executeEmoTrade(symbol, side, leverage, rule, confluenceData) {
     const state = _config.personalTradingState;
     const plan  = _config.PERSONAL_PLAN;
 
-    if (state.coolingDown)                              return;
-    if (state.tradesToday >= plan.maxTradesPerDay)      return;
+    if (state.coolingDown)                               return;
+    if (state.tradesToday >= plan.maxTradesPerDay)       return;
     if (state.pnlToday <= -Math.abs(plan.maxDailyLoss)) return;
     if (state.pnlToday >= plan.dailyProfitLock)         return;
-    if (emoPosition)                                    return;
+    if (emoPosition)                                     return;
 
-    await setLeverage(symbol, leverage);
-
+    await atSetLeverage(symbol, leverage);
     const [markPrice, symbolInfo] = await Promise.all([
-      getMarkPrice(symbol),
-      getExchangeInfo(symbol),
+      atGetMarkPrice(symbol),
+      atGetExchangeInfo(symbol),
     ]);
 
     if (!markPrice) throw new Error("No mark price");
@@ -336,41 +392,36 @@ async function executeEmoTrade(symbol, side, leverage, rule, confluenceData) {
     const notional = riskUsd * leverage;
     const stepSize = getLotStepSize(symbolInfo);
     const qty      = roundQty(notional / markPrice, stepSize);
-
     if (qty <= 0) throw new Error("Qty = 0");
 
     const slPct = Number(process.env.AUTO_TRADE_SL_PCT || 1.5);
+    const tpPct = Number(process.env.AUTO_TRADE_TP_PCT || 3.0);
 
-    // Construir mensaje de confirmación
     const confluenceLines = confluenceData.pairs
-      .map((p) => `  ${p.emoji} <b>${p.symbol}</b> → ${p.transition}`)
+      .slice(0, 8)
+      .map((p) => `  ${p.emoji} <b>${p.symbol}</b> ${formatPct(p.pct)}`)
       .join("\n");
+
+    _pendingEmoTrade = { symbol, side, qty, price: markPrice, leverage, rule, confluenceData, ts: Date.now() };
 
     await sendPrivate(
       `🧬 <b>EMOTION TRADE PENDIENTE</b>\n\n` +
       `Transición: <b>${escapeHTML(confluenceData.transitionKey)}</b>\n` +
       `Dirección: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
       `Par: <b>${escapeHTML(symbol)}</b>\n` +
-      `Leverage: <b>${leverage}x</b>\n` +
       `Mark Price: <b>${formatUsd(markPrice)}</b>\n` +
-      `Risk: <b>${formatUsd(riskUsd)}</b>\n` +
-      `Notional: <b>${formatUsd(notional)}</b>\n` +
-      `SL: <b>${slPct}%</b> | TP: <b>3%</b>\n\n` +
-      `🧠 <b>Por qué:</b>\n` +
-      `${escapeHTML(rule.note)}\n\n` +
+      `Qty: <b>${qty}</b> | Leverage: <b>${leverage}x</b>\n` +
+      `Risk: <b>${formatUsd(riskUsd)}</b> | Notional: <b>${formatUsd(notional)}</b>\n` +
+      `SL: <b>${slPct}%</b> | TP: <b>${tpPct}%</b>\n\n` +
+      `🧠 <b>Por qué:</b> ${escapeHTML(rule.note)}\n\n` +
       `📊 <b>Confluencia (${confluenceData.pairs.length} pares):</b>\n` +
       `${confluenceLines}\n\n` +
-      `Fuerza de señal: <b>${escapeHTML(rule.strength.toUpperCase())}</b>\n\n` +
-      `Responde:\n` +
+      `Fuerza: <b>${escapeHTML(confluenceData.signalLevel.toUpperCase())}</b>\n\n` +
       `✅ /emoconfirmar — ejecutar\n` +
       `❌ /emocancelar  — descartar\n\n` +
       `⚠️ Expira en 3 minutos.`
     );
 
-    // Guardar pending
-    _pendingEmoTrade = { symbol, side, qty, price: markPrice, leverage, rule, confluenceData, ts: Date.now() };
-
-    // Auto-expirar
     setTimeout(() => {
       if (_pendingEmoTrade && Date.now() - _pendingEmoTrade.ts >= 3 * 60 * 1000) {
         _pendingEmoTrade = null;
@@ -384,8 +435,6 @@ async function executeEmoTrade(symbol, side, leverage, rule, confluenceData) {
   }
 }
 
-let _pendingEmoTrade = null;
-
 async function confirmEmoTrade() {
   if (!_pendingEmoTrade) return;
   const { symbol, side, qty, price, leverage, rule } = _pendingEmoTrade;
@@ -393,21 +442,16 @@ async function confirmEmoTrade() {
 
   try {
     await sendPrivate(`⏳ Ejecutando ${side === "BUY" ? "LONG" : "SHORT"} en ${symbol}...`);
-
-    const order     = await placeMarketOrder(symbol, side, qty);
+    const order     = await atPlaceMarketOrder(symbol, side, qty);
     const fillPrice = parseFloat(order.avgPrice || order.price || price);
-    const slPct     = Number(process.env.AUTO_TRADE_SL_PCT || 1.5);
 
     await sleep(500);
-    const { slPrice, tpPrice, slOrderId, tpOrderId } = await placeSlTp(symbol, side, qty, fillPrice, slPct);
+    const { slPrice, tpPrice, slOrderId, tpOrderId } = await atPlaceSlTp(symbol, side, qty, fillPrice);
 
     emoPosition = { symbol, side, qty, entryPrice: fillPrice, slOrderId, tpOrderId, leverage, rule, ts: Date.now() };
-
-    if (_config?.personalTradingState) {
-      _config.personalTradingState.tradesToday += 1;
-    }
-
     lastSignalTs = Date.now();
+
+    if (_config?.personalTradingState) _config.personalTradingState.tradesToday += 1;
 
     await sendPrivate(
       `✅ <b>EMOTION TRADE EJECUTADO</b>\n\n` +
@@ -430,24 +474,19 @@ async function confirmEmoTrade() {
 }
 
 async function closeEmoPosition(reason = "Manual") {
-  if (!emoPosition) {
-    await sendPrivate("⚠️ No hay posición de EmoTrader abierta.");
-    return;
-  }
+  if (!emoPosition) { await sendPrivate("⚠️ No hay posición de EmoTrader abierta."); return; }
   try {
     const { symbol, side, qty, entryPrice, slOrderId, tpOrderId } = emoPosition;
     const closeSide = side === "BUY" ? "SELL" : "BUY";
 
-    if (slOrderId) await cancelOrder(symbol, slOrderId);
-    if (tpOrderId) await cancelOrder(symbol, tpOrderId);
+    if (slOrderId) await atCancelOrder(symbol, slOrderId);
+    if (tpOrderId) await atCancelOrder(symbol, tpOrderId);
     await sleep(300);
 
-    const order     = await placeMarketOrder(symbol, closeSide, qty);
+    const order     = await atPlaceMarketOrder(symbol, closeSide, qty);
     const exitPrice = parseFloat(order.avgPrice || order.price || entryPrice);
-    const pnlRaw    = side === "BUY"
-      ? (exitPrice - entryPrice) * qty
-      : (entryPrice - exitPrice) * qty;
-    const pnl = parseFloat(pnlRaw.toFixed(2));
+    const pnlRaw    = side === "BUY" ? (exitPrice - entryPrice) * qty : (entryPrice - exitPrice) * qty;
+    const pnl       = parseFloat(pnlRaw.toFixed(2));
 
     if (_config?.personalTradingState) {
       _config.personalTradingState.pnlToday += pnl;
@@ -455,9 +494,7 @@ async function closeEmoPosition(reason = "Manual") {
       if (
         _config.personalTradingState.pnlToday >= _config.PERSONAL_PLAN.dailyProfitLock ||
         _config.personalTradingState.pnlToday <= -Math.abs(_config.PERSONAL_PLAN.maxDailyLoss)
-      ) {
-        _config.personalTradingState.coolingDown = true;
-      }
+      ) _config.personalTradingState.coolingDown = true;
     }
 
     emoPosition = null;
@@ -479,225 +516,22 @@ async function closeEmoPosition(reason = "Manual") {
 }
 
 // ===============================
-// CONFLUENCE DETECTOR
-// ===============================
-function detectConfluence(transitionKey) {
-  const pairs = [];
-
-  for (const [symbol, state] of pairState.entries()) {
-    if (!state.prevEmotion || !state.emotion) continue;
-    const key = getTransitionKey(state.prevEmotion, state.emotion);
-    if (key === transitionKey) {
-      const emo = EMOTIONS.find((e) => e.key === state.emotion);
-      pairs.push({
-        symbol,
-        emoji: emo?.emoji || "❓",
-        transition: `${state.prevEmotion} → ${state.emotion}`,
-        pct5m: state.pct5m,
-      });
-    }
-  }
-
-  return pairs;
-}
-
-// ===============================
-// PROCESS EMOTION TRANSITION
-// ===============================
-async function processTransition(symbol, prevEmotion, nextEmotion, pct5m) {
-  const transitionKey = getTransitionKey(prevEmotion, nextEmotion);
-  const rule          = TRANSITION_RULES[transitionKey];
-
-  if (!rule) return;
-
-  // Registrar en historial
-  transitionHistory.unshift({
-    symbol,
-    transitionKey,
-    action: rule.action,
-    strength: rule.strength,
-    pct5m,
-    ts: Date.now(),
-  });
-  if (transitionHistory.length > MAX_HISTORY) transitionHistory.pop();
-
-  console.log(`[EmoTrader] ${symbol}: ${transitionKey} → ${rule.action} (${rule.strength})`);
-
-  // Si es señal de cierre
-  if (rule.action === "CLOSE_LONG" && emoPosition?.side === "BUY") {
-    await closeEmoPosition(`Señal emocional: ${transitionKey}`);
-    return;
-  }
-  if (rule.action === "CLOSE_SHORT" && emoPosition?.side === "SELL") {
-    await closeEmoPosition(`Señal emocional: ${transitionKey}`);
-    return;
-  }
-
-  // Si no es LONG o SHORT, salir
-  if (rule.action !== "LONG" && rule.action !== "SHORT") return;
-
-  // Cooldown entre señales
-  if (Date.now() - lastSignalTs < SIGNAL_COOLDOWN_MS) return;
-
-  // No abrir si ya hay posición
-  if (emoPosition) return;
-
-  // Medir confluencia
-  const confluencePairs = detectConfluence(transitionKey);
-  const count           = confluencePairs.length;
-
-  // Nivel de señal
-  let signalLevel = null;
-  if (count >= CONFLUENCE.strong) signalLevel = "strong";
-  else if (count >= CONFLUENCE.medium) signalLevel = "medium";
-  else if (count >= CONFLUENCE.weak) signalLevel = "weak";
-
-  if (!signalLevel) return;
-
-  // Solo alertar sin operar para señales débiles
-  if (signalLevel === "weak") {
-    await sendPrivate(
-      `🟡 <b>EmoTrader — Señal Débil</b>\n\n` +
-      `${escapeHTML(transitionKey)}\n` +
-      `Par: <b>${escapeHTML(symbol)}</b>\n` +
-      `Movimiento 5m: <b>${formatPct(pct5m)}</b>\n` +
-      `Confluencia: <b>${count} par(es)</b>\n\n` +
-      `ℹ️ Señal insuficiente para operar. Monitoreando...`
-    );
-    return;
-  }
-
-  // Señal media o fuerte → proponer trade
-  const side      = rule.action === "LONG" ? "BUY" : "SELL";
-  const leverage  = rule.leverage;
-
-  // Elegir el par con mayor movimiento como el par a tradear
-  const bestPair  = confluencePairs.sort((a, b) => Math.abs(b.pct5m) - Math.abs(a.pct5m))[0];
-  const tradeSymbol = bestPair?.symbol || symbol;
-
-  await executeEmoTrade(tradeSymbol, side, leverage, rule, {
-    transitionKey,
-    pairs: confluencePairs,
-    signalLevel,
-  });
-}
-
-// ===============================
-// EVALUATE PAIR STATE
-// Llamado cada 60 segundos por par
-// ===============================
-async function evaluatePair(symbol) {
-  try {
-    const pct5m    = calcPctChange(symbol, 5 * 60 * 1000);
-    const emotion  = getEmotion(pct5m);
-    const existing = pairState.get(symbol);
-
-    const prevEmotion = existing?.emotion || null;
-    const price       = priceBuffer.get(symbol)?.slice(-1)[0]?.price || 0;
-
-    pairState.set(symbol, {
-      emotion:     emotion.key,
-      prevEmotion,
-      pct5m,
-      price,
-      ts: Date.now(),
-    });
-
-    // Detectar transición
-    if (prevEmotion && prevEmotion !== emotion.key) {
-      await processTransition(symbol, prevEmotion, emotion.key, pct5m);
-    }
-  } catch (err) {
-    console.error(`[EmoTrader] evaluatePair ${symbol}:`, err.message);
-  }
-}
-
-// ===============================
-// WEBSOCKET — Binance Futures Mini Ticker
-// Escucha todos los pares simultáneamente
-// ===============================
-function buildWsUrl() {
-  const streams = EMOTION_TRADE_PAIRS
-    .map((s) => `${s.toLowerCase()}@miniTicker`)
-    .join("/");
-
-  const base = process.env.BINANCE_TESTNET !== "false"
-    ? "wss://stream.binancefuture.com/stream?streams="
-    : "wss://fstream.binance.com/stream?streams=";
-
-  return `${base}${streams}`;
-}
-
-function connectWebSocket() {
-  const url = buildWsUrl();
-  console.log("[EmoTrader] Conectando WebSocket...");
-
-  _ws = new WebSocket(url);
-
-  _ws.on("open", () => {
-    console.log("[EmoTrader] WebSocket conectado —", EMOTION_TRADE_PAIRS.length, "pares");
-    if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null; }
-  });
-
-  _ws.on("message", (raw) => {
-    try {
-      const msg  = JSON.parse(raw);
-      const data = msg?.data || msg;
-      if (!data || data.e !== "24hrMiniTicker") return;
-
-      const symbol = data.s;
-      const price  = parseFloat(data.c); // close price
-
-      if (!EMOTION_TRADE_PAIRS.includes(symbol)) return;
-
-      pushPrice(symbol, price);
-    } catch (_) {}
-  });
-
-  _ws.on("error", (err) => {
-    console.error("[EmoTrader] WebSocket error:", err.message);
-  });
-
-  _ws.on("close", () => {
-    console.warn("[EmoTrader] WebSocket cerrado. Reconectando en 5s...");
-    _wsReconnectTimer = setTimeout(connectWebSocket, 5000);
-  });
-}
-
-// ===============================
-// EVALUATION LOOP
-// Evalúa todos los pares cada 60 segundos
-// ===============================
-function startEvaluationLoop() {
-  setInterval(async () => {
-    for (const symbol of EMOTION_TRADE_PAIRS) {
-      await evaluatePair(symbol);
-      await sleep(100); // pequeña pausa entre pares
-    }
-  }, 60 * 1000);
-
-  console.log("[EmoTrader] Loop de evaluación iniciado (60s)");
-}
-
-// ===============================
 // TELEGRAM HANDLERS
 // ===============================
 async function handleEmoStatus(ctx) {
-  const lines = [];
+  if (!pairState.size) {
+    return ctx.reply("⏳ Cargando datos... espera 30 segundos y vuelve a intentar.", { parse_mode: "HTML" });
+  }
 
-  for (const symbol of EMOTION_TRADE_PAIRS) {
+  const lines = EMOTION_TRADE_PAIRS.map((symbol) => {
     const state = pairState.get(symbol);
-    if (!state) { lines.push(`• <b>${symbol}</b> — sin datos aún`); continue; }
-
+    if (!state) return `• <b>${symbol}</b> — sin datos`;
     const emo   = EMOTIONS.find((e) => e.key === state.emotion);
     const arrow = state.prevEmotion && state.prevEmotion !== state.emotion
       ? ` ← ${EMOTIONS.find((e) => e.key === state.prevEmotion)?.emoji || ""}`
       : "";
-
-    lines.push(
-      `${emo?.emoji || "❓"} <b>${symbol}</b> ${formatPct(state.pct5m)}${arrow}`
-    );
-  }
+    return `${emo?.emoji || "❓"} <b>${symbol}</b> ${formatPct(state.pct)}${arrow}`;
+  });
 
   const posInfo = emoPosition
     ? `\n\n📈 <b>Posición abierta:</b>\n${emoPosition.side === "BUY" ? "LONG" : "SHORT"} ${emoPosition.symbol} entry ${formatUsd(emoPosition.entryPrice)}`
@@ -705,44 +539,35 @@ async function handleEmoStatus(ctx) {
 
   return ctx.reply(
     `🧬 <b>EmoTrader — Estado Actual</b>\n\n` +
-    lines.join("\n") +
-    posInfo +
-    `\n\n🌐 wojakmeter.com`,
+    lines.join("\n") + posInfo + `\n\n🌐 wojakmeter.com`,
     { parse_mode: "HTML", disable_web_page_preview: true }
   );
 }
 
 async function handleEmoHistory(ctx) {
-  if (!transitionHistory.length) {
-    return ctx.reply("📜 Sin transiciones registradas aún.");
-  }
-
+  if (!transitionHistory.length) return ctx.reply("📜 Sin transiciones registradas aún.");
   const lines = transitionHistory.slice(0, 15).map((t) => {
-    const rule  = TRANSITION_RULES[t.transitionKey];
-    const icon  = rule?.action === "LONG" ? "📈" : rule?.action === "SHORT" ? "📉" : "🔄";
-    const time  = new Date(t.ts).toTimeString().slice(0, 5);
+    const rule = TRANSITION_RULES[t.transitionKey];
+    const icon = rule?.action === "LONG" ? "📈" : rule?.action === "SHORT" ? "📉" : "🔄";
+    const time = new Date(t.ts).toTimeString().slice(0, 5);
     return `${icon} <b>${t.symbol}</b> ${escapeHTML(t.transitionKey)} [${time}]`;
   });
-
   return ctx.reply(
-    `📜 <b>EmoTrader — Historial</b>\n\n` +
-    lines.join("\n") +
-    `\n\n🌐 wojakmeter.com`,
+    `📜 <b>EmoTrader — Historial</b>\n\n` + lines.join("\n") + `\n\n🌐 wojakmeter.com`,
     { parse_mode: "HTML" }
   );
 }
 
 async function handleEmoPairs(ctx) {
-  const lines = EMOTION_TRADE_PAIRS.map((s, i) => `${i + 1}. ${s}`);
   return ctx.reply(
-    `📋 <b>EmoTrader — Pares Monitoreados (${EMOTION_TRADE_PAIRS.length})</b>\n\n` +
-    lines.join("\n"),
+    `📋 <b>EmoTrader — ${EMOTION_TRADE_PAIRS.length} Pares Monitoreados</b>\n\n` +
+    EMOTION_TRADE_PAIRS.map((s, i) => `${i + 1}. ${s}`).join("\n"),
     { parse_mode: "HTML" }
   );
 }
 
 async function handleEmoConfirmar(ctx) {
-  if (!_pendingEmoTrade) return ctx.reply("⚠️ No hay trade pendiente.");
+  if (!_pendingEmoTrade) return ctx.reply("⚠️ No hay trade pendiente de confirmación.");
   await ctx.reply("✅ Confirmado. Ejecutando...");
   await confirmEmoTrade();
 }
@@ -766,10 +591,6 @@ async function handleEmoCerrar(ctx) {
 function start(config) {
   _config = config;
 
-  if (!config.binanceApiKey || !config.binanceApiSecret) {
-    console.warn("[EmoTrader] Sin API keys — modo observación solo (sin trades)");
-  }
-
   _binance = new Binance().options({
     APIKEY:        config.binanceApiKey    || "",
     APISECRET:     config.binanceApiSecret || "",
@@ -782,10 +603,8 @@ function start(config) {
     },
   });
 
-  connectWebSocket();
-  startEvaluationLoop();
-
-  console.log("[EmoTrader] Iniciado —", EMOTION_TRADE_PAIRS.length, "pares | testnet:", config.useTestnet);
+  pollLoop();
+  console.log(`[EmoTrader] Iniciado — ${EMOTION_TRADE_PAIRS.length} pares | poll cada ${POLL_INTERVAL_MS / 1000}s`);
 }
 
 // ===============================
