@@ -127,16 +127,27 @@ function getTransitionKey(prev, next) {
 // ===============================
 async function fetchAllTickers() {
   try {
-    const url = "https://fapi.binance.com/fapi/v1/ticker/24hr";
-    const res  = await fetch(url, {
-      headers: { "User-Agent": "WojakMeterBot/2.0" },
-      signal: AbortSignal.timeout(10000),
+    // Usa CoinGecko — ya funciona desde Railway
+    const url = "https://api.coingecko.com/api/v3/coins/markets" +
+      "?vs_currency=usd&order=market_cap_desc&per_page=250&page=1" +
+      "&sparkline=false&price_change_percentage=24h";
+
+    const res = await fetch(url, {
+      headers: { "User-Agent": "WojakMeterBot/2.0", "Accept": "application/json" },
+      signal: AbortSignal.timeout(15000),
     });
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-    const data = await res.json();
-    return Array.isArray(data) ? data : [];
+    const coins = await res.json();
+    if (!Array.isArray(coins)) return [];
+
+    // Convertir formato CoinGecko → formato interno
+    return coins.map((c) => ({
+      symbol:             (c.symbol || "").toUpperCase() + "USDT",
+      lastPrice:          String(c.current_price || 0),
+      priceChangePercent: String(c.price_change_percentage_24h || 0),
+    }));
   } catch (err) {
     console.error("[EmoTrader] fetchAllTickers error:", err.message);
     return [];
