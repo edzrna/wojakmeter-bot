@@ -2,6 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
 const Binance = require("node-binance-api");
+const emotionTrader = require("./emotion-trader");
 
 // ===============================
 // CONFIG
@@ -978,6 +979,7 @@ function buildMainKeyboard() {
     ["📋 My Plan"],
     ["🤖 AutoTrade ON", "🛑 AutoTrade OFF"],
     ["📈 Posición", "📋 Órdenes"],
+    ["🧬 Emo Status", "📜 Emo History"],
     ["/coin btc", "/daily"],
     ["/mywatchlist", "/scan"],
     ["/scandebug", "/testsignal"],
@@ -1700,6 +1702,13 @@ bot.command("losers",     sendTopLosers);
 bot.command("radar",      sendRadar);
 bot.command("discipline", sendDiscipline);
 
+bot.command("emostatus",    async (ctx) => { if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx); return emotionTrader.handleEmoStatus(ctx); });
+bot.command("emohistory",   async (ctx) => { if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx); return emotionTrader.handleEmoHistory(ctx); });
+bot.command("emopairs",     async (ctx) => { if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx); return emotionTrader.handleEmoPairs(ctx); });
+bot.command("emoconfirmar", async (ctx) => { if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx); return emotionTrader.handleEmoConfirmar(ctx); });
+bot.command("emocancelar",  async (ctx) => { if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx); return emotionTrader.handleEmoCancelar(ctx); });
+bot.command("emocerrar",    async (ctx) => { if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx); return emotionTrader.handleEmoCerrar(ctx); });
+
 // AutoTrade commands
 bot.command("confirmar", async (ctx) => {
   if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
@@ -1974,6 +1983,9 @@ bot.on("text", async (ctx) => {
   if (text.includes("Radar"))       return sendRadar(ctx);
   if (text.includes("Discipline"))  return sendDiscipline(ctx);
 
+  if (text.includes("Emo Status"))  { if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx); return emotionTrader.handleEmoStatus(ctx); }
+  if (text.includes("Emo History")) { if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx); return emotionTrader.handleEmoHistory(ctx); }
+
   if (text.includes("AutoTrade ON")) {
     if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
     autoTradeActive = true;
@@ -2065,7 +2077,21 @@ app.listen(PORT, "0.0.0.0", () => console.log(`HTTP server listening on port ${P
   await warmUpCache().catch(console.error);
   await runChannelBroadcast().catch(console.error);
   await scanMarketPersonalSignals().catch(console.error);
+
+  // Iniciar EmoTrader
+  emotionTrader.start({
+    bot,
+    PERSONAL_PLAN,
+    personalTradingState,
+    resetPersonalStateIfNewDay,
+    PRIVATE_TELEGRAM_USER_ID,
+    binanceApiKey:    BINANCE_API_KEY,
+    binanceApiSecret: BINANCE_API_SECRET,
+    useTestnet:       USE_TESTNET,
+  });
 })();
 
 process.once("SIGINT",  () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
+
+// Auto-appended: EmoTrader start is called inside the async block above via inline patch
