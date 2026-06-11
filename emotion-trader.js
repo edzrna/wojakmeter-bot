@@ -132,8 +132,10 @@ async function fetchAllTickers() {
       "?vs_currency=usd&order=market_cap_desc&per_page=250&page=1" +
       "&sparkline=false&price_change_percentage=24h";
 
+    const cgHeaders = { "User-Agent": "WojakMeterBot/2.0", "Accept": "application/json" };
+    if (process.env.COINGECKO_API_KEY) cgHeaders["x-cg-demo-api-key"] = process.env.COINGECKO_API_KEY;
     const res = await fetch(url, {
-      headers: { "User-Agent": "WojakMeterBot/2.0", "Accept": "application/json" },
+      headers: cgHeaders,
       signal: AbortSignal.timeout(15000),
     });
 
