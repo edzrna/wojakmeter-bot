@@ -2093,5 +2093,3 @@ app.listen(PORT, "0.0.0.0", () => console.log(`HTTP server listening on port ${P
 
 process.once("SIGINT",  () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
-
-// Auto-appended: EmoTrader start is called inside the async block above via inline patch
