@@ -216,8 +216,8 @@ function buildTradeLinksFromSymbol(symbol = "") {
   const spotPair    = `${base}_USDT`;
   return {
     pair:            futuresPair,
-    binanceFutures:  `https://www.binance.com/en/futures/${futuresPair}`,
-    binanceSpot:     `https://www.binance.com/en/trade/${spotPair}`,
+    binanceFutures:  `https://app.binance.com/en/futures/${futuresPair}`,
+    binanceSpot:     `https://app.binance.com/en/trade/${spotPair}`,
     tradingView:     `https://www.tradingview.com/symbols/${futuresPair}/`
   };
 }
@@ -900,6 +900,165 @@ async function scanMarketPersonalSignals() {
 }
 
 // ===============================
+// ANALYZE — Top 10 Pairs
+// ===============================
+function analyzePair(coin) {
+  const change1h  = safe(coin.price_change_percentage_1h_in_currency,  0);
+  const change24h = safe(coin.price_change_percentage_24h_in_currency, 0);
+  const change7d  = safe(coin.price_change_percentage_7d_in_currency,  0);
+  const volume    = safe(coin.total_volume,  0);
+  const marketCap = safe(coin.market_cap,    0);
+  const price     = safe(coin.current_price, 0);
+  const volToMcap = marketCap > 0 ? (volume / marketCap) * 100 : 0;
+
+  let score = 50;
+  score += change24h * 3.5;
+  score += change1h  * 6;
+  score += change7d  * 1.2;
+  if (volToMcap > 10)     score += 8;
+  else if (volToMcap > 5) score += 4;
+  else if (volToMcap < 1) score -= 4;
+  score = Math.round(clamp(score, 0, 100));
+
+  let direction  = "WAIT";
+  let action     = null;
+  let confidence = "—";
+
+  const reversalLong  = (change24h < -4 && change1h >  0.5);
+  const reversalShort = (change24h >  4 && change1h < -0.5);
+  const trendLong     = (change24h > 2 && change7d > 3 && change1h > 0);
+  const trendShort    = (change24h < -2 && change7d < -3 && change1h < 0);
+
+  if (score >= 72) {
+    direction  = "LONG";
+    action     = "BUY";
+    confidence = score >= 85 ? "High 🔥" : "Medium";
+  } else if (score <= 32) {
+    direction  = "SHORT";
+    action     = "SELL";
+    confidence = score <= 18 ? "High 🔥" : "Medium";
+  } else if (reversalLong) {
+    direction  = "LONG (Reversal)";
+    action     = "BUY";
+    confidence = "Medium";
+    score      = Math.max(score, 62);
+  } else if (reversalShort) {
+    direction  = "SHORT (Reversal)";
+    action     = "SELL";
+    confidence = "Medium";
+    score      = Math.min(score, 38);
+  } else if (trendLong) {
+    direction  = "LONG (Trend)";
+    action     = "BUY";
+    confidence = "Medium";
+  } else if (trendShort) {
+    direction  = "SHORT (Trend)";
+    action     = "SELL";
+    confidence = "Medium";
+  }
+
+  const slPct   = 2.0;
+  const tpPct   = 5.0;
+  const slPrice = action === "BUY"
+    ? price * (1 - slPct / 100)
+    : price * (1 + slPct / 100);
+  const tpPrice = action === "BUY"
+    ? price * (1 + tpPct / 100)
+    : price * (1 - tpPct / 100);
+
+  const reasons = [];
+  if (Math.abs(change24h) >= 3)   reasons.push(`24h: ${formatPercent(change24h)}`);
+  if (Math.abs(change1h)  >= 0.5) reasons.push(`1h: ${formatPercent(change1h)}`);
+  if (Math.abs(change7d)  >= 3)   reasons.push(`7d: ${formatPercent(change7d)}`);
+  if (volToMcap > 5)              reasons.push(`Vol/MCap: ${volToMcap.toFixed(1)}%`);
+
+  return {
+    coin, score, direction, action, confidence,
+    change1h, change24h, change7d, volToMcap,
+    price, slPrice, tpPrice, slPct, tpPct, reasons
+  };
+}
+
+function buildAnalyzeLine(a, index) {
+  const symbol  = (a.coin.symbol || "").toUpperCase();
+  const links   = buildTradeLinksFromSymbol(symbol);
+  const emotion = getEmotionByChange(a.change24h);
+  const dirIcon = a.action === "BUY" ? "📈" : a.action === "SELL" ? "📉" : "⏸";
+  const rr      = `1:${(a.tpPct / a.slPct).toFixed(1)}`;
+
+  const instruction = a.action
+    ? (
+        `Entry ≈ <b>${formatUsd(a.price)}</b>\n` +
+        `SL: <b>${formatUsd(a.slPrice)}</b> (-${a.slPct}%) · TP: <b>${formatUsd(a.tpPrice)}</b> (+${a.tpPct}%)\n` +
+        `R/R: <b>${rr}</b> · Confidence: <b>${a.confidence}</b>`
+      )
+    : `No clear setup — wait for direction.`;
+
+  const reasons = a.reasons.length ? a.reasons.join(" · ") : "Mixed signals";
+
+  return (
+    `${index}. ${dirIcon} <b>${escapeHTML(symbol)}</b> — <b>${escapeHTML(a.direction)}</b>\n` +
+    `${emotion.emoji} Score: <b>${a.score}/100</b> · ${escapeHTML(reasons)}\n` +
+    `${instruction}\n` +
+    `<a href="${links.binanceFutures}">Binance App</a> · <a href="${links.tradingView}">Chart</a>`
+  );
+}
+
+async function sendAnalysis(ctx) {
+  await ctx.reply("🔍 Analyzing top tradeable pairs...", { reply_markup: buildMainKeyboard().reply_markup });
+  try {
+    const markets = await getMarkets();
+
+    const valid = markets
+      .filter(c =>
+        c.current_price > 0 &&
+        c.total_volume > 0 &&
+        c.price_change_percentage_24h_in_currency != null
+      )
+      .slice(0, 50);
+
+    const analyzed = valid
+      .map(analyzePair)
+      .sort((a, b) => {
+        const aAction = a.action ? 1 : 0;
+        const bAction = b.action ? 1 : 0;
+        if (bAction !== aAction) return bAction - aAction;
+        return Math.abs(b.score - 50) - Math.abs(a.score - 50);
+      })
+      .slice(0, 10);
+
+    const longs  = analyzed.filter(a => a.action === "BUY").length;
+    const shorts = analyzed.filter(a => a.action === "SELL").length;
+
+    const marketBias = longs > shorts
+      ? `📈 Bullish bias (${longs} LONG / ${shorts} SHORT)`
+      : longs < shorts
+        ? `📉 Bearish bias (${shorts} SHORT / ${longs} LONG)`
+        : `⚖️ Neutral (${longs} LONG / ${shorts} SHORT)`;
+
+    const global  = await getGlobal().catch(() => null);
+    const change  = safe(global?.data?.market_cap_change_percentage_24h_usd, 0);
+    const score   = scoreFromChange(change);
+    const emotion = getEmotionByChange(change);
+    const lines   = analyzed.map((a, i) => buildAnalyzeLine(a, i + 1)).join("\n\n");
+
+    return ctx.reply(
+      `🧠 <b>WojakMeter Analysis — Top 10 Pairs</b>\n\n` +
+      `${emotion.emoji} Market: <b>${emotion.label}</b> (${score}/100)\n` +
+      `${marketBias}\n\n` +
+      `━━━━━━━━━━━━━━━━━━━\n\n` +
+      `${lines}\n\n` +
+      `━━━━━━━━━━━━━━━━━━━\n\n` +
+      `⚠️ <b>Discipline</b>\n` +
+      `Signal readings only — not direct entries.\n` +
+      `Confirm setup, define stop loss and size risk before trading.\n\n` +
+      `🌐 wojakmeter.com`,
+      { parse_mode: "HTML", disable_web_page_preview: true, reply_markup: buildMainKeyboard().reply_markup }
+    );
+  } catch (error) { return replyWithError(ctx, error, "Error analyze"); }
+}
+
+// ===============================
 // KEYBOARD
 // ===============================
 function buildMainKeyboard() {
@@ -908,8 +1067,8 @@ function buildMainKeyboard() {
     ["🔥 Trending", "🌟 Spotlight"],
     ["⚠️ Risk", "₿ BTC Mood"],
     ["🚀 Top Gainers", "💥 Top Losers"],
-    ["🧪 Radar", "🧠 Discipline"],
-    ["📋 My Plan"],
+    ["🧪 Radar", "🔍 Analyze"],
+    ["🧠 Discipline", "📋 My Plan"],
     ["🤖 AutoTrade ON", "🛑 AutoTrade OFF"],
     ["📈 Position", "📋 Orders"],
     ["🧬 Emo Status", "📜 Emo History"],
@@ -1621,6 +1780,7 @@ bot.command("gainers",    sendTopGainers);
 bot.command("losers",     sendTopLosers);
 bot.command("radar",      sendRadar);
 bot.command("discipline", sendDiscipline);
+bot.command("analyze",    sendAnalysis);
 
 bot.command("emostatus",    async (ctx) => { if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx); return emotionTrader.handleEmoStatus(ctx); });
 bot.command("emohistory",   async (ctx) => { if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx); return emotionTrader.handleEmoHistory(ctx); });
@@ -1915,6 +2075,7 @@ bot.on("text", async (ctx) => {
   if (text.includes("Top Gainers")) return sendTopGainers(ctx);
   if (text.includes("Top Losers"))  return sendTopLosers(ctx);
   if (text.includes("Radar"))       return sendRadar(ctx);
+  if (text.includes("Analyze"))     return sendAnalysis(ctx);
   if (text.includes("Discipline"))  return sendDiscipline(ctx);
 
   if (text.includes("Emo Status"))  { if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx); return emotionTrader.handleEmoStatus(ctx); }
