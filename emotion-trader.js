@@ -2,7 +2,6 @@
 // WOJAKMETER — EMOTION TRADER v4 SAFE-CONFIRM
 // WebSocket Binance + Funding Rate + Liquidations
 // + REST CoinGecko fallback
-// Optimized for small-account risk control
 // Requires manual confirmation before execution
 // ===============================
 
@@ -10,7 +9,7 @@ const WebSocket = require("ws");
 const Binance = require("node-binance-api");
 
 // ===============================
-// PAIRS — 27 pairs
+// PAIRS
 // ===============================
 const EMOTION_TRADE_PAIRS = [
   "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
@@ -22,7 +21,7 @@ const EMOTION_TRADE_PAIRS = [
 ];
 
 // ===============================
-// EMOTION CONFIG
+// EMOTIONS
 // ===============================
 const EMOTIONS = [
   { key: "euphoria", emoji: "🤩", label: "Euphoria", minPct: 12 },
@@ -36,7 +35,6 @@ const EMOTIONS = [
 
 // ===============================
 // TRANSITION RULES — SAFER VERSION
-// Lower leverage, more controlled
 // ===============================
 const TRANSITION_RULES = {
   "neutral→optimism": {
@@ -45,24 +43,28 @@ const TRANSITION_RULES = {
     strength: "medium",
     note: "Market waking up to the upside"
   },
+
   "optimism→content": {
     action: "LONG",
     leverage: 4,
     strength: "strong",
     note: "Bullish momentum confirmed"
   },
+
   "doubt→neutral": {
     action: "LONG",
     leverage: 3,
     strength: "medium",
     note: "Bearish pressure fading"
   },
+
   "frustration→concern": {
     action: "LONG",
     leverage: 3,
     strength: "medium",
     note: "Possible emotional bottom"
   },
+
   "concern→doubt": {
     action: "LONG",
     leverage: 4,
@@ -76,24 +78,28 @@ const TRANSITION_RULES = {
     strength: "medium",
     note: "Market losing conviction"
   },
+
   "doubt→concern": {
     action: "SHORT",
     leverage: 4,
     strength: "strong",
     note: "Bearish pressure confirmed"
   },
+
   "optimism→neutral": {
     action: "SHORT",
     leverage: 3,
     strength: "medium",
     note: "Bullish momentum losing steam"
   },
+
   "euphoria→content": {
     action: "SHORT",
     leverage: 3,
     strength: "medium",
     note: "Possible emotional top"
   },
+
   "content→optimism": {
     action: "SHORT",
     leverage: 2,
@@ -107,6 +113,7 @@ const TRANSITION_RULES = {
     strength: "exit",
     note: "Euphoria reached — close LONG"
   },
+
   "concern→frustration": {
     action: "CLOSE_SHORT",
     leverage: 0,
@@ -116,8 +123,7 @@ const TRANSITION_RULES = {
 };
 
 // ===============================
-// CONFLUENCE — SAFER VERSION
-// More confluence required = fewer bad signals
+// CONFLUENCE / INTERVALS
 // ===============================
 const CONFLUENCE = {
   weak: 2,
@@ -145,6 +151,7 @@ const priceBuffer = new Map();
 const fundingRates = new Map();
 const liquidations = [];
 const transitionHistory = [];
+
 const MAX_HISTORY = 50;
 
 let lastSignalTs = 0;
@@ -165,12 +172,16 @@ function formatUsd(n) {
   const num = Number(n);
 
   if (!Number.isFinite(num)) return "$0.00";
-  if (Math.abs(num) >= 1_000_000_000) return `$${(num / 1_000_000_000).toFixed(2)}B`;
-  if (Math.abs(num) >= 1_000_000) return `$${(num / 1_000_000).toFixed(2)}M`;
-  if (Math.abs(num) >= 1_000) return `$${(num / 1_000).toFixed(2)}K`;
-  if (Math.abs(num) >= 1) return `$${num.toFixed(2)}`;
 
-  return `$${num.toFixed(6)}`;
+  const sign = num < 0 ? "-" : "";
+  const abs = Math.abs(num);
+
+  if (abs >= 1_000_000_000) return `${sign}$${(abs / 1_000_000_000).toFixed(2)}B`;
+  if (abs >= 1_000_000) return `${sign}$${(abs / 1_000_000).toFixed(2)}M`;
+  if (abs >= 1_000) return `${sign}$${(abs / 1_000).toFixed(2)}K`;
+  if (abs >= 1) return `${sign}$${abs.toFixed(2)}`;
+
+  return `${sign}$${abs.toFixed(6)}`;
 }
 
 function formatPct(n) {
@@ -180,10 +191,6 @@ function formatPct(n) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
 }
 
 function getEmotion(pct) {
@@ -198,6 +205,7 @@ function getEmotion(pct) {
 
 function pushPrice(symbol, price) {
   const cleanPrice = Number(price);
+
   if (!Number.isFinite(cleanPrice) || cleanPrice <= 0) return;
 
   if (!priceBuffer.has(symbol)) {
@@ -205,6 +213,7 @@ function pushPrice(symbol, price) {
   }
 
   const buf = priceBuffer.get(symbol);
+
   buf.push({
     price: cleanPrice,
     ts: Date.now()
@@ -257,13 +266,6 @@ function getFundingSignal(symbol, direction) {
   return "neutral";
 }
 
-function getMaxAllowedLeverage(plan, ruleLeverage) {
-  const maxPlanLev = Number(plan?.maxLeverage || 5);
-  const ruleLev = Number(ruleLeverage || 1);
-
-  return Math.max(1, Math.min(maxPlanLev, ruleLev));
-}
-
 function getSlPct() {
   return Number(process.env.AUTO_TRADE_SL_PCT || 1.5);
 }
@@ -272,8 +274,15 @@ function getTpPct() {
   return Number(process.env.AUTO_TRADE_TP_PCT || 3.0);
 }
 
+function getMaxAllowedLeverage(plan, ruleLeverage) {
+  const maxPlanLev = Number(plan?.maxLeverage || 5);
+  const ruleLev = Number(ruleLeverage || 1);
+
+  return Math.max(1, Math.min(maxPlanLev, ruleLev));
+}
+
 // ===============================
-// WEBSOCKET — Binance Futures
+// WEBSOCKET — BINANCE FUTURES
 // ===============================
 function buildWsUrl() {
   const tickers = EMOTION_TRADE_PAIRS
@@ -354,6 +363,7 @@ function connectWebSocket() {
 
   _ws.on("close", () => {
     console.warn("[EmoTrader] WebSocket closed. Reconnecting in 5s...");
+
     _wsReconnectTimer = setTimeout(connectWebSocket, 5000);
   });
 }
@@ -370,7 +380,9 @@ async function fetchFundingRates() {
       signal: AbortSignal.timeout(10000)
     });
 
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
 
     const data = await res.json();
 
@@ -392,7 +404,7 @@ async function fetchFundingRates() {
 }
 
 // ===============================
-// REST FALLBACK — CoinGecko
+// REST FALLBACK — COINGECKO
 // ===============================
 async function fetchCoinGeckoFallback() {
   try {
@@ -414,7 +426,9 @@ async function fetchCoinGeckoFallback() {
       signal: AbortSignal.timeout(15000)
     });
 
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
 
     const coins = await res.json();
 
@@ -427,6 +441,7 @@ async function fetchCoinGeckoFallback() {
 
       if (EMOTION_TRADE_PAIRS.includes(symbol)) {
         const buf = priceBuffer.get(symbol);
+
         const hasRecentData =
           buf &&
           buf.length > 0 &&
@@ -440,7 +455,9 @@ async function fetchCoinGeckoFallback() {
     }
 
     if (loaded > 0) {
-      console.log(`[EmoTrader] CoinGecko fallback: ${loaded} pairs without WebSocket data`);
+      console.log(
+        `[EmoTrader] CoinGecko fallback: ${loaded} pairs without WebSocket data`
+      );
     }
   } catch (err) {
     console.error("[EmoTrader] CoinGecko fallback error:", err.message);
@@ -464,6 +481,7 @@ function startEvaluationLoop() {
 
       const emo5m = getEmotion(pct5m);
       const emo15m = getEmotion(pct15m);
+
       const existing = pairState.get(symbol);
       const prevEmotion = existing?.emotion || null;
 
@@ -497,7 +515,7 @@ function startEvaluationLoop() {
 }
 
 // ===============================
-// PROCESS TRANSITION
+// PROCESS EMOTION TRANSITION
 // ===============================
 async function processTransition(
   symbol,
@@ -529,10 +547,12 @@ async function processTransition(
   }
 
   console.log(
-    `[EmoTrader] ${symbol}: ${transitionKey} → ${rule.action} (${rule.strength}) ` +
-      `5m:${pct5m.toFixed(2)}% 15m:${pct15m.toFixed(2)}%`
+    `[EmoTrader] ${symbol}: ${transitionKey} → ${rule.action} (${rule.strength}) 5m:${pct5m.toFixed(
+      2
+    )}% 15m:${pct15m.toFixed(2)}%`
   );
 
+  // Exit signals
   if (rule.action === "CLOSE_LONG" && emoPosition?.side === "BUY") {
     await closeEmoPosition(`Signal: ${transitionKey}`);
     return;
@@ -548,6 +568,7 @@ async function processTransition(
   if (Date.now() - lastSignalTs < SIGNAL_COOLDOWN_MS) return;
   if (emoPosition || _pendingEmoTrade) return;
 
+  // Confluence check
   const confluencePairs = [];
 
   for (const [sym, state] of pairState.entries()) {
@@ -572,9 +593,13 @@ async function processTransition(
 
   let signalLevel = null;
 
-  if (count >= CONFLUENCE.strong) signalLevel = "strong";
-  else if (count >= CONFLUENCE.medium) signalLevel = "medium";
-  else if (count >= CONFLUENCE.weak) signalLevel = "weak";
+  if (count >= CONFLUENCE.strong) {
+    signalLevel = "strong";
+  } else if (count >= CONFLUENCE.medium) {
+    signalLevel = "medium";
+  } else if (count >= CONFLUENCE.weak) {
+    signalLevel = "weak";
+  }
 
   if (!signalLevel) return;
 
@@ -585,6 +610,7 @@ async function processTransition(
     side === "BUY" ? "SELL" : "BUY"
   );
 
+  // Weak signal = alert only, no trade proposal
   if (signalLevel === "weak") {
     const hasExtra = funding === "strong" || recentLiqs.length >= 2;
 
@@ -597,13 +623,18 @@ async function processTransition(
         `Funding: <b>${formatPct(fundingRates.get(symbol) || 0)}</b>\n` +
         `Recent liquidations: <b>${recentLiqs.length}</b>\n` +
         `Confluence: <b>${count} pairs</b>\n\n` +
-        `${hasExtra ? "⚡ Signal reinforced by funding/liquidations." : "ℹ️ Signal too weak. Monitoring only."}\n\n` +
+        `${
+          hasExtra
+            ? "⚡ Signal reinforced by funding/liquidations."
+            : "ℹ️ Signal too weak. Monitoring only."
+        }\n\n` +
         `No trade proposed. Waiting for stronger confirmation.`
     );
 
     return;
   }
 
+  // Medium / Strong signal = proposal only, manual confirmation required
   const bestPair = confluencePairs.sort(
     (a, b) => Math.abs(b.pct5m) - Math.abs(a.pct5m)
   )[0];
@@ -623,29 +654,35 @@ async function processTransition(
 }
 
 // ===============================
-// SEND PRIVATE
+// SEND PRIVATE MESSAGE
 // ===============================
 async function sendPrivate(text) {
   if (!_config?.bot || !_config?.PRIVATE_TELEGRAM_USER_ID) return;
 
   try {
-    await _config.bot.telegram.sendMessage(_config.PRIVATE_TELEGRAM_USER_ID, text, {
-      parse_mode: "HTML",
-      disable_web_page_preview: true
-    });
+    await _config.bot.telegram.sendMessage(
+      _config.PRIVATE_TELEGRAM_USER_ID,
+      text,
+      {
+        parse_mode: "HTML",
+        disable_web_page_preview: true
+      }
+    );
   } catch (err) {
     console.error("[EmoTrader] sendPrivate:", err.message);
   }
 }
 
 // ===============================
-// BINANCE FUTURES HELPERS
+// BINANCE PROMISE HELPER
 // ===============================
-async function atSetLeverage(symbol, leverage) {
+function promisifyBinance(fn) {
   return new Promise((resolve, reject) => {
-    _binance.futuresLeverage(symbol, leverage, (err, res) => {
+    fn((err, res) => {
       if (err) {
-        return reject(new Error(err.body || err.message || JSON.stringify(err)));
+        return reject(
+          new Error(err.body || err.message || JSON.stringify(err))
+        );
       }
 
       resolve(res);
@@ -653,41 +690,46 @@ async function atSetLeverage(symbol, leverage) {
   });
 }
 
-async function atGetMarkPrice(symbol) {
-  return new Promise((resolve, reject) => {
-    _binance.futuresMarkPrice(symbol, (err, res) => {
-      if (err) {
-        return reject(new Error(err.body || err.message || JSON.stringify(err)));
-      }
+// ===============================
+// BINANCE FUTURES HELPERS
+// ===============================
+async function atSetLeverage(symbol, leverage) {
+  return promisifyBinance((cb) =>
+    _binance.futuresLeverage(symbol, leverage, cb)
+  );
+}
 
-      resolve(parseFloat(res?.markPrice || res?.price || 0));
-    });
-  });
+async function atGetMarkPrice(symbol) {
+  const res = await promisifyBinance((cb) =>
+    _binance.futuresMarkPrice(symbol, cb)
+  );
+
+  return parseFloat(res?.markPrice || res?.price || 0);
 }
 
 async function atGetExchangeInfo(symbol) {
-  return new Promise((resolve, reject) => {
-    _binance.futuresExchangeInfo((err, info) => {
-      if (err) {
-        return reject(new Error(err.body || err.message || JSON.stringify(err)));
-      }
+  const info = await promisifyBinance((cb) =>
+    _binance.futuresExchangeInfo(cb)
+  );
 
-      resolve((info?.symbols || []).find((s) => s.symbol === symbol) || null);
-    });
-  });
+  return (info?.symbols || []).find((s) => s.symbol === symbol) || null;
 }
 
 function getFilter(symbolInfo, filterType) {
-  return (symbolInfo?.filters || []).find((f) => f.filterType === filterType);
+  return (symbolInfo?.filters || []).find(
+    (f) => f.filterType === filterType
+  );
 }
 
 function getLotStepSize(symbolInfo) {
   const f = getFilter(symbolInfo, "LOT_SIZE");
+
   return parseFloat(f?.stepSize || "0.001");
 }
 
 function getMinQty(symbolInfo) {
   const f = getFilter(symbolInfo, "LOT_SIZE");
+
   return parseFloat(f?.minQty || "0");
 }
 
@@ -701,6 +743,7 @@ function getMinNotional(symbolInfo) {
 
 function getTickSize(symbolInfo) {
   const f = getFilter(symbolInfo, "PRICE_FILTER");
+
   return parseFloat(f?.tickSize || "0.01");
 }
 
@@ -709,7 +752,9 @@ function roundQty(qty, stepSize) {
 
   const precision = Math.max(0, Math.round(-Math.log10(stepSize)));
 
-  return parseFloat((Math.floor(qty / stepSize) * stepSize).toFixed(precision));
+  return parseFloat(
+    (Math.floor(qty / stepSize) * stepSize).toFixed(precision)
+  );
 }
 
 function roundPrice(price, tickSize) {
@@ -717,11 +762,13 @@ function roundPrice(price, tickSize) {
 
   const precision = Math.max(0, Math.round(-Math.log10(tickSize)));
 
-  return parseFloat((Math.round(price / tickSize) * tickSize).toFixed(precision));
+  return parseFloat(
+    (Math.round(price / tickSize) * tickSize).toFixed(precision)
+  );
 }
 
 async function atPlaceMarketOrder(symbol, side, qty) {
-  return new Promise((resolve, reject) => {
+  return promisifyBinance((cb) =>
     _binance.futuresOrder(
       side,
       symbol,
@@ -730,15 +777,9 @@ async function atPlaceMarketOrder(symbol, side, qty) {
       {
         type: "MARKET"
       },
-      (err, res) => {
-        if (err) {
-          return reject(new Error(err.body || err.message || JSON.stringify(err)));
-        }
-
-        resolve(res);
-      }
-    );
-  });
+      cb
+    )
+  );
 }
 
 async function atPlaceSlTp(symbol, side, qty, entryPrice) {
@@ -749,21 +790,20 @@ async function atPlaceSlTp(symbol, side, qty, entryPrice) {
   const slPct = getSlPct();
   const tpPct = getTpPct();
 
-  let slPrice;
-  let tpPrice;
+  let slPrice =
+    side === "BUY"
+      ? entryPrice * (1 - slPct / 100)
+      : entryPrice * (1 + slPct / 100);
 
-  if (side === "BUY") {
-    slPrice = entryPrice * (1 - slPct / 100);
-    tpPrice = entryPrice * (1 + tpPct / 100);
-  } else {
-    slPrice = entryPrice * (1 + slPct / 100);
-    tpPrice = entryPrice * (1 - tpPct / 100);
-  }
+  let tpPrice =
+    side === "BUY"
+      ? entryPrice * (1 + tpPct / 100)
+      : entryPrice * (1 - tpPct / 100);
 
   slPrice = roundPrice(slPrice, tickSize);
   tpPrice = roundPrice(tpPrice, tickSize);
 
-  const slOrder = await new Promise((resolve, reject) => {
+  const slOrder = await promisifyBinance((cb) =>
     _binance.futuresOrder(
       oppSide,
       symbol,
@@ -775,14 +815,11 @@ async function atPlaceSlTp(symbol, side, qty, entryPrice) {
         reduceOnly: true,
         workingType: "MARK_PRICE"
       },
-      (err, res) => {
-        if (err) return reject(new Error(err.body || err.message || JSON.stringify(err)));
-        resolve(res);
-      }
-    );
-  });
+      cb
+    )
+  );
 
-  const tpOrder = await new Promise((resolve, reject) => {
+  const tpOrder = await promisifyBinance((cb) =>
     _binance.futuresOrder(
       oppSide,
       symbol,
@@ -794,12 +831,9 @@ async function atPlaceSlTp(symbol, side, qty, entryPrice) {
         reduceOnly: true,
         workingType: "MARK_PRICE"
       },
-      (err, res) => {
-        if (err) return reject(new Error(err.body || err.message || JSON.stringify(err)));
-        resolve(res);
-      }
-    );
-  });
+      cb
+    )
+  );
 
   return {
     slPrice,
@@ -810,19 +844,18 @@ async function atPlaceSlTp(symbol, side, qty, entryPrice) {
 }
 
 async function atCancelOrder(symbol, orderId) {
-  return new Promise((resolve) => {
-    _binance.futuresCancel(symbol, { orderId }, (err, res) => {
-      if (err) {
-        console.error("[EmoTrader] cancel order error:", err.message || err.body);
-      }
-
-      resolve(res);
-    });
-  });
+  try {
+    return await promisifyBinance((cb) =>
+      _binance.futuresCancel(symbol, { orderId }, cb)
+    );
+  } catch (err) {
+    console.error("[EmoTrader] cancel order error:", err.message);
+    return null;
+  }
 }
 
 // ===============================
-// EXECUTE TRADE — CONFIRMATION REQUIRED
+// EXECUTE EMOTION TRADE — CONFIRMATION REQUIRED
 // ===============================
 async function executeEmoTrade(symbol, side, leverage, rule, data) {
   try {
@@ -867,8 +900,8 @@ async function executeEmoTrade(symbol, side, leverage, rule, data) {
     const minQty = getMinQty(symbolInfo);
     const minNotional = getMinNotional(symbolInfo);
 
-    let qty = roundQty(rawQty, stepSize);
-    let notional = qty * markPrice;
+    const qty = roundQty(rawQty, stepSize);
+    const notional = qty * markPrice;
 
     if (qty <= 0) {
       throw new Error("Calculated qty = 0");
@@ -880,18 +913,19 @@ async function executeEmoTrade(symbol, side, leverage, rule, data) {
 
     if (minNotional && notional < minNotional) {
       throw new Error(
-        `Notional too small: ${formatUsd(notional)}. Minimum required approx: ${formatUsd(minNotional)}`
+        `Notional too small: ${formatUsd(notional)}. Minimum approx: ${formatUsd(minNotional)}`
       );
     }
 
     const potentialWin = (riskUsd * (tpPct / slPct)).toFixed(2);
-    const potentialLoss = riskUsd.toFixed(2);
 
     const confluenceLines = data.pairs
       .slice(0, 8)
       .map(
         (p) =>
-          `  ${p.emoji} <b>${p.symbol}</b> 5m:${formatPct(p.pct5m)} 15m:${formatPct(p.pct15m)} | funding:${formatPct(p.funding || 0)}`
+          `  ${p.emoji} <b>${p.symbol}</b> 5m:${formatPct(p.pct5m)} 15m:${formatPct(
+            p.pct15m
+          )} | funding:${formatPct(p.funding || 0)}`
       )
       .join("\n");
 
@@ -919,17 +953,19 @@ async function executeEmoTrade(symbol, side, leverage, rule, data) {
         `Leverage: <b>${safeLeverage}x</b>\n` +
         `Notional: <b>${formatUsd(notional)}</b>\n\n` +
         `🧠 <b>Risk Model</b>\n` +
-        `Max Risk: <b>-$${potentialLoss}</b>\n` +
+        `Max Risk: <b>-$${riskUsd.toFixed(2)}</b>\n` +
         `SL: <b>${slPct}%</b>\n` +
         `TP: <b>${tpPct}%</b>\n` +
         `R/R: <b>1:${(tpPct / slPct).toFixed(1)}</b>\n` +
         `Potential Win: <b>+$${potentialWin}</b>\n\n` +
         `📊 <b>Market Context</b>\n` +
-        `5m: <b>${formatPct(data.pct5m)}</b> | 15m: <b>${formatPct(data.pct15m)}</b>\n` +
+        `5m: <b>${formatPct(data.pct5m)}</b> | 15m: <b>${formatPct(
+          data.pct15m
+        )}</b>\n` +
         `Funding: <b>${formatPct(fundingRates.get(symbol) || 0)}</b>\n` +
         `Liquidations 10m: <b>${data.recentLiqs}</b>\n\n` +
         `📌 <b>Confluence (${data.pairs.length} pairs)</b>\n${confluenceLines}\n\n` +
-        `Strength: <b>${escapeHTML(String(data.signalLevel).toUpperCase())}</b>\n` +
+        `Strength: <b>${String(data.signalLevel).toUpperCase()}</b>\n` +
         `🧠 ${escapeHTML(rule.note)}\n\n` +
         `⚠️ <b>Manual confirmation required.</b>\n` +
         `✅ /emoconfirmar — execute\n` +
@@ -938,9 +974,14 @@ async function executeEmoTrade(symbol, side, leverage, rule, data) {
     );
 
     setTimeout(() => {
-      if (_pendingEmoTrade && Date.now() - _pendingEmoTrade.ts >= 3 * 60 * 1000) {
+      if (
+        _pendingEmoTrade &&
+        Date.now() - _pendingEmoTrade.ts >= 3 * 60 * 1000
+      ) {
         _pendingEmoTrade = null;
-        sendPrivate("⏱ <b>Emotion trade expired</b>\nOrder was not executed.");
+        sendPrivate(
+          "⏱ <b>Emotion trade expired</b>\nOrder was not executed."
+        );
       }
     }, 3 * 60 * 1000);
   } catch (err) {
@@ -982,12 +1023,8 @@ async function confirmEmoTrade() {
 
     await sleep(500);
 
-    const { slPrice, tpPrice, slOrderId, tpOrderId } = await atPlaceSlTp(
-      symbol,
-      side,
-      qty,
-      fillPrice
-    );
+    const { slPrice, tpPrice, slOrderId, tpOrderId } =
+      await atPlaceSlTp(symbol, side, qty, fillPrice);
 
     emoPosition = {
       symbol,
@@ -1024,13 +1061,8 @@ async function confirmEmoTrade() {
         `R/R: <b>1:${(tpPct / slPct).toFixed(1)}</b>\n` +
         `Max Risk: <b>-$${Number(riskUsd).toFixed(2)}</b>\n` +
         `Target: <b>+$${potentialWin}</b>\n\n` +
-        `🧠 ${escapeHTML(rule.note)}\n\n` +
         `Use /emocerrar to close manually.\n` +
         `🌐 wojakmeter.com`
-    );
-
-    console.log(
-      `[EmoTrader] Trade executed: ${side} ${symbol} entry=${fillPrice} leverage=${leverage}x`
     );
   } catch (err) {
     console.error("[EmoTrader] confirmEmoTrade:", err.message);
@@ -1082,8 +1114,10 @@ async function closeEmoPosition(reason = "Manual") {
       }
 
       if (
-        _config.personalTradingState.pnlToday >= _config.PERSONAL_PLAN.dailyProfitLock ||
-        _config.personalTradingState.pnlToday <= -Math.abs(_config.PERSONAL_PLAN.maxDailyLoss)
+        _config.personalTradingState.pnlToday >=
+          _config.PERSONAL_PLAN.dailyProfitLock ||
+        _config.personalTradingState.pnlToday <=
+          -Math.abs(_config.PERSONAL_PLAN.maxDailyLoss)
       ) {
         _config.personalTradingState.coolingDown = true;
       }
@@ -1099,9 +1133,10 @@ async function closeEmoPosition(reason = "Manual") {
         `Entry: <b>${formatUsd(entryPrice)}</b>\n` +
         `Exit: <b>${formatUsd(exitPrice)}</b>\n` +
         `PnL: <b>${pnl >= 0 ? "+" : ""}${formatUsd(pnl)}</b>\n\n` +
-        `Daily PnL: <b>${(_config?.personalTradingState?.pnlToday || 0) >= 0 ? "+" : ""}${formatUsd(_config?.personalTradingState?.pnlToday || 0)}</b>\n` +
-        `Balance: <b>${formatUsd(_config?.PERSONAL_PLAN?.balance || 0)}</b>\n\n` +
-        `🌐 wojakmeter.com`
+        `Daily PnL: <b>${
+          (_config?.personalTradingState?.pnlToday || 0) >= 0 ? "+" : ""
+        }${formatUsd(_config?.personalTradingState?.pnlToday || 0)}</b>\n` +
+        `Balance: <b>${formatUsd(_config?.PERSONAL_PLAN?.balance || 0)}</b>`
     );
   } catch (err) {
     console.error("[EmoTrader] closeEmoPosition:", err.message);
@@ -1128,19 +1163,29 @@ async function handleEmoStatus(ctx) {
     if (!state) return `• <b>${symbol}</b> — no data`;
 
     const emo = EMOTIONS.find((e) => e.key === state.emotion);
-    const funding = state.funding ? ` | F:${formatPct(state.funding)}` : "";
+
+    const funding = state.funding
+      ? ` | F:${formatPct(state.funding)}`
+      : "";
+
     const arrow =
       state.prevEmotion && state.prevEmotion !== state.emotion
-        ? ` ← ${EMOTIONS.find((e) => e.key === state.prevEmotion)?.emoji || ""}`
+        ? ` ← ${
+            EMOTIONS.find((e) => e.key === state.prevEmotion)?.emoji || ""
+          }`
         : "";
 
-    return `${emo?.emoji || "❓"} <b>${symbol}</b> 5m:${formatPct(state.pct5m)} 15m:${formatPct(state.pct15m)}${funding}${arrow}`;
+    return `${emo?.emoji || "❓"} <b>${symbol}</b> 5m:${formatPct(
+      state.pct5m
+    )} 15m:${formatPct(state.pct15m)}${funding}${arrow}`;
   });
 
   const posInfo = emoPosition
     ? `\n\n📈 <b>Open Position:</b> ${
         emoPosition.side === "BUY" ? "LONG" : "SHORT"
-      } ${emoPosition.symbol} @ ${formatUsd(emoPosition.entryPrice)} | ${emoPosition.leverage}x`
+      } ${emoPosition.symbol} @ ${formatUsd(
+        emoPosition.entryPrice
+      )} | ${emoPosition.leverage}x`
     : "\n\n⬜ No open position";
 
   const pendingInfo = _pendingEmoTrade
@@ -1157,7 +1202,9 @@ async function handleEmoStatus(ctx) {
       posInfo +
       pendingInfo +
       `\n\n💥 Liquidations last 5min: <b>${recentLiqs.length}</b>\n` +
-      `📊 Signal cooldown: <b>${Math.round(SIGNAL_COOLDOWN_MS / 60000)} min</b>\n` +
+      `📊 Signal cooldown: <b>${Math.round(
+        SIGNAL_COOLDOWN_MS / 60000
+      )} min</b>\n` +
       `🧠 Confluence: weak=${CONFLUENCE.weak}, medium=${CONFLUENCE.medium}, strong=${CONFLUENCE.strong}\n` +
       `🌐 wojakmeter.com`,
     {
@@ -1174,6 +1221,7 @@ async function handleEmoHistory(ctx) {
 
   const lines = transitionHistory.slice(0, 15).map((t) => {
     const rule = TRANSITION_RULES[t.transitionKey];
+
     const icon =
       rule?.action === "LONG"
         ? "📈"
@@ -1183,11 +1231,17 @@ async function handleEmoHistory(ctx) {
 
     const time = new Date(t.ts).toTimeString().slice(0, 5);
 
-    return `${icon} <b>${t.symbol}</b> ${escapeHTML(t.transitionKey)} 5m:${formatPct(t.pct5m)} 15m:${formatPct(t.pct15m || 0)} [${time}]`;
+    return `${icon} <b>${t.symbol}</b> ${escapeHTML(
+      t.transitionKey
+    )} 5m:${formatPct(t.pct5m)} 15m:${formatPct(
+      t.pct15m || 0
+    )} [${time}]`;
   });
 
   return ctx.reply(
-    `📜 <b>EmoTrader — History</b>\n\n${lines.join("\n")}\n\n🌐 wojakmeter.com`,
+    `📜 <b>EmoTrader — History</b>\n\n${lines.join(
+      "\n"
+    )}\n\n🌐 wojakmeter.com`,
     {
       parse_mode: "HTML"
     }
@@ -1210,6 +1264,7 @@ async function handleEmoConfirmar(ctx) {
   }
 
   await ctx.reply("✅ Confirmed. Executing...");
+
   await confirmEmoTrade();
 }
 
@@ -1219,6 +1274,7 @@ async function handleEmoCancelar(ctx) {
   }
 
   const { side, symbol } = _pendingEmoTrade;
+
   _pendingEmoTrade = null;
 
   return ctx.reply(`❌ Emotion trade ${side} on ${symbol} cancelled.`);
@@ -1230,6 +1286,7 @@ async function handleEmoCerrar(ctx) {
   }
 
   await ctx.reply("⏳ Closing position...");
+
   await closeEmoPosition("Manual via Telegram");
 }
 
@@ -1252,6 +1309,7 @@ function start(config) {
   });
 
   connectWebSocket();
+
   fetchFundingRates();
 
   setTimeout(async () => {
@@ -1262,13 +1320,16 @@ function start(config) {
   startEvaluationLoop();
 
   setInterval(fetchFundingRates, FUNDING_REFRESH_MS);
+
   setInterval(fetchCoinGeckoFallback, 5 * 60 * 1000);
 
   console.log(
     `[EmoTrader] ===== STARTED v4 SAFE-CONFIRM ===== ` +
       `${EMOTION_TRADE_PAIRS.length} pairs | WS + Funding + Liquidations | ` +
       `confluence: weak=${CONFLUENCE.weak} medium=${CONFLUENCE.medium} strong=${CONFLUENCE.strong} | ` +
-      `cooldown: ${SIGNAL_COOLDOWN_MS / 60000}min | testnet: ${config.useTestnet}`
+      `cooldown: ${SIGNAL_COOLDOWN_MS / 60000}min | testnet: ${
+        config.useTestnet
+      }`
   );
 }
 
@@ -1277,13 +1338,18 @@ function start(config) {
 // ===============================
 module.exports = {
   start,
+
   handleEmoStatus,
   handleEmoHistory,
   handleEmoPairs,
+
   handleEmoConfirmar,
   handleEmoCancelar,
   handleEmoCerrar,
+
   getEmoPosition: () => emoPosition,
+
   getPairState: () => Object.fromEntries(pairState),
+
   getHistory: () => transitionHistory
 };
