@@ -6,6 +6,11 @@ const Binance = require("node-binance-api");
 const emotionTrader = require("./emotion-trader");
 
 // ===============================
+// WOJAKMETER BOT — INDEX
+// Personal Telegram control panel + market signals + safe-confirm AutoTrade
+// ===============================
+
+// ===============================
 // CONFIG
 // ===============================
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -14,9 +19,6 @@ if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN in environment");
 const PORT = process.env.PORT || 3000;
 const TELEGRAM_CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID || null;
 
-// ===============================
-// PERSONAL PLAN CONFIG — SAFER DEFAULTS
-// ===============================
 const PERSONAL_ALERTS_ENABLED = process.env.PERSONAL_ALERTS_ENABLED === "true";
 const PRIVATE_TELEGRAM_USER_ID = process.env.PRIVATE_TELEGRAM_USER_ID || null;
 
@@ -75,22 +77,55 @@ const PERSONAL_MARKET_ALERT_COOLDOWN_MS = Number(
 let lastPersonalMarketAlerts = new Map();
 
 // ===============================
-// APP / BOT
+// BINANCE AUTOTRADE CONFIG
+// ===============================
+const BINANCE_API_KEY = process.env.BINANCE_API_KEY || "";
+const BINANCE_API_SECRET = process.env.BINANCE_API_SECRET || "";
+const USE_TESTNET = process.env.BINANCE_TESTNET !== "false";
+
+const AUTO_TRADE_ENABLED_ENV = process.env.AUTO_TRADE_ENABLED === "true";
+const AUTO_TRADE_CONFIRM = process.env.AUTO_TRADE_CONFIRM !== "false";
+
+const SL_PCT = Number(process.env.AUTO_TRADE_SL_PCT || 1.5);
+const TP_PCT = Number(process.env.AUTO_TRADE_TP_PCT || 3.0);
+const AT_LEVERAGE = Number(process.env.AUTO_TRADE_LEVERAGE || 3);
+const SCORE_LONG_MIN = Number(process.env.AUTO_TRADE_SCORE_LONG || 80);
+const SCORE_SHORT_MAX = Number(process.env.AUTO_TRADE_SCORE_SHORT || 20);
+
+let autoTradeActive = AUTO_TRADE_ENABLED_ENV;
+let pendingConfirm = null;
+let openPosition = null;
+let pendingDangerAction = null;
+let lastTradeSignalTs = 0;
+
+const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000;
+
+// ===============================
+// APP / BOT / BINANCE
 // ===============================
 const app = express();
 app.use(express.json());
 
 const bot = new Telegraf(BOT_TOKEN);
 
+const binanceClient = new Binance().options({
+  APIKEY: BINANCE_API_KEY,
+  APISECRET: BINANCE_API_SECRET,
+  useServerTime: true,
+  recvWindow: 10000,
+  urls: {
+    base: USE_TESTNET
+      ? "https://testnet.binancefuture.com/fapi/"
+      : "https://fapi.binance.com/fapi/"
+  }
+});
+
 // ===============================
-// API
+// COINGECKO API + CACHE
 // ===============================
 const API_BASE = "https://api.coingecko.com/api/v3";
 const VS_CURRENCY = "usd";
 
-// ===============================
-// CACHE
-// ===============================
 const cache = {
   markets: { data: null, ts: 0 },
   trending: { data: null, ts: 0 },
@@ -100,35 +135,6 @@ const cache = {
 const MARKET_CACHE_TTL = 60 * 1000;
 const TRENDING_CACHE_TTL = 2 * 60 * 1000;
 const GLOBAL_CACHE_TTL = 2 * 60 * 1000;
-
-// ===============================
-// USER COOLDOWN
-// ===============================
-const userCooldowns = new Map();
-const USER_COOLDOWN_MS = 800;
-
-// ===============================
-// WATCHLISTS IN MEMORY
-// ===============================
-const userWatchlists = new Map();
-
-// ===============================
-// AUTO BROADCAST STATE
-// ===============================
-let lastBroadcastState = {
-  emotionKey: null,
-  score: null,
-  change: null,
-  btcDom: null,
-  volume: null,
-  spotlightCoinId: null,
-  ts: 0
-};
-
-const BROADCAST_INTERVAL_MS = 2 * 60 * 1000;
-const MIN_BROADCAST_GAP_MS = 10 * 60 * 1000;
-const SCORE_SHIFT_THRESHOLD = 8;
-const BREAKING_SCORE_SHIFT_THRESHOLD = 15;
 
 // ===============================
 // EMOTIONS
@@ -145,9 +151,6 @@ const EMOTION_CONFIG = [
 
 const EMOJI_SET = new Set(EMOTION_CONFIG.map((e) => e.emoji));
 
-// ===============================
-// STICKERS
-// ===============================
 const STICKERS = {
   neutral:
     "CAACAgEAAxkBAAIDAWn6pso8JitfvHNu4rQfYboxH07AAALvBwACfBjRR_P2E1ZGYEM_OwQ",
@@ -165,46 +168,58 @@ const STICKERS = {
     "CAACAgEAAxkBAAIDB2n6puH1J-pEl7lVktyW2Y1eprH0AALeBgACuhnYR3yJfsZTlcMKOwQ"
 };
 
-// ===============================
-// NARRATIVES
-// ===============================
 const NARRATIVE_VARIANTS = {
   euphoria: [
     "Momentum is overheated. Traders are leaning aggressively risk-on.",
-    "Market confidence is surging fast. Risk appetite is elevated.",
-    "Buyers are in control and sentiment is running hot."
+    "Market confidence is surging fast. Risk appetite is elevated."
   ],
   content: [
     "The market is constructive. Confidence is present without extreme euphoria.",
-    "Conditions look stable and bullish without feeling stretched.",
-    "Traders are comfortable holding risk, but not chasing hard."
+    "Conditions look stable and bullish without feeling stretched."
   ],
   optimism: [
     "Sentiment is improving. Buyers are gaining confidence.",
-    "Momentum is recovering and optimism is building.",
-    "The market is leaning positive with early conviction."
+    "Momentum is recovering and optimism is building."
   ],
   neutral: [
     "The market is balanced. No strong emotional edge yet.",
-    "Price action is undecided. Emotion is still centered.",
-    "The market feels calm, but not committed."
+    "Price action is undecided. Emotion is still centered."
   ],
   doubt: [
     "Confidence is weakening. Traders are becoming hesitant.",
-    "The market is losing conviction and second-guessing itself.",
-    "Buyers are slowing down and hesitation is growing."
+    "The market is losing conviction and second-guessing itself."
   ],
   concern: [
     "Pressure is building. Sentiment is turning defensive.",
-    "The market is getting uncomfortable and more reactive.",
-    "Risk appetite is fading as pressure increases."
+    "The market is getting uncomfortable and more reactive."
   ],
   frustration: [
     "The market is under stress. Emotion is clearly risk-off.",
-    "Panic is rising and traders are losing patience.",
-    "This is a heavy emotional drawdown environment."
+    "Panic is rising and traders are losing patience."
   ]
 };
+
+// ===============================
+// STATE
+// ===============================
+const userCooldowns = new Map();
+const USER_COOLDOWN_MS = 800;
+const userWatchlists = new Map();
+
+let lastBroadcastState = {
+  emotionKey: null,
+  score: null,
+  change: null,
+  btcDom: null,
+  volume: null,
+  spotlightCoinId: null,
+  ts: 0
+};
+
+const BROADCAST_INTERVAL_MS = 2 * 60 * 1000;
+const MIN_BROADCAST_GAP_MS = 10 * 60 * 1000;
+const SCORE_SHIFT_THRESHOLD = 8;
+const BREAKING_SCORE_SHIFT_THRESHOLD = 15;
 
 // ===============================
 // HELPERS
@@ -238,21 +253,41 @@ function scoreFromChange(change) {
 }
 
 function formatUsd(value) {
-  if (value === null || value === undefined || Number.isNaN(Number(value))) return "N/A";
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return "N/A";
+  }
 
   const num = Number(value);
+  const sign = num < 0 ? "-" : "";
+  const abs = Math.abs(num);
 
-  if (Math.abs(num) >= 1_000_000_000_000) return `$${(num / 1_000_000_000_000).toFixed(2)}T`;
-  if (Math.abs(num) >= 1_000_000_000) return `$${(num / 1_000_000_000).toFixed(2)}B`;
-  if (Math.abs(num) >= 1_000_000) return `$${(num / 1_000_000).toFixed(2)}M`;
-  if (Math.abs(num) >= 1_000) return `$${(num / 1_000).toFixed(2)}K`;
-  if (Math.abs(num) >= 1) return `$${num.toFixed(2)}`;
+  if (abs >= 1_000_000_000_000) {
+    return `${sign}$${(abs / 1_000_000_000_000).toFixed(2)}T`;
+  }
 
-  return `$${num.toFixed(6)}`;
+  if (abs >= 1_000_000_000) {
+    return `${sign}$${(abs / 1_000_000_000).toFixed(2)}B`;
+  }
+
+  if (abs >= 1_000_000) {
+    return `${sign}$${(abs / 1_000_000).toFixed(2)}M`;
+  }
+
+  if (abs >= 1_000) {
+    return `${sign}$${(abs / 1_000).toFixed(2)}K`;
+  }
+
+  if (abs >= 1) {
+    return `${sign}$${abs.toFixed(2)}`;
+  }
+
+  return `${sign}$${abs.toFixed(6)}`;
 }
 
 function formatPercent(value) {
-  if (value === null || value === undefined || Number.isNaN(Number(value))) return "N/A";
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return "N/A";
+  }
 
   const num = Number(value);
 
@@ -290,12 +325,33 @@ function buildTradeLinksBlock(symbol = "") {
   );
 }
 
+function getEmotionByChange(change24h) {
+  const n = safe(change24h, 0);
+
+  return (
+    EMOTION_CONFIG.find((e) => n >= e.min && n <= e.max) ||
+    EMOTION_CONFIG.find((e) => e.key === "neutral")
+  );
+}
+
+function matchEmotionByEmoji(emoji) {
+  return EMOTION_CONFIG.find((x) => x.emoji === emoji) || null;
+}
+
+function getEmotionNarrative(emotionKey) {
+  return (
+    pickRandom(NARRATIVE_VARIANTS[emotionKey]) ||
+    "The emotional state of the market is shifting."
+  );
+}
+
 function getSignalQuality(score) {
   if (score >= 90) return "Extreme / High volatility";
   if (score >= 80) return "High-quality watchlist";
   if (score >= 65) return "Possible setup";
   if (score >= 50) return "Observation only";
   if (score >= 35) return "Weak / uncertain";
+
   return "High risk / panic zone";
 }
 
@@ -347,46 +403,48 @@ function buildSignalQualityBlock(score, change) {
 function trendArrow(value) {
   if (value > 0) return "📈";
   if (value < 0) return "📉";
+
   return "➡️";
 }
 
-function getEmotionByChange(change24h) {
-  const n = safe(change24h, 0);
-
-  return (
-    EMOTION_CONFIG.find((e) => n >= e.min && n <= e.max) ||
-    EMOTION_CONFIG.find((e) => e.key === "neutral")
-  );
-}
-
-function matchEmotionByEmoji(emoji) {
-  return EMOTION_CONFIG.find((x) => x.emoji === emoji) || null;
-}
-
-function isUserCoolingDown(userId) {
-  const now = Date.now();
-  const last = userCooldowns.get(userId) || 0;
-
-  if (now - last < USER_COOLDOWN_MS) return true;
-
-  userCooldowns.set(userId, now);
-  return false;
-}
-
-function getEmotionNarrative(emotionKey) {
-  return (
-    pickRandom(NARRATIVE_VARIANTS[emotionKey]) ||
-    "The emotional state of the market is shifting."
-  );
-}
-
 function getAlertLevel(score) {
-  if (score >= 85) return { key: "extreme_bull", label: "Extreme Bullish", icon: "🟢" };
-  if (score >= 70) return { key: "bullish", label: "Bullish", icon: "🟩" };
-  if (score >= 45) return { key: "balanced", label: "Balanced", icon: "⚪" };
-  if (score >= 20) return { key: "risk_off", label: "Risk-Off", icon: "🟧" };
+  if (score >= 85) {
+    return {
+      key: "extreme_bull",
+      label: "Extreme Bullish",
+      icon: "🟢"
+    };
+  }
 
-  return { key: "panic", label: "Panic", icon: "🔴" };
+  if (score >= 70) {
+    return {
+      key: "bullish",
+      label: "Bullish",
+      icon: "🟩"
+    };
+  }
+
+  if (score >= 45) {
+    return {
+      key: "balanced",
+      label: "Balanced",
+      icon: "⚪"
+    };
+  }
+
+  if (score >= 20) {
+    return {
+      key: "risk_off",
+      label: "Risk-Off",
+      icon: "🟧"
+    };
+  }
+
+  return {
+    key: "panic",
+    label: "Panic",
+    icon: "🔴"
+  };
 }
 
 function isPrivateOwner(ctx) {
@@ -399,6 +457,17 @@ async function replyOwnerOnly(ctx) {
   return ctx.reply("🚫 This command is private.", {
     reply_markup: buildMainKeyboard().reply_markup
   });
+}
+
+function isUserCoolingDown(userId) {
+  const now = Date.now();
+  const last = userCooldowns.get(userId) || 0;
+
+  if (now - last < USER_COOLDOWN_MS) return true;
+
+  userCooldowns.set(userId, now);
+
+  return false;
 }
 
 function resetPersonalStateIfNewDay() {
@@ -422,1118 +491,19 @@ function canSendPersonalAlert(score) {
   if (score < PERSONAL_PLAN.minSignalScore) return false;
   if (personalTradingState.coolingDown) return false;
   if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) return false;
-  if (personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)) return false;
-  if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) return false;
+
+  if (
+    personalTradingState.pnlToday <=
+    -Math.abs(PERSONAL_PLAN.maxDailyLoss)
+  ) {
+    return false;
+  }
+
+  if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) {
+    return false;
+  }
 
   return true;
-}
-
-function buildMyPlanMessage() {
-  resetPersonalStateIfNewDay();
-
-  return (
-    `🧠 <b>My WojakMeter Trading Plan</b>\n\n` +
-    `💼 Balance: <b>$${PERSONAL_PLAN.balance.toFixed(2)}</b>\n` +
-    `🎯 Risk per trade: <b>$${PERSONAL_PLAN.riskPerTrade.toFixed(2)}</b>\n` +
-    `🛑 Max daily loss: <b>-$${PERSONAL_PLAN.maxDailyLoss.toFixed(2)}</b>\n` +
-    `🔒 Daily profit lock: <b>+$${PERSONAL_PLAN.dailyProfitLock.toFixed(2)}</b>\n` +
-    `📌 Max trades/day: <b>${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
-    `⚙️ Default leverage: <b>${PERSONAL_PLAN.defaultLeverage}x</b>\n` +
-    `🚫 Max leverage: <b>${PERSONAL_PLAN.maxLeverage}x</b>\n` +
-    `🧪 Min signal score: <b>${PERSONAL_PLAN.minSignalScore}/100</b>\n\n` +
-
-    `📊 <b>Today</b>\n` +
-    `Trades: <b>${personalTradingState.tradesToday}/${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
-    `PnL: <b>${personalTradingState.pnlToday >= 0 ? "+" : ""}$${personalTradingState.pnlToday.toFixed(2)}</b>\n` +
-    `Cooling down: <b>${personalTradingState.coolingDown ? "Yes" : "No"}</b>\n\n` +
-
-    `🤖 <b>AutoTrade</b>\n` +
-    `Status: <b>${autoTradeActive ? "ON ✅" : "OFF 🛑"}</b>\n` +
-    `Manual confirmation: <b>${AUTO_TRADE_CONFIRM ? "Required ✅" : "Disabled ⚠️"}</b>\n` +
-    `Testnet: <b>${USE_TESTNET ? "Yes (safe)" : "❗ REAL MONEY"}</b>\n` +
-    `Score LONG: <b>≥${SCORE_LONG_MIN}</b> | Score SHORT: <b>≤${SCORE_SHORT_MAX}</b>\n\n` +
-
-    `🧠 <b>Rule</b>\n` +
-    `No trade is valid without defined risk, stop loss and emotional control.\n\n` +
-    `🌐 wojakmeter.com`
-  );
-}
-
-function buildPersonalAlertMessage(coin, title = "Personal Watchlist Alert") {
-  resetPersonalStateIfNewDay();
-
-  const change = safe(coin.price_change_percentage_24h);
-  const score = scoreFromChange(change);
-  const emotion = getEmotionByChange(change);
-  const symbol = (coin.symbol || "").toUpperCase();
-  const links = buildTradeLinksFromSymbol(symbol);
-
-  return (
-    `🔥 <b>WOJAKMETER PERSONAL ALERT</b>\n\n` +
-    `Type: <b>${escapeHTML(title)}</b>\n` +
-    `Pair: <b>${escapeHTML(links.pair)}</b>\n` +
-    `${emotion.emoji} Mood: <b>${emotion.label}</b>\n` +
-    `Score: <b>${score}/100</b>\n` +
-    `Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n\n` +
-
-    `💵 Price: <b>${formatUsd(coin.current_price)}</b>\n` +
-    `📉 24h: <b>${formatPercent(change)}</b>\n` +
-    `💸 Volume: <b>${formatUsd(coin.total_volume)}</b>\n\n` +
-
-    `🧠 <b>Your Plan</b>\n` +
-    `Max risk: <b>$${PERSONAL_PLAN.riskPerTrade.toFixed(2)}</b>\n` +
-    `Leverage: <b>${PERSONAL_PLAN.defaultLeverage}x (max ${PERSONAL_PLAN.maxLeverage}x)</b>\n` +
-    `Trades today: <b>${personalTradingState.tradesToday}/${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
-    `PnL today: <b>${personalTradingState.pnlToday >= 0 ? "+" : ""}$${personalTradingState.pnlToday.toFixed(2)}</b>\n\n` +
-
-    `⚠️ <b>Discipline</b>\n` +
-    `This is not financial advice. Wait for confirmation. Define stop loss first.` +
-    buildTradeLinksBlock(symbol) +
-    `\n\n🌐 wojakmeter.com`
-  );
-}
-
-async function sendPersonalAlert(coin, title = "Personal Watchlist Alert") {
-  try {
-    if (!coin) return;
-
-    const score = scoreFromChange(coin.price_change_percentage_24h);
-
-    if (!canSendPersonalAlert(score)) return;
-
-    const msg = buildPersonalAlertMessage(coin, title);
-
-    await bot.telegram.sendMessage(PRIVATE_TELEGRAM_USER_ID, msg, {
-      parse_mode: "HTML",
-      disable_web_page_preview: true
-    });
-  } catch (err) {
-    console.error("Personal alert error:", err.message);
-  }
-}
-
-// ===============================
-// BINANCE FUTURES AUTO-TRADER — SAFE CONFIRM MODE
-// ===============================
-const BINANCE_API_KEY = process.env.BINANCE_API_KEY || "";
-const BINANCE_API_SECRET = process.env.BINANCE_API_SECRET || "";
-const USE_TESTNET = process.env.BINANCE_TESTNET !== "false";
-
-const AUTO_TRADE_ENABLED_ENV = process.env.AUTO_TRADE_ENABLED === "true";
-
-// Important:
-// Keep confirmation required by default.
-// Even if AutoTrade is ON, the bot sends a proposal.
-// You must manually confirm with /confirmar.
-const AUTO_TRADE_CONFIRM = process.env.AUTO_TRADE_CONFIRM !== "false";
-
-const SL_PCT = Number(process.env.AUTO_TRADE_SL_PCT || 1.5);
-const TP_PCT = Number(process.env.AUTO_TRADE_TP_PCT || 3.0);
-const AT_LEVERAGE = Number(process.env.AUTO_TRADE_LEVERAGE || 3);
-const SCORE_LONG_MIN = Number(process.env.AUTO_TRADE_SCORE_LONG || 80);
-const SCORE_SHORT_MAX = Number(process.env.AUTO_TRADE_SCORE_SHORT || 20);
-
-let autoTradeActive = AUTO_TRADE_ENABLED_ENV;
-let pendingConfirm = null;
-let openPosition = null;
-let lastTradeSignalTs = 0;
-
-const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000;
-
-const binanceClient = new Binance().options({
-  APIKEY: BINANCE_API_KEY,
-  APISECRET: BINANCE_API_SECRET,
-  useServerTime: true,
-  recvWindow: 10000,
-  urls: {
-    base: USE_TESTNET
-      ? "https://testnet.binancefuture.com/fapi/"
-      : "https://fapi.binance.com/fapi/"
-  }
-});
-
-function canOpenTrade() {
-  resetPersonalStateIfNewDay();
-
-  if (!autoTradeActive) return false;
-  if (openPosition) return false;
-  if (pendingConfirm) return false;
-  if (personalTradingState.coolingDown) return false;
-  if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) return false;
-  if (personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)) return false;
-  if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) return false;
-  if (Date.now() - lastTradeSignalTs < SIGNAL_COOLDOWN_MS) return false;
-
-  return true;
-}
-
-async function sendPrivate(text) {
-  if (!PRIVATE_TELEGRAM_USER_ID) return;
-
-  try {
-    await bot.telegram.sendMessage(PRIVATE_TELEGRAM_USER_ID, text, {
-      parse_mode: "HTML",
-      disable_web_page_preview: true
-    });
-  } catch (err) {
-    console.error("[AutoTrader] sendPrivate error:", err.message);
-  }
-}
-
-async function atSetLeverage(symbol, leverage = AT_LEVERAGE) {
-  return new Promise((resolve, reject) => {
-    binanceClient.futuresLeverage(symbol, leverage, (err, res) => {
-      if (err) {
-        return reject(new Error(err.body || err.message || JSON.stringify(err)));
-      }
-
-      resolve(res);
-    });
-  });
-}
-
-async function atGetMarkPrice(symbol) {
-  return new Promise((resolve, reject) => {
-    binanceClient.futuresMarkPrice(symbol, (err, res) => {
-      if (err) {
-        return reject(new Error(err.body || err.message || JSON.stringify(err)));
-      }
-
-      resolve(parseFloat(res?.markPrice || res?.price || 0));
-    });
-  });
-}
-
-async function atGetFuturesBalance() {
-  return new Promise((resolve, reject) => {
-    binanceClient.futuresBalance((err, balances) => {
-      if (err) {
-        return reject(new Error(err.body || err.message || JSON.stringify(err)));
-      }
-
-      const usdt = (balances || []).find((b) => b.asset === "USDT");
-
-      resolve(parseFloat(usdt?.availableBalance || 0));
-    });
-  });
-}
-
-async function atGetExchangeInfo(symbol) {
-  return new Promise((resolve, reject) => {
-    binanceClient.futuresExchangeInfo((err, info) => {
-      if (err) {
-        return reject(new Error(err.body || err.message || JSON.stringify(err)));
-      }
-
-      const sym = (info?.symbols || []).find((s) => s.symbol === symbol);
-
-      resolve(sym || null);
-    });
-  });
-}
-
-function atGetFilter(symbolInfo, filterType) {
-  return (symbolInfo?.filters || []).find((f) => f.filterType === filterType);
-}
-
-function atGetLotStepSize(symbolInfo) {
-  const lotFilter = atGetFilter(symbolInfo, "LOT_SIZE");
-
-  return parseFloat(lotFilter?.stepSize || "0.001");
-}
-
-function atGetMinQty(symbolInfo) {
-  const lotFilter = atGetFilter(symbolInfo, "LOT_SIZE");
-
-  return parseFloat(lotFilter?.minQty || "0");
-}
-
-function atGetMinNotional(symbolInfo) {
-  const minNotionalFilter =
-    atGetFilter(symbolInfo, "MIN_NOTIONAL") ||
-    atGetFilter(symbolInfo, "NOTIONAL");
-
-  return parseFloat(
-    minNotionalFilter?.notional ||
-    minNotionalFilter?.minNotional ||
-    "5"
-  );
-}
-
-function atGetTickSize(symbolInfo) {
-  const priceFilter = atGetFilter(symbolInfo, "PRICE_FILTER");
-
-  return parseFloat(priceFilter?.tickSize || "0.01");
-}
-
-function atRoundQty(qty, stepSize) {
-  if (!stepSize || stepSize <= 0) return qty;
-
-  const precision = Math.max(0, Math.round(-Math.log10(stepSize)));
-
-  return parseFloat((Math.floor(qty / stepSize) * stepSize).toFixed(precision));
-}
-
-function atRoundPrice(price, tickSize) {
-  if (!tickSize || tickSize <= 0) return price;
-
-  const precision = Math.max(0, Math.round(-Math.log10(tickSize)));
-
-  return parseFloat((Math.round(price / tickSize) * tickSize).toFixed(precision));
-}
-
-async function atPlaceMarketOrder(symbol, side, qty) {
-  return new Promise((resolve, reject) => {
-    binanceClient.futuresOrder(
-      side,
-      symbol,
-      qty,
-      false,
-      {
-        type: "MARKET"
-      },
-      (err, res) => {
-        if (err) {
-          return reject(new Error(err.body || err.message || JSON.stringify(err)));
-        }
-
-        resolve(res);
-      }
-    );
-  });
-}
-
-async function atPlaceSlTpOrders(symbol, side, qty, entryPrice) {
-  const oppositeSide = side === "BUY" ? "SELL" : "BUY";
-  const symbolInfo = await atGetExchangeInfo(symbol);
-  const tickSize = atGetTickSize(symbolInfo);
-
-  let slPrice;
-  let tpPrice;
-
-  if (side === "BUY") {
-    slPrice = entryPrice * (1 - SL_PCT / 100);
-    tpPrice = entryPrice * (1 + TP_PCT / 100);
-  } else {
-    slPrice = entryPrice * (1 + SL_PCT / 100);
-    tpPrice = entryPrice * (1 - TP_PCT / 100);
-  }
-
-  slPrice = atRoundPrice(slPrice, tickSize);
-  tpPrice = atRoundPrice(tpPrice, tickSize);
-
-  const slOrder = await new Promise((resolve, reject) => {
-    binanceClient.futuresOrder(
-      oppositeSide,
-      symbol,
-      qty,
-      slPrice,
-      {
-        type: "STOP_MARKET",
-        stopPrice: slPrice,
-        reduceOnly: true,
-        workingType: "MARK_PRICE"
-      },
-      (err, res) => {
-        if (err) {
-          return reject(new Error(err.body || err.message || JSON.stringify(err)));
-        }
-
-        resolve(res);
-      }
-    );
-  });
-
-  const tpOrder = await new Promise((resolve, reject) => {
-    binanceClient.futuresOrder(
-      oppositeSide,
-      symbol,
-      qty,
-      tpPrice,
-      {
-        type: "TAKE_PROFIT_MARKET",
-        stopPrice: tpPrice,
-        reduceOnly: true,
-        workingType: "MARK_PRICE"
-      },
-      (err, res) => {
-        if (err) {
-          return reject(new Error(err.body || err.message || JSON.stringify(err)));
-        }
-
-        resolve(res);
-      }
-    );
-  });
-
-  return {
-    slPrice,
-    tpPrice,
-    slOrderId: slOrder.orderId,
-    tpOrderId: tpOrder.orderId
-  };
-}
-
-async function atCancelOrder(symbol, orderId) {
-  return new Promise((resolve) => {
-    binanceClient.futuresCancel(symbol, { orderId }, (err, res) => {
-      if (err) {
-        console.error("[AutoTrader] cancelOrder error:", err.message || err.body);
-      }
-
-      resolve(res);
-    });
-  });
-}
-
-async function atGetOpenPositions() {
-  return new Promise((resolve, reject) => {
-    binanceClient.futuresPositionRisk((err, positions) => {
-      if (err) {
-        return reject(new Error(err.body || err.message || JSON.stringify(err)));
-      }
-
-      resolve((positions || []).filter((p) => parseFloat(p.positionAmt) !== 0));
-    });
-  });
-}
-
-async function atGetOpenOrders(symbol) {
-  return new Promise((resolve, reject) => {
-    binanceClient.futuresOpenOrders(symbol, (err, orders) => {
-      if (err) {
-        return reject(new Error(err.body || err.message || JSON.stringify(err)));
-      }
-
-      resolve(orders || []);
-    });
-  });
-}
-
-function calculateQtyByRisk({ markPrice, symbolInfo, riskUsd, slPct }) {
-  const stopDistanceUsd = markPrice * (slPct / 100);
-  const rawQty = riskUsd / stopDistanceUsd;
-
-  const stepSize = atGetLotStepSize(symbolInfo);
-  const minQty = atGetMinQty(symbolInfo);
-  const minNotional = atGetMinNotional(symbolInfo);
-
-  const qty = atRoundQty(rawQty, stepSize);
-  const notional = qty * markPrice;
-
-  if (qty <= 0) {
-    throw new Error("Calculated qty is 0 — check balance and riskPerTrade");
-  }
-
-  if (minQty && qty < minQty) {
-    throw new Error(`Qty too small. Qty=${qty}, minQty=${minQty}`);
-  }
-
-  if (minNotional && notional < minNotional) {
-    throw new Error(
-      `Notional too small: ${formatUsd(notional)}. Minimum required approx: ${formatUsd(minNotional)}`
-    );
-  }
-
-  return {
-    qty,
-    notional,
-    stepSize,
-    minQty,
-    minNotional
-  };
-}
-
-async function atExecuteTrade(side, symbol, score) {
-  try {
-    const safeLeverage = Math.max(
-      1,
-      Math.min(PERSONAL_PLAN.maxLeverage, AT_LEVERAGE)
-    );
-
-    await atSetLeverage(symbol, safeLeverage);
-
-    const [markPrice, symbolInfo] = await Promise.all([
-      atGetMarkPrice(symbol),
-      atGetExchangeInfo(symbol)
-    ]);
-
-    if (!markPrice || markPrice <= 0) {
-      throw new Error("Could not get mark price");
-    }
-
-    if (!symbolInfo) {
-      throw new Error(`No exchange info for ${symbol}`);
-    }
-
-    const riskUsd = PERSONAL_PLAN.riskPerTrade;
-
-    const { qty, notional } = calculateQtyByRisk({
-      markPrice,
-      symbolInfo,
-      riskUsd,
-      slPct: SL_PCT
-    });
-
-    const slEst =
-      side === "BUY"
-        ? markPrice * (1 - SL_PCT / 100)
-        : markPrice * (1 + SL_PCT / 100);
-
-    const tpEst =
-      side === "BUY"
-        ? markPrice * (1 + TP_PCT / 100)
-        : markPrice * (1 - TP_PCT / 100);
-
-    const potentialWin = (riskUsd * (TP_PCT / SL_PCT)).toFixed(2);
-    const potentialLoss = riskUsd.toFixed(2);
-
-    pendingConfirm = {
-      side,
-      symbol,
-      qty,
-      price: markPrice,
-      slPrice: slEst,
-      tpPrice: tpEst,
-      score,
-      leverage: safeLeverage,
-      riskUsd,
-      ts: Date.now()
-    };
-
-    await sendPrivate(
-      `🚨 <b>AUTO-TRADE SIGNAL</b>\n\n` +
-      `Pair: <b>${escapeHTML(symbol)}</b>\n` +
-      `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
-      `WojakMeter Score: <b>${score}/100</b>\n` +
-      `Mark Price: <b>${formatUsd(markPrice)}</b>\n` +
-      `Qty: <b>${qty}</b>\n` +
-      `Leverage: <b>${safeLeverage}x</b>\n` +
-      `Notional: <b>${formatUsd(notional)}</b>\n\n` +
-      `🧠 <b>Risk Model</b>\n` +
-      `Max Risk: <b>-$${potentialLoss}</b>\n` +
-      `Stop Loss: <b>${formatUsd(slEst)}</b> (-${SL_PCT}%)\n` +
-      `Take Profit: <b>${formatUsd(tpEst)}</b> (+${TP_PCT}%)\n` +
-      `R/R Ratio: <b>1:${(TP_PCT / SL_PCT).toFixed(1)}</b>\n` +
-      `Potential Win: <b>+$${potentialWin}</b>\n\n` +
-      `⚠️ <b>Manual confirmation required.</b>\n` +
-      `✅ /confirmar — execute now\n` +
-      `❌ /cancelar — discard\n\n` +
-      `⏱ Expires in 3 minutes.`
-    );
-
-    setTimeout(() => {
-      if (pendingConfirm && Date.now() - pendingConfirm.ts >= 3 * 60 * 1000) {
-        pendingConfirm = null;
-        sendPrivate(
-          "⏱ <b>Auto-trade expired</b>\nOrder was not executed."
-        );
-      }
-    }, 3 * 60 * 1000);
-  } catch (err) {
-    console.error("[AutoTrader] executeTrade error:", err.message);
-
-    await sendPrivate(
-      `⚠️ <b>AutoTrade error</b>\n\n${escapeHTML(err.message)}`
-    );
-  }
-}
-
-async function atExecuteConfirmed(symbol, side, qty, price, score) {
-  try {
-    const leverage = pendingConfirm?.leverage || AT_LEVERAGE;
-    const riskUsd = pendingConfirm?.riskUsd || PERSONAL_PLAN.riskPerTrade;
-
-    await sendPrivate(
-      `⏳ <b>Executing ${side} order...</b>\n` +
-      `Pair: <b>${escapeHTML(symbol)}</b>\n` +
-      `Qty: <b>${qty}</b>\n` +
-      `Leverage: <b>${leverage}x</b>`
-    );
-
-    const order = await atPlaceMarketOrder(symbol, side, qty);
-    const fillPrice = parseFloat(order.avgPrice || order.price || price);
-
-    await sleep(500);
-
-    const { slPrice, tpPrice, slOrderId, tpOrderId } = await atPlaceSlTpOrders(
-      symbol,
-      side,
-      qty,
-      fillPrice
-    );
-
-    openPosition = {
-      side,
-      symbol,
-      entryPrice: fillPrice,
-      qty,
-      slOrderId,
-      tpOrderId,
-      score,
-      leverage,
-      riskUsd,
-      ts: Date.now()
-    };
-
-    lastTradeSignalTs = Date.now();
-    personalTradingState.tradesToday += 1;
-
-    const potentialWin = (riskUsd * (TP_PCT / SL_PCT)).toFixed(2);
-
-    await sendPrivate(
-      `✅ <b>ORDER EXECUTED</b>\n\n` +
-      `Pair: <b>${escapeHTML(symbol)}</b>\n` +
-      `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
-      `Entry Price: <b>${formatUsd(fillPrice)}</b>\n` +
-      `Qty: <b>${qty}</b>\n` +
-      `Leverage: <b>${leverage}x</b>\n\n` +
-      `🛑 Stop Loss: <b>${formatUsd(slPrice)}</b> (-${SL_PCT}%)\n` +
-      `✅ Take Profit: <b>${formatUsd(tpPrice)}</b> (+${TP_PCT}%)\n` +
-      `📊 R/R: <b>1:${(TP_PCT / SL_PCT).toFixed(1)}</b>\n` +
-      `Max Risk: <b>-$${Number(riskUsd).toFixed(2)}</b>\n` +
-      `Target: <b>+$${potentialWin}</b>\n\n` +
-      `WojakMeter Score: <b>${score}/100</b>\n` +
-      `Order ID: <code>${order.orderId}</code>\n\n` +
-      `Use /position to track.\n` +
-      `Use /close to exit manually.\n\n` +
-      `🌐 wojakmeter.com`
-    );
-
-    console.log(
-      `[AutoTrader] Order executed: ${side} ${symbol} qty=${qty} entry=${fillPrice} leverage=${leverage}x`
-    );
-  } catch (err) {
-    console.error("[AutoTrader] executeConfirmed error:", err.message);
-
-    await sendPrivate(
-      `⚠️ <b>Execution error</b>\n\n${escapeHTML(err.message)}`
-    );
-  }
-}
-
-async function atClosePosition(reason = "Manual") {
-  if (!openPosition) {
-    await sendPrivate("⚠️ No open position to close.");
-    return;
-  }
-
-  try {
-    const { symbol, side, qty, entryPrice, slOrderId, tpOrderId } = openPosition;
-    const closeSide = side === "BUY" ? "SELL" : "BUY";
-
-    if (slOrderId) await atCancelOrder(symbol, slOrderId).catch(() => {});
-    if (tpOrderId) await atCancelOrder(symbol, tpOrderId).catch(() => {});
-
-    await sleep(300);
-
-    const closeOrder = await atPlaceMarketOrder(symbol, closeSide, qty);
-    const exitPrice = parseFloat(closeOrder.avgPrice || closeOrder.price || entryPrice);
-
-    const pnlRaw =
-      side === "BUY"
-        ? (exitPrice - entryPrice) * qty
-        : (entryPrice - exitPrice) * qty;
-
-    const pnl = parseFloat(pnlRaw.toFixed(2));
-
-    personalTradingState.pnlToday += pnl;
-    PERSONAL_PLAN.balance += pnl;
-
-    if (
-      personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock ||
-      personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)
-    ) {
-      personalTradingState.coolingDown = true;
-    }
-
-    openPosition = null;
-
-    await sendPrivate(
-      `${pnl >= 0 ? "💚" : "💔"} <b>POSITION CLOSED</b>\n\n` +
-      `Reason: <b>${escapeHTML(reason)}</b>\n` +
-      `Pair: <b>${escapeHTML(symbol)}</b>\n` +
-      `Side: <b>${side === "BUY" ? "LONG" : "SHORT"}</b>\n` +
-      `Entry: <b>${formatUsd(entryPrice)}</b>\n` +
-      `Exit: <b>${formatUsd(exitPrice)}</b>\n` +
-      `PnL: <b>${pnl >= 0 ? "+" : ""}${formatUsd(pnl)}</b>\n\n` +
-      `Daily PnL: <b>${personalTradingState.pnlToday >= 0 ? "+" : ""}${formatUsd(personalTradingState.pnlToday)}</b>\n` +
-      `Balance: <b>${formatUsd(PERSONAL_PLAN.balance)}</b>\n\n` +
-      `🌐 wojakmeter.com`
-    );
-
-    console.log(`[AutoTrader] Position closed: ${symbol} pnl=${pnl}`);
-  } catch (err) {
-    console.error("[AutoTrader] closePosition error:", err.message);
-
-    await sendPrivate(
-      `⚠️ <b>Error closing position</b>\n\n${escapeHTML(err.message)}`
-    );
-  }
-}
-
-async function evaluateAndTrade(nextState) {
-  try {
-    if (!autoTradeActive) return;
-    if (!canOpenTrade()) return;
-
-    const { score, emotionKey } = nextState;
-
-    let side = null;
-    const symbol = "BTCUSDT";
-
-    if (score >= SCORE_LONG_MIN) {
-      side = "BUY";
-    } else if (score <= SCORE_SHORT_MAX) {
-      side = "SELL";
-    }
-
-    if (!side) return;
-
-    console.log(
-      `[AutoTrader] Signal: ${side} | Score: ${score} | Emotion: ${emotionKey} | Confirmation required`
-    );
-
-    await atExecuteTrade(side, symbol, score);
-  } catch (err) {
-    console.error("[AutoTrader] evaluateAndTrade error:", err.message);
-  }
-}
-
-// ===============================
-// COINGECKO MARKET PERSONAL SCANNER
-// ===============================
-function detectMarketSetup(coin) {
-  if (!coin) return null;
-
-  const symbol = (coin.symbol || "").toUpperCase();
-  const name = coin.name || symbol;
-  const price = safe(coin.current_price);
-  const change24h = safe(coin.price_change_percentage_24h);
-  const volume = safe(coin.total_volume);
-  const marketCap = safe(coin.market_cap);
-
-  if (!symbol || !price || !volume) return null;
-
-  const volumeToMcap = marketCap > 0 ? volume / marketCap : 0;
-
-  let type = "Observation";
-  let direction = "WAIT";
-  let mood = "Neutral";
-  let score = 50;
-  let reason = [];
-  let warning = "This is a market scanner alert, not a direct entry.";
-
-  if (change24h >= 3 && volumeToMcap >= 0.03) {
-    type = "Momentum Watch / Strong Gainer";
-    direction = "WAIT FOR PULLBACK";
-    mood = "Optimism / Euphoria";
-    score = 65;
-    score += Math.min(20, change24h * 2);
-    score += Math.min(10, volumeToMcap * 100);
-
-    reason.push(`Strong 24h move: ${formatPercent(change24h)}`);
-    reason.push(`Healthy volume vs market cap: ${(volumeToMcap * 100).toFixed(2)}%`);
-    reason.push("Market is showing strong buyer attention.");
-
-    warning = "Avoid chasing. Wait for pullback, retest, or clean confirmation.";
-  }
-
-  if (change24h <= -3 && volumeToMcap >= 0.03) {
-    type = "Capitulation Watch / Heavy Loser";
-    direction = "WAIT FOR STABILIZATION";
-    mood = "Concern / Panic";
-    score = 65;
-    score += Math.min(20, Math.abs(change24h) * 2);
-    score += Math.min(10, volumeToMcap * 100);
-
-    reason.push(`Heavy 24h drop: ${formatPercent(change24h)}`);
-    reason.push(`High activity vs market cap: ${(volumeToMcap * 100).toFixed(2)}%`);
-    reason.push("Market is showing strong emotional pressure.");
-
-    warning = "Do not catch the knife. Wait for stabilization or reversal structure.";
-  }
-
-  if (Math.abs(change24h) >= 2 && volumeToMcap >= 0.06) {
-    type = change24h > 0 ? "Volume Momentum Watch" : "Volume Stress Watch";
-    direction = change24h > 0 ? "LONG WATCH" : "SHORT / REVERSAL WATCH";
-    mood = change24h > 0 ? "Optimism / Activity" : "Concern / Activity";
-
-    score = Math.max(score, 70);
-    score += Math.min(15, Math.abs(change24h) * 2);
-    score += Math.min(10, volumeToMcap * 80);
-
-    reason.push(`Unusual volume activity: ${(volumeToMcap * 100).toFixed(2)}% of market cap`);
-    reason.push(`24h move: ${formatPercent(change24h)}`);
-
-    warning = "Volume is active. Wait for confirmation before entering.";
-  }
-
-  score = Math.round(clamp(score, 0, 100));
-
-  if (score < MARKET_MIN_SIGNAL_SCORE) return null;
-
-  return {
-    symbol: `${symbol}USDT`,
-    baseSymbol: symbol,
-    name,
-    interval: "24h",
-    type,
-    direction,
-    mood,
-    score,
-    close: price,
-    move1: change24h,
-    move5: change24h,
-    move20: change24h,
-    volRatio: volumeToMcap * 100,
-    rsi: 50,
-    volume,
-    marketCap,
-    reason,
-    warning
-  };
-}
-
-function buildMarketPersonalSignalMessage(signal) {
-  resetPersonalStateIfNewDay();
-
-  const links = buildTradeLinksFromSymbol(signal.baseSymbol || signal.symbol);
-
-  const reasonLines = signal.reason.length
-    ? signal.reason.map((r) => `• ${escapeHTML(r)}`).join("\n")
-    : "• Market movement detected.";
-
-  return (
-    `🔥 <b>WOJAKMETER PERSONAL SIGNAL</b>\n\n` +
-    `Pair: <b>${escapeHTML(signal.symbol)}</b>\n` +
-    `Source: <b>CoinGecko Market Scanner</b>\n` +
-    `Timeframe: <b>${escapeHTML(signal.interval)}</b>\n` +
-    `Type: <b>${escapeHTML(signal.type)}</b>\n` +
-    `Direction: <b>${escapeHTML(signal.direction)}</b>\n` +
-    `Mood: <b>${escapeHTML(signal.mood)}</b>\n` +
-    `Score: <b>${signal.score}/100</b>\n\n` +
-
-    `📊 <b>Market Data</b>\n` +
-    `Price: <b>${formatUsd(signal.close)}</b>\n` +
-    `24h Move: <b>${formatPercent(signal.move1)}</b>\n` +
-    `Volume: <b>${formatUsd(signal.volume)}</b>\n` +
-    `Market Cap: <b>${formatUsd(signal.marketCap)}</b>\n` +
-    `Volume/MCap: <b>${signal.volRatio.toFixed(2)}%</b>\n\n` +
-
-    `🧠 <b>Why it triggered</b>\n${reasonLines}\n\n` +
-
-    `⚠️ <b>Execution Warning</b>\n${escapeHTML(signal.warning)}\n\n` +
-
-    `🧠 <b>Your Plan</b>\n` +
-    `Max risk: <b>$${PERSONAL_PLAN.riskPerTrade.toFixed(2)}</b>\n` +
-    `Leverage: <b>${PERSONAL_PLAN.defaultLeverage}x (max ${PERSONAL_PLAN.maxLeverage}x)</b>\n` +
-    `Trades today: <b>${personalTradingState.tradesToday}/${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
-    `PnL today: <b>${personalTradingState.pnlToday >= 0 ? "+" : ""}$${personalTradingState.pnlToday.toFixed(2)}</b>\n\n` +
-
-    `🔗 <b>Trade / Chart</b>\n` +
-    `<a href="${links.binanceFutures}">Binance Futures</a> · ` +
-    `<a href="${links.tradingView}">TradingView</a>\n\n` +
-
-    `🚫 This is not financial advice. Wait for confirmation and define stop loss first.\n\n` +
-    `🌐 wojakmeter.com`
-  );
-}
-
-function canSendMarketPersonalSignal(signal) {
-  resetPersonalStateIfNewDay();
-
-  if (!MARKET_SCANNER_ENABLED) return false;
-  if (!PERSONAL_ALERTS_ENABLED) return false;
-  if (!PRIVATE_TELEGRAM_USER_ID) return false;
-  if (signal.score < MARKET_MIN_SIGNAL_SCORE) return false;
-  if (personalTradingState.coolingDown) return false;
-  if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) return false;
-  if (personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)) return false;
-  if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) return false;
-
-  const key = `${signal.symbol}:${signal.type}`;
-  const last = lastPersonalMarketAlerts.get(key) || 0;
-
-  if (Date.now() - last < PERSONAL_MARKET_ALERT_COOLDOWN_MS) return false;
-
-  lastPersonalMarketAlerts.set(key, Date.now());
-
-  return true;
-}
-
-async function sendMarketPersonalSignal(signal) {
-  try {
-    if (!canSendMarketPersonalSignal(signal)) return;
-
-    await bot.telegram.sendMessage(
-      PRIVATE_TELEGRAM_USER_ID,
-      buildMarketPersonalSignalMessage(signal),
-      {
-        parse_mode: "HTML",
-        disable_web_page_preview: true
-      }
-    );
-
-    console.log(
-      `Market personal signal sent: ${signal.symbol} ${signal.type} score ${signal.score}`
-    );
-  } catch (err) {
-    console.error("Send market personal signal error:", err.message);
-  }
-}
-
-async function scanMarketPersonalSignals() {
-  try {
-    if (!MARKET_SCANNER_ENABLED || !PERSONAL_ALERTS_ENABLED || !PRIVATE_TELEGRAM_USER_ID) {
-      return;
-    }
-
-    resetPersonalStateIfNewDay();
-
-    if (personalTradingState.coolingDown) return;
-    if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) return;
-    if (personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)) return;
-    if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) return;
-
-    const markets = await getMarkets(true);
-
-    const allowedBases = MARKET_SCAN_SYMBOLS.map((s) =>
-      String(s).replace("USDT", "").toUpperCase()
-    );
-
-    const filtered = markets.filter((coin) =>
-      allowedBases.includes((coin.symbol || "").toUpperCase())
-    );
-
-    const signals = filtered
-      .map(detectMarketSetup)
-      .filter(Boolean)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 5);
-
-    for (const signal of signals) {
-      await sendMarketPersonalSignal(signal);
-      await sleep(750);
-    }
-  } catch (err) {
-    console.error("Market personal scanner error:", err.message);
-  }
-}
-
-// ===============================
-// ANALYZE — TOP PAIRS
-// ===============================
-function analyzePair(coin) {
-  const change1h = safe(coin.price_change_percentage_1h_in_currency, 0);
-  const change24h = safe(coin.price_change_percentage_24h_in_currency, 0);
-  const change7d = safe(coin.price_change_percentage_7d_in_currency, 0);
-  const volume = safe(coin.total_volume, 0);
-  const marketCap = safe(coin.market_cap, 0);
-  const price = safe(coin.current_price, 0);
-  const volToMcap = marketCap > 0 ? (volume / marketCap) * 100 : 0;
-
-  let score = 50;
-
-  score += change24h * 3.5;
-  score += change1h * 6;
-  score += change7d * 1.2;
-
-  if (volToMcap > 10) score += 8;
-  else if (volToMcap > 5) score += 4;
-  else if (volToMcap < 1) score -= 4;
-
-  score = Math.round(clamp(score, 0, 100));
-
-  let direction = "WAIT";
-  let action = null;
-  let confidence = "—";
-
-  const reversalLong = change24h < -4 && change1h > 0.5;
-  const reversalShort = change24h > 4 && change1h < -0.5;
-  const trendLong = change24h > 2 && change7d > 3 && change1h > 0;
-  const trendShort = change24h < -2 && change7d < -3 && change1h < 0;
-
-  if (score >= 75) {
-    direction = "LONG";
-    action = "BUY";
-    confidence = score >= 85 ? "High 🔥" : "Medium";
-  } else if (score <= 25) {
-    direction = "SHORT";
-    action = "SELL";
-    confidence = score <= 15 ? "High 🔥" : "Medium";
-  } else if (reversalLong) {
-    direction = "LONG (Reversal)";
-    action = "BUY";
-    confidence = "Medium";
-    score = Math.max(score, 62);
-  } else if (reversalShort) {
-    direction = "SHORT (Reversal)";
-    action = "SELL";
-    confidence = "Medium";
-    score = Math.min(score, 38);
-  } else if (trendLong) {
-    direction = "LONG (Trend)";
-    action = "BUY";
-    confidence = "Medium";
-  } else if (trendShort) {
-    direction = "SHORT (Trend)";
-    action = "SELL";
-    confidence = "Medium";
-  }
-
-  const slPct = SL_PCT;
-  const tpPct = TP_PCT;
-
-  const slPrice =
-    action === "BUY"
-      ? price * (1 - slPct / 100)
-      : price * (1 + slPct / 100);
-
-  const tpPrice =
-    action === "BUY"
-      ? price * (1 + tpPct / 100)
-      : price * (1 - tpPct / 100);
-
-  const reasons = [];
-
-  if (Math.abs(change24h) >= 3) reasons.push(`24h: ${formatPercent(change24h)}`);
-  if (Math.abs(change1h) >= 0.5) reasons.push(`1h: ${formatPercent(change1h)}`);
-  if (Math.abs(change7d) >= 3) reasons.push(`7d: ${formatPercent(change7d)}`);
-  if (volToMcap > 5) reasons.push(`Vol/MCap: ${volToMcap.toFixed(1)}%`);
-
-  return {
-    coin,
-    score,
-    direction,
-    action,
-    confidence,
-    change1h,
-    change24h,
-    change7d,
-    volToMcap,
-    price,
-    slPrice,
-    tpPrice,
-    slPct,
-    tpPct,
-    reasons
-  };
-}
-
-function buildAnalyzeLine(a, index) {
-  const symbol = (a.coin.symbol || "").toUpperCase();
-  const links = buildTradeLinksFromSymbol(symbol);
-  const emotion = getEmotionByChange(a.change24h);
-  const dirIcon = a.action === "BUY" ? "📈" : a.action === "SELL" ? "📉" : "⏸";
-  const rr = `1:${(a.tpPct / a.slPct).toFixed(1)}`;
-
-  const instruction = a.action
-    ? (
-      `Entry ≈ <b>${formatUsd(a.price)}</b>\n` +
-      `SL: <b>${formatUsd(a.slPrice)}</b> (-${a.slPct}%) · TP: <b>${formatUsd(a.tpPrice)}</b> (+${a.tpPct}%)\n` +
-      `R/R: <b>${rr}</b> · Confidence: <b>${a.confidence}</b>`
-    )
-    : "No clear setup — wait for direction.";
-
-  const reasons = a.reasons.length ? a.reasons.join(" · ") : "Mixed signals";
-
-  return (
-    `${index}. ${dirIcon} <b>${escapeHTML(symbol)}</b> — <b>${escapeHTML(a.direction)}</b>\n` +
-    `${emotion.emoji} Score: <b>${a.score}/100</b> · ${escapeHTML(reasons)}\n` +
-    `${instruction}\n` +
-    `<a href="${links.binanceFutures}">Binance App</a> · <a href="${links.tradingView}">Chart</a>`
-  );
-}
-
-async function sendAnalysis(ctx) {
-  await ctx.reply("🔍 Analyzing top tradeable pairs...", {
-    reply_markup: buildMainKeyboard().reply_markup
-  });
-
-  try {
-    const markets = await getMarkets();
-
-    const valid = markets
-      .filter(
-        (c) =>
-          c.current_price > 0 &&
-          c.total_volume > 0 &&
-          c.price_change_percentage_24h_in_currency != null
-      )
-      .slice(0, 50);
-
-    const analyzed = valid
-      .map(analyzePair)
-      .sort((a, b) => {
-        const aAction = a.action ? 1 : 0;
-        const bAction = b.action ? 1 : 0;
-
-        if (bAction !== aAction) return bAction - aAction;
-
-        return Math.abs(b.score - 50) - Math.abs(a.score - 50);
-      })
-      .slice(0, 10);
-
-    const longs = analyzed.filter((a) => a.action === "BUY").length;
-    const shorts = analyzed.filter((a) => a.action === "SELL").length;
-
-    const marketBias =
-      longs > shorts
-        ? `📈 Bullish bias (${longs} LONG / ${shorts} SHORT)`
-        : longs < shorts
-          ? `📉 Bearish bias (${shorts} SHORT / ${longs} LONG)`
-          : `⚖️ Neutral (${longs} LONG / ${shorts} SHORT)`;
-
-    const global = await getGlobal().catch(() => null);
-    const change = safe(global?.data?.market_cap_change_percentage_24h_usd, 0);
-    const score = scoreFromChange(change);
-    const emotion = getEmotionByChange(change);
-    const lines = analyzed.map((a, i) => buildAnalyzeLine(a, i + 1)).join("\n\n");
-
-    return ctx.reply(
-      `🧠 <b>WojakMeter Analysis — Top 10 Pairs</b>\n\n` +
-      `${emotion.emoji} Market: <b>${emotion.label}</b> (${score}/100)\n` +
-      `${marketBias}\n\n` +
-      `━━━━━━━━━━━━━━━━━━━\n\n` +
-      `${lines}\n\n` +
-      `━━━━━━━━━━━━━━━━━━━\n\n` +
-      `⚠️ <b>Discipline</b>\n` +
-      `Signal readings only — not direct entries.\n` +
-      `Confirm setup, define stop loss and size risk before trading.\n\n` +
-      `🌐 wojakmeter.com`,
-      {
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        reply_markup: buildMainKeyboard().reply_markup
-      }
-    );
-  } catch (error) {
-    return replyWithError(ctx, error, "Error analyze");
-  }
-}
-
-// ===============================
-// KEYBOARD
-// ===============================
-function buildMainKeyboard() {
-  return Markup.keyboard([
-    ["🧠 Signal", "📊 Market"],
-    ["🔥 Trending", "🌟 Spotlight"],
-    ["⚠️ Risk", "₿ BTC Mood"],
-    ["🚀 Top Gainers", "💥 Top Losers"],
-    ["🧪 Radar", "🔍 Analyze"],
-    ["🧠 Discipline", "📋 My Plan"],
-    ["🤖 AutoTrade ON", "🛑 AutoTrade OFF"],
-    ["📈 Position", "📋 Orders"],
-    ["🧬 Emo Status", "📜 Emo History"],
-    ["/coin btc", "/daily"],
-    ["/mywatchlist", "/scan"],
-    ["/scandebug", "/testsignal"],
-    ["🤩", "😌", "🙂", "😐"],
-    ["🤔", "😟", "😡"],
-    ["/start", "/help", "/teststicker", "/testchannel"]
-  ]).resize();
 }
 
 function normalizeCoinKey(input) {
@@ -1549,51 +519,31 @@ function getUserWatchlist(userId) {
 }
 
 // ===============================
-// TELEGRAM SENDERS
+// TELEGRAM KEYBOARD
 // ===============================
-async function sendEmotionSticker(ctx, emotionKey) {
-  const sticker = STICKERS[emotionKey];
-
-  if (!sticker) return;
-
-  try {
-    await ctx.replyWithSticker(sticker, {
-      reply_markup: buildMainKeyboard().reply_markup
-    });
-  } catch (e) {
-    console.error("Sticker error:", e.message);
-  }
-}
-
-async function sendStickerToChannel(emotionKey) {
-  if (!TELEGRAM_CHANNEL_ID) return;
-
-  const sticker = STICKERS[emotionKey];
-
-  if (!sticker) return;
-
-  try {
-    await bot.telegram.sendSticker(TELEGRAM_CHANNEL_ID, sticker);
-  } catch (err) {
-    console.error("Channel sticker error:", err.message);
-  }
-}
-
-async function sendMessageToChannel(text) {
-  if (!TELEGRAM_CHANNEL_ID) return;
-
-  try {
-    await bot.telegram.sendMessage(TELEGRAM_CHANNEL_ID, text, {
-      parse_mode: "HTML",
-      disable_web_page_preview: true
-    });
-  } catch (err) {
-    console.error("Channel message error:", err.message);
-  }
+function buildMainKeyboard() {
+  return Markup.keyboard([
+    ["🧠 Signal", "📊 Market"],
+    ["🔥 Trending", "🌟 Spotlight"],
+    ["⚠️ Risk", "₿ BTC Mood"],
+    ["🚀 Top Gainers", "💥 Top Losers"],
+    ["🧪 Radar", "🔍 Analyze"],
+    ["💵 Futures", "📈 Positions"],
+    ["📋 Orders", "🧠 Risk Status"],
+    ["🧠 Discipline", "📋 My Plan"],
+    ["🤖 AutoTrade ON", "🛑 AutoTrade OFF"],
+    ["🧬 Emo Status", "📜 Emo History"],
+    ["/coin btc", "/daily"],
+    ["/mywatchlist", "/scan"],
+    ["/scandebug", "/testsignal"],
+    ["🤩", "😌", "🙂", "😐"],
+    ["🤔", "😟", "😡"],
+    ["/start", "/help", "/id"]
+  ]).resize();
 }
 
 // ===============================
-// FETCH WITH RETRY
+// FETCH + COINGECKO
 // ===============================
 async function fetchJSON(url, options = {}) {
   const maxRetries = options.maxRetries ?? 3;
@@ -1656,9 +606,6 @@ async function fetchJSON(url, options = {}) {
   }
 }
 
-// ===============================
-// API LAYER + CACHE
-// ===============================
 async function getMarkets(force = false) {
   const now = Date.now();
 
@@ -1667,12 +614,8 @@ async function getMarkets(force = false) {
   }
 
   const url =
-    `${API_BASE}/coins/markets` +
-    `?vs_currency=${VS_CURRENCY}` +
-    `&order=market_cap_desc` +
-    `&per_page=100&page=1` +
-    `&sparkline=false` +
-    `&price_change_percentage=1h,24h,7d`;
+    `${API_BASE}/coins/markets?vs_currency=${VS_CURRENCY}` +
+    `&order=market_cap_desc&per_page=100&page=1&sparkline=false&price_change_percentage=1h,24h,7d`;
 
   const data = await fetchJSON(url, {
     maxRetries: 3,
@@ -1728,7 +671,706 @@ async function getGlobal(force = false) {
 }
 
 // ===============================
-// BUILDERS / FORMATTERS
+// BINANCE FUTURES HELPERS
+// ===============================
+async function sendPrivate(text) {
+  if (!PRIVATE_TELEGRAM_USER_ID) return;
+
+  try {
+    await bot.telegram.sendMessage(PRIVATE_TELEGRAM_USER_ID, text, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true
+    });
+  } catch (err) {
+    console.error("[Private] send error:", err.message);
+  }
+}
+
+function promisifyBinance(fn) {
+  return new Promise((resolve, reject) => {
+    fn((err, res) => {
+      if (err) {
+        return reject(
+          new Error(err.body || err.message || JSON.stringify(err))
+        );
+      }
+
+      resolve(res);
+    });
+  });
+}
+
+async function atSetLeverage(symbol, leverage = AT_LEVERAGE) {
+  return promisifyBinance((cb) =>
+    binanceClient.futuresLeverage(symbol, leverage, cb)
+  );
+}
+
+async function atGetMarkPrice(symbol) {
+  const res = await promisifyBinance((cb) =>
+    binanceClient.futuresMarkPrice(symbol, cb)
+  );
+
+  return parseFloat(res?.markPrice || res?.price || 0);
+}
+
+async function atGetFuturesBalance() {
+  const balances = await promisifyBinance((cb) =>
+    binanceClient.futuresBalance(cb)
+  );
+
+  const usdt = (balances || []).find((b) => b.asset === "USDT");
+
+  return parseFloat(usdt?.availableBalance || 0);
+}
+
+async function atGetFuturesAccount() {
+  return promisifyBinance((cb) => binanceClient.futuresAccount(cb));
+}
+
+async function atGetExchangeInfo(symbol) {
+  const info = await promisifyBinance((cb) =>
+    binanceClient.futuresExchangeInfo(cb)
+  );
+
+  return (info?.symbols || []).find((s) => s.symbol === symbol) || null;
+}
+
+function atGetFilter(symbolInfo, filterType) {
+  return (symbolInfo?.filters || []).find(
+    (f) => f.filterType === filterType
+  );
+}
+
+function atGetLotStepSize(symbolInfo) {
+  const lotFilter = atGetFilter(symbolInfo, "LOT_SIZE");
+
+  return parseFloat(lotFilter?.stepSize || "0.001");
+}
+
+function atGetMinQty(symbolInfo) {
+  const lotFilter = atGetFilter(symbolInfo, "LOT_SIZE");
+
+  return parseFloat(lotFilter?.minQty || "0");
+}
+
+function atGetMinNotional(symbolInfo) {
+  const f =
+    atGetFilter(symbolInfo, "MIN_NOTIONAL") ||
+    atGetFilter(symbolInfo, "NOTIONAL");
+
+  return parseFloat(f?.notional || f?.minNotional || "5");
+}
+
+function atGetTickSize(symbolInfo) {
+  const f = atGetFilter(symbolInfo, "PRICE_FILTER");
+
+  return parseFloat(f?.tickSize || "0.01");
+}
+
+function atRoundQty(qty, stepSize) {
+  if (!stepSize || stepSize <= 0) return qty;
+
+  const precision = Math.max(0, Math.round(-Math.log10(stepSize)));
+
+  return parseFloat(
+    (Math.floor(qty / stepSize) * stepSize).toFixed(precision)
+  );
+}
+
+function atRoundPrice(price, tickSize) {
+  if (!tickSize || tickSize <= 0) return price;
+
+  const precision = Math.max(0, Math.round(-Math.log10(tickSize)));
+
+  return parseFloat(
+    (Math.round(price / tickSize) * tickSize).toFixed(precision)
+  );
+}
+
+async function atPlaceMarketOrder(symbol, side, qty) {
+  return promisifyBinance((cb) =>
+    binanceClient.futuresOrder(
+      side,
+      symbol,
+      qty,
+      false,
+      { type: "MARKET" },
+      cb
+    )
+  );
+}
+
+async function atPlaceSlTpOrders(symbol, side, qty, entryPrice) {
+  const oppositeSide = side === "BUY" ? "SELL" : "BUY";
+  const symbolInfo = await atGetExchangeInfo(symbol);
+  const tickSize = atGetTickSize(symbolInfo);
+
+  let slPrice =
+    side === "BUY"
+      ? entryPrice * (1 - SL_PCT / 100)
+      : entryPrice * (1 + SL_PCT / 100);
+
+  let tpPrice =
+    side === "BUY"
+      ? entryPrice * (1 + TP_PCT / 100)
+      : entryPrice * (1 - TP_PCT / 100);
+
+  slPrice = atRoundPrice(slPrice, tickSize);
+  tpPrice = atRoundPrice(tpPrice, tickSize);
+
+  const slOrder = await promisifyBinance((cb) =>
+    binanceClient.futuresOrder(
+      oppositeSide,
+      symbol,
+      qty,
+      slPrice,
+      {
+        type: "STOP_MARKET",
+        stopPrice: slPrice,
+        reduceOnly: true,
+        workingType: "MARK_PRICE"
+      },
+      cb
+    )
+  );
+
+  const tpOrder = await promisifyBinance((cb) =>
+    binanceClient.futuresOrder(
+      oppositeSide,
+      symbol,
+      qty,
+      tpPrice,
+      {
+        type: "TAKE_PROFIT_MARKET",
+        stopPrice: tpPrice,
+        reduceOnly: true,
+        workingType: "MARK_PRICE"
+      },
+      cb
+    )
+  );
+
+  return {
+    slPrice,
+    tpPrice,
+    slOrderId: slOrder.orderId,
+    tpOrderId: tpOrder.orderId
+  };
+}
+
+async function atCancelOrder(symbol, orderId) {
+  try {
+    return await promisifyBinance((cb) =>
+      binanceClient.futuresCancel(symbol, { orderId }, cb)
+    );
+  } catch (err) {
+    console.error("[Binance] cancel order error:", err.message);
+    return null;
+  }
+}
+
+async function atCancelAllOrders(symbol) {
+  return promisifyBinance((cb) =>
+    binanceClient.futuresCancelAll(symbol, cb)
+  );
+}
+
+async function atGetOpenPositions() {
+  const positions = await promisifyBinance((cb) =>
+    binanceClient.futuresPositionRisk(cb)
+  );
+
+  return (positions || []).filter((p) => parseFloat(p.positionAmt) !== 0);
+}
+
+async function atGetOpenOrders(symbol) {
+  return promisifyBinance((cb) =>
+    binanceClient.futuresOpenOrders(symbol, cb)
+  );
+}
+
+async function atGetAllOpenOrdersForTrackedSymbols() {
+  const symbols = Array.from(
+    new Set([
+      ...MARKET_SCAN_SYMBOLS,
+      "BTCUSDT",
+      "ETHUSDT",
+      "SOLUSDT",
+      "BNBUSDT",
+      "XRPUSDT",
+      "DOGEUSDT",
+      "ADAUSDT",
+      "AVAXUSDT",
+      "LINKUSDT",
+      "NEARUSDT",
+      "PEPEUSDT",
+      "WIFUSDT"
+    ])
+  );
+
+  const all = [];
+
+  for (const symbol of symbols) {
+    try {
+      const orders = await atGetOpenOrders(symbol);
+
+      for (const order of orders) {
+        all.push(order);
+      }
+
+      await sleep(150);
+    } catch (_) {}
+  }
+
+  return all;
+}
+
+function calculateQtyByRisk({ markPrice, symbolInfo, riskUsd, slPct }) {
+  const stopDistanceUsd = markPrice * (slPct / 100);
+  const rawQty = riskUsd / stopDistanceUsd;
+  const stepSize = atGetLotStepSize(symbolInfo);
+  const minQty = atGetMinQty(symbolInfo);
+  const minNotional = atGetMinNotional(symbolInfo);
+  const qty = atRoundQty(rawQty, stepSize);
+  const notional = qty * markPrice;
+
+  if (qty <= 0) {
+    throw new Error("Calculated qty is 0 — check riskPerTrade");
+  }
+
+  if (minQty && qty < minQty) {
+    throw new Error(`Qty too small. Qty=${qty}, minQty=${minQty}`);
+  }
+
+  if (minNotional && notional < minNotional) {
+    throw new Error(
+      `Notional too small: ${formatUsd(notional)}. Minimum approx: ${formatUsd(
+        minNotional
+      )}`
+    );
+  }
+
+  return {
+    qty,
+    notional,
+    stepSize,
+    minQty,
+    minNotional
+  };
+}
+
+// ===============================
+// FUTURES CONTROL PANEL BUILDERS
+// ===============================
+function buildFuturesAccountMessage(account) {
+  const totalWalletBalance = safe(account.totalWalletBalance);
+  const totalUnrealizedProfit = safe(account.totalUnrealizedProfit);
+  const totalMarginBalance = safe(account.totalMarginBalance);
+  const availableBalance = safe(account.availableBalance);
+  const totalInitialMargin = safe(account.totalInitialMargin);
+  const totalMaintMargin = safe(account.totalMaintMargin);
+
+  return (
+    `📊 <b>Binance Futures Account</b>\n\n` +
+    `💼 Wallet Balance: <b>${formatUsd(totalWalletBalance)}</b>\n` +
+    `✅ Available Balance: <b>${formatUsd(availableBalance)}</b>\n` +
+    `📈 Unrealized PnL: <b>${
+      totalUnrealizedProfit >= 0 ? "+" : ""
+    }${formatUsd(totalUnrealizedProfit)}</b>\n` +
+    `💰 Margin Balance: <b>${formatUsd(totalMarginBalance)}</b>\n\n` +
+    `🧱 <b>Margin</b>\n` +
+    `Initial Margin: <b>${formatUsd(totalInitialMargin)}</b>\n` +
+    `Maintenance Margin: <b>${formatUsd(totalMaintMargin)}</b>\n\n` +
+    `🧠 <b>Your Risk Plan</b>\n` +
+    `Risk/trade: <b>${formatUsd(PERSONAL_PLAN.riskPerTrade)}</b>\n` +
+    `Max daily loss: <b>-${formatUsd(PERSONAL_PLAN.maxDailyLoss)}</b>\n` +
+    `Profit lock: <b>+${formatUsd(PERSONAL_PLAN.dailyProfitLock)}</b>\n` +
+    `Trades today: <b>${personalTradingState.tradesToday}/${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
+    `Cooling down: <b>${personalTradingState.coolingDown ? "Yes" : "No"}</b>\n\n` +
+    `🤖 AutoTrade: <b>${autoTradeActive ? "ON ✅" : "OFF 🛑"}</b>\n` +
+    `Manual confirmation: <b>${
+      AUTO_TRADE_CONFIRM ? "Required ✅" : "Disabled ⚠️"
+    }</b>\n` +
+    `Testnet: <b>${USE_TESTNET ? "Yes" : "❗ REAL MONEY"}</b>`
+  );
+}
+
+function buildPositionsMessage(positions) {
+  if (!positions.length) {
+    return (
+      `📈 <b>Open Positions</b>\n\n` +
+      `No open futures positions.\n\n` +
+      `🌐 wojakmeter.com`
+    );
+  }
+
+  const lines = positions.map((p, i) => {
+    const amt = parseFloat(p.positionAmt);
+    const side = amt > 0 ? "LONG" : "SHORT";
+    const pnl = safe(p.unRealizedProfit);
+    const entry = safe(p.entryPrice);
+    const mark = safe(p.markPrice);
+    const leverage = p.leverage || "—";
+
+    return (
+      `${i + 1}. ${amt > 0 ? "📈" : "📉"} <b>${escapeHTML(
+        p.symbol
+      )}</b> — <b>${side}</b>\n` +
+      `Qty: <b>${Math.abs(amt)}</b>\n` +
+      `Entry: <b>${formatUsd(entry)}</b>\n` +
+      `Mark: <b>${formatUsd(mark)}</b>\n` +
+      `PnL: <b>${pnl >= 0 ? "+" : ""}${formatUsd(pnl)}</b>\n` +
+      `Leverage: <b>${leverage}x</b>\n` +
+      `Close: <code>/closepos ${p.symbol}</code>`
+    );
+  });
+
+  return (
+    `📈 <b>Open Positions</b>\n\n` +
+    lines.join("\n\n") +
+    `\n\n⚠️ Closing a position requires confirmation.`
+  );
+}
+
+function buildAllOrdersMessage(orders) {
+  if (!orders.length) {
+    return (
+      `📋 <b>Open Orders</b>\n\n` +
+      `No open futures orders.\n\n` +
+      `🌐 wojakmeter.com`
+    );
+  }
+
+  const lines = orders.slice(0, 20).map((o, i) => {
+    return (
+      `${i + 1}. <b>${escapeHTML(o.symbol)}</b>\n` +
+      `Type: <b>${escapeHTML(o.type)}</b>\n` +
+      `Side: <b>${escapeHTML(o.side)}</b>\n` +
+      `Qty: <b>${o.origQty}</b>\n` +
+      `Price: <b>${formatUsd(o.price || 0)}</b>\n` +
+      `Stop: <b>${formatUsd(o.stopPrice || 0)}</b>\n` +
+      `ID: <code>${o.orderId}</code>`
+    );
+  });
+
+  return (
+    `📋 <b>Open Futures Orders</b>\n\n` +
+    lines.join("\n\n") +
+    `\n\n⚠️ To cancel all orders for a pair:\n` +
+    `<code>/cancelall BTCUSDT</code>`
+  );
+}
+
+function buildRiskStatusMessage() {
+  resetPersonalStateIfNewDay();
+
+  let status = "Healthy ✅";
+
+  if (personalTradingState.coolingDown) {
+    status = "Cooling down 🧊";
+  } else if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) {
+    status = "Max trades reached 📌";
+  } else if (
+    personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)
+  ) {
+    status = "Max daily loss reached 🛑";
+  } else if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) {
+    status = "Profit lock reached 🔒";
+  }
+
+  return (
+    `🧠 <b>Risk Status</b>\n\n` +
+    `Status: <b>${status}</b>\n\n` +
+    `💼 Balance: <b>${formatUsd(PERSONAL_PLAN.balance)}</b>\n` +
+    `🎯 Risk per trade: <b>${formatUsd(PERSONAL_PLAN.riskPerTrade)}</b>\n` +
+    `🛑 Max daily loss: <b>-${formatUsd(PERSONAL_PLAN.maxDailyLoss)}</b>\n` +
+    `🔒 Daily profit lock: <b>+${formatUsd(PERSONAL_PLAN.dailyProfitLock)}</b>\n` +
+    `📌 Trades today: <b>${personalTradingState.tradesToday}/${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
+    `📊 PnL today: <b>${
+      personalTradingState.pnlToday >= 0 ? "+" : ""
+    }${formatUsd(personalTradingState.pnlToday)}</b>\n` +
+    `🧊 Cooling down: <b>${personalTradingState.coolingDown ? "Yes" : "No"}</b>\n\n` +
+    `⚙️ Default leverage: <b>${PERSONAL_PLAN.defaultLeverage}x</b>\n` +
+    `🚫 Max leverage: <b>${PERSONAL_PLAN.maxLeverage}x</b>\n\n` +
+    `Rule: <b>No confirmation, no execution.</b>`
+  );
+}
+
+// ===============================
+// AUTOTRADE CORE
+// ===============================
+function canOpenTrade() {
+  resetPersonalStateIfNewDay();
+
+  if (!autoTradeActive) return false;
+  if (openPosition) return false;
+  if (pendingConfirm) return false;
+  if (personalTradingState.coolingDown) return false;
+  if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) return false;
+  if (personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)) return false;
+  if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) return false;
+  if (Date.now() - lastTradeSignalTs < SIGNAL_COOLDOWN_MS) return false;
+
+  return true;
+}
+
+async function atExecuteTrade(side, symbol, score) {
+  try {
+    const safeLeverage = Math.max(
+      1,
+      Math.min(PERSONAL_PLAN.maxLeverage, AT_LEVERAGE)
+    );
+
+    await atSetLeverage(symbol, safeLeverage);
+
+    const [markPrice, symbolInfo] = await Promise.all([
+      atGetMarkPrice(symbol),
+      atGetExchangeInfo(symbol)
+    ]);
+
+    if (!markPrice || markPrice <= 0) {
+      throw new Error("Could not get mark price");
+    }
+
+    if (!symbolInfo) {
+      throw new Error(`No exchange info for ${symbol}`);
+    }
+
+    const riskUsd = PERSONAL_PLAN.riskPerTrade;
+
+    const { qty, notional } = calculateQtyByRisk({
+      markPrice,
+      symbolInfo,
+      riskUsd,
+      slPct: SL_PCT
+    });
+
+    const slEst =
+      side === "BUY"
+        ? markPrice * (1 - SL_PCT / 100)
+        : markPrice * (1 + SL_PCT / 100);
+
+    const tpEst =
+      side === "BUY"
+        ? markPrice * (1 + TP_PCT / 100)
+        : markPrice * (1 - TP_PCT / 100);
+
+    const potentialWin = (riskUsd * (TP_PCT / SL_PCT)).toFixed(2);
+    const potentialLoss = riskUsd.toFixed(2);
+
+    pendingConfirm = {
+      side,
+      symbol,
+      qty,
+      price: markPrice,
+      score,
+      leverage: safeLeverage,
+      riskUsd,
+      ts: Date.now()
+    };
+
+    await sendPrivate(
+      `🚨 <b>AUTO-TRADE SIGNAL</b>\n\n` +
+      `Pair: <b>${escapeHTML(symbol)}</b>\n` +
+      `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
+      `WojakMeter Score: <b>${score}/100</b>\n` +
+      `Mark Price: <b>${formatUsd(markPrice)}</b>\n` +
+      `Qty: <b>${qty}</b>\n` +
+      `Leverage: <b>${safeLeverage}x</b>\n` +
+      `Notional: <b>${formatUsd(notional)}</b>\n\n` +
+      `🧠 <b>Risk Model</b>\n` +
+      `Max Risk: <b>-$${potentialLoss}</b>\n` +
+      `Stop Loss: <b>${formatUsd(slEst)}</b> (-${SL_PCT}%)\n` +
+      `Take Profit: <b>${formatUsd(tpEst)}</b> (+${TP_PCT}%)\n` +
+      `R/R Ratio: <b>1:${(TP_PCT / SL_PCT).toFixed(1)}</b>\n` +
+      `Potential Win: <b>+$${potentialWin}</b>\n\n` +
+      `⚠️ <b>Manual confirmation required.</b>\n` +
+      `✅ /confirmar — execute now\n` +
+      `❌ /cancelar — discard\n\n` +
+      `⏱ Expires in 3 minutes.`
+    );
+
+    setTimeout(() => {
+      if (pendingConfirm && Date.now() - pendingConfirm.ts >= 3 * 60 * 1000) {
+        pendingConfirm = null;
+
+        sendPrivate(
+          "⏱ <b>Auto-trade expired</b>\nOrder was not executed."
+        );
+      }
+    }, 3 * 60 * 1000);
+  } catch (err) {
+    console.error("[AutoTrader] executeTrade error:", err.message);
+
+    await sendPrivate(
+      `⚠️ <b>AutoTrade error</b>\n\n${escapeHTML(err.message)}`
+    );
+  }
+}
+
+async function atExecuteConfirmed(symbol, side, qty, price, score, pendingData = null) {
+  try {
+    const leverage = pendingData?.leverage || AT_LEVERAGE;
+    const riskUsd = pendingData?.riskUsd || PERSONAL_PLAN.riskPerTrade;
+
+    await sendPrivate(
+      `⏳ <b>Executing ${side} order...</b>\n` +
+      `Pair: <b>${escapeHTML(symbol)}</b>\n` +
+      `Qty: <b>${qty}</b>\n` +
+      `Leverage: <b>${leverage}x</b>`
+    );
+
+    const order = await atPlaceMarketOrder(symbol, side, qty);
+    const fillPrice = parseFloat(order.avgPrice || order.price || price);
+
+    await sleep(500);
+
+    const { slPrice, tpPrice, slOrderId, tpOrderId } =
+      await atPlaceSlTpOrders(symbol, side, qty, fillPrice);
+
+    openPosition = {
+      side,
+      symbol,
+      entryPrice: fillPrice,
+      qty,
+      slOrderId,
+      tpOrderId,
+      score,
+      leverage,
+      riskUsd,
+      ts: Date.now()
+    };
+
+    lastTradeSignalTs = Date.now();
+    personalTradingState.tradesToday += 1;
+
+    const potentialWin = (riskUsd * (TP_PCT / SL_PCT)).toFixed(2);
+
+    await sendPrivate(
+      `✅ <b>ORDER EXECUTED</b>\n\n` +
+      `Pair: <b>${escapeHTML(symbol)}</b>\n` +
+      `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
+      `Entry Price: <b>${formatUsd(fillPrice)}</b>\n` +
+      `Qty: <b>${qty}</b>\n` +
+      `Leverage: <b>${leverage}x</b>\n\n` +
+      `🛑 Stop Loss: <b>${formatUsd(slPrice)}</b> (-${SL_PCT}%)\n` +
+      `✅ Take Profit: <b>${formatUsd(tpPrice)}</b> (+${TP_PCT}%)\n` +
+      `📊 R/R: <b>1:${(TP_PCT / SL_PCT).toFixed(1)}</b>\n` +
+      `Max Risk: <b>-$${Number(riskUsd).toFixed(2)}</b>\n` +
+      `Target: <b>+$${potentialWin}</b>\n\n` +
+      `Use /position to track.\n` +
+      `Use /close to exit manually.\n\n` +
+      `🌐 wojakmeter.com`
+    );
+  } catch (err) {
+    console.error("[AutoTrader] executeConfirmed error:", err.message);
+
+    await sendPrivate(
+      `⚠️ <b>Execution error</b>\n\n${escapeHTML(err.message)}`
+    );
+  }
+}
+
+async function atCloseTrackedPosition(reason = "Manual") {
+  if (!openPosition) {
+    await sendPrivate("⚠️ No tracked AutoTrade position to close.");
+    return;
+  }
+
+  try {
+    const {
+      symbol,
+      side,
+      qty,
+      entryPrice,
+      slOrderId,
+      tpOrderId
+    } = openPosition;
+
+    const closeSide = side === "BUY" ? "SELL" : "BUY";
+
+    if (slOrderId) {
+      await atCancelOrder(symbol, slOrderId).catch(() => {});
+    }
+
+    if (tpOrderId) {
+      await atCancelOrder(symbol, tpOrderId).catch(() => {});
+    }
+
+    await sleep(300);
+
+    const closeOrder = await atPlaceMarketOrder(symbol, closeSide, qty);
+    const exitPrice = parseFloat(closeOrder.avgPrice || closeOrder.price || entryPrice);
+
+    const pnlRaw =
+      side === "BUY"
+        ? (exitPrice - entryPrice) * qty
+        : (entryPrice - exitPrice) * qty;
+
+    const pnl = parseFloat(pnlRaw.toFixed(2));
+
+    personalTradingState.pnlToday += pnl;
+    PERSONAL_PLAN.balance += pnl;
+
+    if (
+      personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock ||
+      personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)
+    ) {
+      personalTradingState.coolingDown = true;
+    }
+
+    openPosition = null;
+
+    await sendPrivate(
+      `${pnl >= 0 ? "💚" : "💔"} <b>POSITION CLOSED</b>\n\n` +
+      `Reason: <b>${escapeHTML(reason)}</b>\n` +
+      `Pair: <b>${escapeHTML(symbol)}</b>\n` +
+      `Side: <b>${side === "BUY" ? "LONG" : "SHORT"}</b>\n` +
+      `Entry: <b>${formatUsd(entryPrice)}</b>\n` +
+      `Exit: <b>${formatUsd(exitPrice)}</b>\n` +
+      `PnL: <b>${pnl >= 0 ? "+" : ""}${formatUsd(pnl)}</b>\n\n` +
+      `Daily PnL: <b>${
+        personalTradingState.pnlToday >= 0 ? "+" : ""
+      }${formatUsd(personalTradingState.pnlToday)}</b>\n` +
+      `Balance: <b>${formatUsd(PERSONAL_PLAN.balance)}</b>`
+    );
+  } catch (err) {
+    await sendPrivate(
+      `⚠️ <b>Error closing tracked position</b>\n\n${escapeHTML(err.message)}`
+    );
+  }
+}
+
+async function evaluateAndTrade(nextState) {
+  try {
+    if (!autoTradeActive || !canOpenTrade()) return;
+
+    const { score, emotionKey } = nextState;
+
+    let side = null;
+    const symbol = "BTCUSDT";
+
+    if (score >= SCORE_LONG_MIN) {
+      side = "BUY";
+    } else if (score <= SCORE_SHORT_MAX) {
+      side = "SELL";
+    }
+
+    if (!side) return;
+
+    console.log(
+      `[AutoTrader] Signal: ${side} | Score: ${score} | Emotion: ${emotionKey}`
+    );
+
+    await atExecuteTrade(side, symbol, score);
+  } catch (err) {
+    console.error("[AutoTrader] evaluateAndTrade error:", err.message);
+  }
+}
+
+// ===============================
+// MARKET MESSAGES
 // ===============================
 function formatCoinLine(coin, index) {
   const symbol = (coin.symbol || "").toUpperCase();
@@ -1754,7 +1396,15 @@ function formatCoinsBlock(title, coins) {
   );
 }
 
-function buildPrettyAlert({ title, emotion, score, change, btcDom, volume, narrative }) {
+function buildPrettyAlert({
+  title,
+  emotion,
+  score,
+  change,
+  btcDom,
+  volume,
+  narrative
+}) {
   const level = getAlertLevel(score);
 
   return (
@@ -1766,176 +1416,6 @@ function buildPrettyAlert({ title, emotion, score, change, btcDom, volume, narra
     `₿ BTC.D: <b>${btcDom.toFixed(2)}%</b>\n` +
     `💸 Volume: <b>${formatUsd(volume)}</b>\n\n` +
     `⚡ ${narrative}` +
-    buildSignalQualityBlock(score, change) +
-    `\n\n🌐 wojakmeter.com`
-  );
-}
-
-function buildEmotionShiftAlert({
-  prevEmotion,
-  nextEmotion,
-  prevScore,
-  nextScore,
-  change,
-  btcDom,
-  volume
-}) {
-  return (
-    `🚨 <b>Emotion Shift</b>\n\n` +
-    `${prevEmotion.emoji} <b>${prevEmotion.label}</b> → ${nextEmotion.emoji} <b>${nextEmotion.label}</b>\n` +
-    `📊 Score: <b>${prevScore}</b> → <b>${nextScore}</b>\n` +
-    `🧪 Quality: <b>${escapeHTML(getSignalQuality(nextScore))}</b>\n` +
-    `📉 Market: <b>${formatPercent(change)}</b>\n` +
-    `₿ BTC.D: <b>${btcDom.toFixed(2)}%</b>\n` +
-    `💸 Volume: <b>${formatUsd(volume)}</b>\n\n` +
-    `⚡ ${getEmotionNarrative(nextEmotion.key)}` +
-    buildSignalQualityBlock(nextScore, change) +
-    `\n\n🌐 wojakmeter.com`
-  );
-}
-
-function buildPanicAlert({ emotion, score, change, btcDom, volume }) {
-  return (
-    `🔴 <b>Panic Alert</b>\n\n` +
-    `${emotion.emoji} <b>${emotion.label}</b>\n` +
-    `📊 Score collapsed to <b>${score}/100</b>\n` +
-    `🧪 Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n` +
-    `📉 Move: <b>${formatPercent(change)}</b>\n` +
-    `₿ BTC.D: <b>${btcDom.toFixed(2)}%</b>\n` +
-    `💸 Volume: <b>${formatUsd(volume)}</b>\n\n` +
-    `⚡ Risk-off conditions are taking control.` +
-    buildSignalQualityBlock(score, change) +
-    `\n\n🌐 wojakmeter.com`
-  );
-}
-
-function buildEuphoriaAlert({ emotion, score, change, btcDom, volume }) {
-  return (
-    `🟢 <b>Euphoria Alert</b>\n\n` +
-    `${emotion.emoji} <b>${emotion.label}</b>\n` +
-    `📊 Score reached <b>${score}/100</b>\n` +
-    `🧪 Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n` +
-    `📈 Move: <b>${formatPercent(change)}</b>\n` +
-    `₿ BTC.D: <b>${btcDom.toFixed(2)}%</b>\n` +
-    `💸 Volume: <b>${formatUsd(volume)}</b>\n\n` +
-    `⚡ Momentum is overheating. Traders are chasing hard.` +
-    buildSignalQualityBlock(score, change) +
-    `\n\n🌐 wojakmeter.com`
-  );
-}
-
-function buildVolumeSpikeAlert({ emotion, score, change, btcDom, volume, prevVolume }) {
-  const jump = prevVolume > 0 ? ((volume - prevVolume) / prevVolume) * 100 : 0;
-
-  return (
-    `💥 <b>Volume Spike</b>\n\n` +
-    `${emotion.emoji} <b>${emotion.label}</b>\n` +
-    `📊 Score: <b>${score}/100</b>\n` +
-    `🧪 Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n` +
-    `📉 Move: <b>${formatPercent(change)}</b>\n` +
-    `💸 Volume: <b>${formatUsd(volume)}</b>\n` +
-    `📈 Spike: <b>${formatPercent(jump)}</b>\n\n` +
-    `⚡ Activity just accelerated. Something is moving.` +
-    buildSignalQualityBlock(score, change) +
-    `\n\n🌐 wojakmeter.com`
-  );
-}
-
-function buildBreakingAlert({ emotion, score, change, btcDom, volume }) {
-  return (
-    `🚨 <b>BREAKING SIGNAL</b>\n\n` +
-    `${emotion.emoji} <b>${emotion.label}</b>\n` +
-    `📊 Score: <b>${score}/100</b>\n` +
-    `🧪 Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n` +
-    `📉 Move: <b>${formatPercent(change)}</b>\n` +
-    `₿ BTC.D: <b>${btcDom.toFixed(2)}%</b>\n` +
-    `💸 Volume: <b>${formatUsd(volume)}</b>\n\n` +
-    `⚡ ${getEmotionNarrative(emotion.key)}` +
-    buildSignalQualityBlock(score, change) +
-    `\n\n🌐 wojakmeter.com`
-  );
-}
-
-function buildCoinSpotlight(title, coin) {
-  if (!coin) return null;
-
-  const change = safe(coin.price_change_percentage_24h);
-  const emotion = getEmotionByChange(change);
-  const score = scoreFromChange(change);
-  const symbol = (coin.symbol || "").toUpperCase();
-
-  return (
-    `🌟 <b>${title}</b>\n\n` +
-    `${emotion.emoji} <b>${escapeHTML(coin.name)}</b> (${escapeHTML(symbol)})\n` +
-    `📊 Score: <b>${score}/100</b>\n` +
-    `🧪 Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n` +
-    `💵 Price: <b>${formatUsd(coin.current_price)}</b>\n` +
-    `📉 24h: <b>${formatPercent(change)}</b>\n` +
-    `💰 MCap: <b>${formatUsd(coin.market_cap)}</b>\n` +
-    `💸 Volume: <b>${formatUsd(coin.total_volume)}</b>\n\n` +
-    `⚡ ${getEmotionNarrative(emotion.key)}` +
-    buildTradeLinksBlock(symbol) +
-    buildSignalQualityBlock(score, change) +
-    `\n\n🌐 wojakmeter.com`
-  );
-}
-
-function buildCoinExtremeAlert(coin) {
-  const change = safe(coin.price_change_percentage_24h);
-  const emotion = getEmotionByChange(change);
-  const score = scoreFromChange(change);
-  const symbol = (coin.symbol || "").toUpperCase();
-  const title = score >= 85 ? "Coin Euphoria / FOMO Watch" : "Coin Panic / Capitulation Watch";
-
-  return (
-    `🚨 <b>${title}</b>\n\n` +
-    `${emotion.emoji} <b>${escapeHTML(coin.name)}</b> (${escapeHTML(symbol)})\n` +
-    `📊 Score: <b>${score}/100</b>\n` +
-    `🧪 Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n` +
-    `💵 Price: <b>${formatUsd(coin.current_price)}</b>\n` +
-    `📉 24h: <b>${formatPercent(change)}</b>\n` +
-    `💸 Volume: <b>${formatUsd(coin.total_volume)}</b>\n\n` +
-    `⚡ ${getEmotionNarrative(emotion.key)}` +
-    buildTradeLinksBlock(symbol) +
-    buildSignalQualityBlock(score, change) +
-    `\n\n🌐 wojakmeter.com`
-  );
-}
-
-function buildDailyWrap(globalData, markets) {
-  const data = globalData?.data || {};
-  const change = safe(data.market_cap_change_percentage_24h_usd);
-  const score = scoreFromChange(change);
-  const emotion = getEmotionByChange(change);
-
-  const gainers = [...markets]
-    .filter((c) => c.price_change_percentage_24h != null)
-    .sort((a, b) => safe(b.price_change_percentage_24h) - safe(a.price_change_percentage_24h))
-    .slice(0, 3);
-
-  const losers = [...markets]
-    .filter((c) => c.price_change_percentage_24h != null)
-    .sort((a, b) => safe(a.price_change_percentage_24h) - safe(b.price_change_percentage_24h))
-    .slice(0, 3);
-
-  const formatMiniLine = (c) => {
-    const symbol = (c.symbol || "").toUpperCase();
-    const links = buildTradeLinksFromSymbol(symbol);
-
-    return `• <b>${escapeHTML(symbol)}</b> ${formatPercent(safe(c.price_change_percentage_24h))} · <a href="${links.binanceFutures}">Futures</a>`;
-  };
-
-  return (
-    `🧾 <b>WojakMeter Daily Wrap</b>\n\n` +
-    `${emotion.emoji} <b>${emotion.label}</b>\n` +
-    `📊 Score: <b>${score}/100</b>\n` +
-    `🧪 Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n` +
-    `📉 Market: <b>${formatPercent(change)}</b>\n` +
-    `₿ BTC.D: <b>${safe(data.market_cap_percentage?.btc).toFixed(2)}%</b>\n` +
-    `💸 Volume: <b>${formatUsd(safe(data.total_volume?.usd))}</b>\n\n` +
-    `🚀 <b>Top Gainers</b>\n${gainers.map(formatMiniLine).join("\n")}\n\n` +
-    `💥 <b>Top Losers</b>\n${losers.map(formatMiniLine).join("\n")}\n\n` +
-    `⚡ ${getEmotionNarrative(emotion.key)}` +
     buildSignalQualityBlock(score, change) +
     `\n\n🌐 wojakmeter.com`
   );
@@ -1965,111 +1445,38 @@ function formatMarketOverview(globalData) {
   );
 }
 
-function formatTrendingLines(trendingData, marketMap) {
-  const coins = trendingData?.coins || [];
-
-  if (!coins.length) return "⚠️ No trending coins found right now.";
-
-  return coins
-    .slice(0, 10)
-    .map((entry, i) => {
-      const item = entry.item || {};
-      const symbol = (item.symbol || "").toUpperCase();
-      const marketCoin = marketMap.get((item.id || "").toLowerCase());
-      const change = marketCoin?.price_change_percentage_24h ?? 0;
-      const price = marketCoin?.current_price;
-      const emotion = getEmotionByChange(change);
-      const links = buildTradeLinksFromSymbol(symbol);
-
-      const extra =
-        price !== undefined
-          ? ` · ${formatUsd(price)} · ${formatPercent(change)}`
-          : "";
-
-      return (
-        `${i + 1}. ${emotion.emoji} <b>${escapeHTML(item.name || "Unknown")}</b> (${escapeHTML(symbol)})${extra}\n` +
-        `   🔗 <a href="${links.binanceFutures}">Futures</a> · <a href="${links.tradingView}">Chart</a>`
-      );
-    })
-    .join("\n\n");
-}
-
-function getStrongestMover(markets = []) {
-  if (!Array.isArray(markets) || !markets.length) return null;
+function buildMyPlanMessage() {
+  resetPersonalStateIfNewDay();
 
   return (
-    [...markets]
-      .filter((c) => c.price_change_percentage_24h != null)
-      .sort(
-        (a, b) =>
-          Math.abs(safe(b.price_change_percentage_24h, 0)) -
-          Math.abs(safe(a.price_change_percentage_24h, 0))
-      )[0] || null
+    `🧠 <b>My WojakMeter Trading Plan</b>\n\n` +
+    `💼 Balance: <b>$${PERSONAL_PLAN.balance.toFixed(2)}</b>\n` +
+    `🎯 Risk per trade: <b>$${PERSONAL_PLAN.riskPerTrade.toFixed(2)}</b>\n` +
+    `🛑 Max daily loss: <b>-$${PERSONAL_PLAN.maxDailyLoss.toFixed(2)}</b>\n` +
+    `🔒 Daily profit lock: <b>+$${PERSONAL_PLAN.dailyProfitLock.toFixed(2)}</b>\n` +
+    `📌 Max trades/day: <b>${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
+    `⚙️ Default leverage: <b>${PERSONAL_PLAN.defaultLeverage}x</b>\n` +
+    `🚫 Max leverage: <b>${PERSONAL_PLAN.maxLeverage}x</b>\n` +
+    `🧪 Min signal score: <b>${PERSONAL_PLAN.minSignalScore}/100</b>\n\n` +
+
+    `📊 <b>Today</b>\n` +
+    `Trades: <b>${personalTradingState.tradesToday}/${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
+    `PnL: <b>${personalTradingState.pnlToday >= 0 ? "+" : ""}$${personalTradingState.pnlToday.toFixed(2)}</b>\n` +
+    `Cooling down: <b>${personalTradingState.coolingDown ? "Yes" : "No"}</b>\n\n` +
+
+    `🤖 <b>AutoTrade</b>\n` +
+    `Status: <b>${autoTradeActive ? "ON ✅" : "OFF 🛑"}</b>\n` +
+    `Manual confirmation: <b>${AUTO_TRADE_CONFIRM ? "Required ✅" : "Disabled ⚠️"}</b>\n` +
+    `Testnet: <b>${USE_TESTNET ? "Yes (safe)" : "❗ REAL MONEY"}</b>\n\n` +
+
+    `🧠 <b>Rule</b>\n` +
+    `No trade is valid without defined risk, stop loss and emotional control.\n\n` +
+    `🌐 wojakmeter.com`
   );
 }
 
-function getSpotlights(markets = []) {
-  const valid = markets.filter((c) => c.price_change_percentage_24h != null);
-
-  return {
-    topGainer:
-      [...valid].sort(
-        (a, b) =>
-          safe(b.price_change_percentage_24h) -
-          safe(a.price_change_percentage_24h)
-      )[0] || null,
-    topLoser:
-      [...valid].sort(
-        (a, b) =>
-          safe(a.price_change_percentage_24h) -
-          safe(b.price_change_percentage_24h)
-      )[0] || null,
-    volumeLeader:
-      [...valid].sort((a, b) => safe(b.total_volume) - safe(a.total_volume))[0] ||
-      null
-  };
-}
-
-function getCoinAlertType(change) {
-  const score = scoreFromChange(change);
-
-  if (score >= 85) return "coin_euphoria";
-  if (score <= 20) return "coin_panic";
-
-  return null;
-}
-
 // ===============================
-// EVENT DETECTION
-// ===============================
-function detectMarketEvents(prev, next) {
-  const events = [];
-
-  if (!prev.emotionKey || prev.emotionKey !== next.emotionKey) {
-    events.push({ type: "emotion_shift" });
-  }
-
-  if (next.score <= 20 && safe(prev.score, 100) > 20) {
-    events.push({ type: "panic_alert" });
-  }
-
-  if (next.score >= 85 && safe(prev.score, 0) < 85) {
-    events.push({ type: "euphoria_alert" });
-  }
-
-  if (next.volume && prev.volume && next.volume > prev.volume * 1.18) {
-    events.push({ type: "volume_spike" });
-  }
-
-  if (Math.abs(safe(next.btcDom) - safe(prev.btcDom)) >= 0.6) {
-    events.push({ type: "btc_dominance_shift" });
-  }
-
-  return events;
-}
-
-// ===============================
-// BUSINESS LOGIC
+// MARKET FUNCTIONS
 // ===============================
 async function replyWithError(ctx, error, prefix = "Error") {
   console.error(prefix, error);
@@ -2084,6 +1491,20 @@ async function replyWithError(ctx, error, prefix = "Error") {
       reply_markup: buildMainKeyboard().reply_markup
     });
   } catch (_) {}
+}
+
+async function sendEmotionSticker(ctx, emotionKey) {
+  const sticker = STICKERS[emotionKey];
+
+  if (!sticker) return;
+
+  try {
+    await ctx.replyWithSticker(sticker, {
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  } catch (e) {
+    console.error("Sticker error:", e.message);
+  }
 }
 
 async function sendSignal(ctx) {
@@ -2116,102 +1537,20 @@ async function sendSignal(ctx) {
   }
 }
 
-async function sendSpotlight(ctx) {
+async function sendMarketOverview(ctx) {
   try {
-    const markets = await getMarkets();
-    const coin = getStrongestMover(markets);
+    const global = await getGlobal();
+    const change = global?.data?.market_cap_change_percentage_24h_usd ?? 0;
 
-    if (!coin) {
-      return ctx.reply("⚠️ No spotlight coin available right now.", {
-        reply_markup: buildMainKeyboard().reply_markup
-      });
-    }
+    await sendEmotionSticker(ctx, getEmotionByChange(change).key);
 
-    await sendEmotionSticker(
-      ctx,
-      getEmotionByChange(coin.price_change_percentage_24h).key
-    );
-
-    return ctx.reply(buildCoinSpotlight("Coin Spotlight", coin), {
+    return ctx.reply(formatMarketOverview(global), {
       parse_mode: "HTML",
       disable_web_page_preview: true,
       reply_markup: buildMainKeyboard().reply_markup
     });
   } catch (error) {
-    return replyWithError(ctx, error, "Error spotlight");
-  }
-}
-
-async function sendRisk(ctx) {
-  try {
-    const global = await getGlobal();
-    const data = global?.data || {};
-    const change = safe(data.market_cap_change_percentage_24h_usd);
-    const score = scoreFromChange(change);
-
-    let label = "Balanced";
-
-    if (score <= 20) label = "Panic";
-    else if (score <= 34) label = "Defensive";
-    else if (score <= 44) label = "Hesitation";
-    else if (score >= 85) label = "Overheated";
-    else if (score >= 70) label = "Constructive";
-    else if (score >= 60) label = "Positive";
-
-    return ctx.reply(
-      `⚠️ <b>Risk Tone</b>\n\n` +
-      `📊 Score: <b>${score}/100</b>\n` +
-      `🧪 Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n` +
-      `🧠 Tone: <b>${label}</b>\n` +
-      `📉 Move: <b>${formatPercent(change)}</b>` +
-      buildSignalQualityBlock(score, change) +
-      `\n\n🌐 wojakmeter.com`,
-      {
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        reply_markup: buildMainKeyboard().reply_markup
-      }
-    );
-  } catch (error) {
-    return replyWithError(ctx, error, "Error risk");
-  }
-}
-
-async function sendBtcMood(ctx) {
-  try {
-    const markets = await getMarkets();
-    const btc = markets.find((c) => (c.symbol || "").toLowerCase() === "btc");
-
-    if (!btc) {
-      return ctx.reply("⚠️ BTC data unavailable.", {
-        reply_markup: buildMainKeyboard().reply_markup
-      });
-    }
-
-    const change = safe(btc.price_change_percentage_24h);
-    const emotion = getEmotionByChange(change);
-    const score = scoreFromChange(change);
-    const symbol = (btc.symbol || "").toUpperCase();
-
-    return ctx.reply(
-      `₿ <b>BTC Mood</b>\n\n` +
-      `${emotion.emoji} <b>${emotion.label}</b>\n` +
-      `📊 Score: <b>${score}/100</b>\n` +
-      `🧪 Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n` +
-      `💵 Price: <b>${formatUsd(btc.current_price)}</b>\n` +
-      `📉 24h: <b>${formatPercent(change)}</b>\n\n` +
-      `⚡ ${getEmotionNarrative(emotion.key)}` +
-      buildTradeLinksBlock(symbol) +
-      buildSignalQualityBlock(score, change) +
-      `\n\n🌐 wojakmeter.com`,
-      {
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        reply_markup: buildMainKeyboard().reply_markup
-      }
-    );
-  } catch (error) {
-    return replyWithError(ctx, error, "Error moodbtc");
+    return replyWithError(ctx, error, "Error market overview");
   }
 }
 
@@ -2242,17 +1581,17 @@ async function sendCoinSignal(ctx, symbolOrId) {
 
     return ctx.reply(
       `🪙 <b>${escapeHTML(coin.name)}</b> (${escapeHTML(symbol)})\n\n` +
-      `${emotion.emoji} <b>${emotion.label}</b>\n` +
-      `📊 Score: <b>${score}/100</b>\n` +
-      `🧪 Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n` +
-      `💵 Price: <b>${formatUsd(coin.current_price)}</b>\n` +
-      `📉 24h: <b>${formatPercent(change)}</b>\n` +
-      `💰 MCap: <b>${formatUsd(coin.market_cap)}</b>\n` +
-      `💸 Volume: <b>${formatUsd(coin.total_volume)}</b>\n\n` +
-      `⚡ ${getEmotionNarrative(emotion.key)}` +
-      buildTradeLinksBlock(symbol) +
-      buildSignalQualityBlock(score, change) +
-      `\n\n🌐 wojakmeter.com`,
+        `${emotion.emoji} <b>${emotion.label}</b>\n` +
+        `📊 Score: <b>${score}/100</b>\n` +
+        `🧪 Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n` +
+        `💵 Price: <b>${formatUsd(coin.current_price)}</b>\n` +
+        `📉 24h: <b>${formatPercent(change)}</b>\n` +
+        `💰 MCap: <b>${formatUsd(coin.market_cap)}</b>\n` +
+        `💸 Volume: <b>${formatUsd(coin.total_volume)}</b>\n\n` +
+        `⚡ ${getEmotionNarrative(emotion.key)}` +
+        buildTradeLinksBlock(symbol) +
+        buildSignalQualityBlock(score, change) +
+        `\n\n🌐 wojakmeter.com`,
       {
         parse_mode: "HTML",
         disable_web_page_preview: true,
@@ -2267,14 +1606,133 @@ async function sendCoinSignal(ctx, symbolOrId) {
 async function sendDaily(ctx) {
   try {
     const [global, markets] = await Promise.all([getGlobal(), getMarkets()]);
+    const data = global?.data || {};
+    const change = safe(data.market_cap_change_percentage_24h_usd);
+    const score = scoreFromChange(change);
+    const emotion = getEmotionByChange(change);
 
-    return ctx.reply(buildDailyWrap(global, markets), {
+    const gainers = [...markets]
+      .filter((c) => c.price_change_percentage_24h != null)
+      .sort((a, b) => safe(b.price_change_percentage_24h) - safe(a.price_change_percentage_24h))
+      .slice(0, 3);
+
+    const losers = [...markets]
+      .filter((c) => c.price_change_percentage_24h != null)
+      .sort((a, b) => safe(a.price_change_percentage_24h) - safe(b.price_change_percentage_24h))
+      .slice(0, 3);
+
+    const mini = (c) =>
+      `• <b>${escapeHTML((c.symbol || "").toUpperCase())}</b> ${formatPercent(
+        safe(c.price_change_percentage_24h)
+      )}`;
+
+    return ctx.reply(
+      `🧾 <b>WojakMeter Daily Wrap</b>\n\n` +
+        `${emotion.emoji} <b>${emotion.label}</b>\n` +
+        `📊 Score: <b>${score}/100</b>\n` +
+        `📉 Market: <b>${formatPercent(change)}</b>\n` +
+        `₿ BTC.D: <b>${safe(data.market_cap_percentage?.btc).toFixed(2)}%</b>\n` +
+        `💸 Volume: <b>${formatUsd(safe(data.total_volume?.usd))}</b>\n\n` +
+        `🚀 <b>Top Gainers</b>\n${gainers.map(mini).join("\n")}\n\n` +
+        `💥 <b>Top Losers</b>\n${losers.map(mini).join("\n")}\n\n` +
+        `⚡ ${getEmotionNarrative(emotion.key)}\n\n` +
+        `🌐 wojakmeter.com`,
+      {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
+  } catch (error) {
+    return replyWithError(ctx, error, "Error daily");
+  }
+}
+
+async function sendListByType(ctx, type) {
+  try {
+    const markets = await getMarkets();
+
+    let list = [...markets].filter((c) => c.price_change_percentage_24h != null);
+    let title = "Coins";
+
+    if (type === "gainers") {
+      list.sort(
+        (a, b) =>
+          safe(b.price_change_percentage_24h) -
+          safe(a.price_change_percentage_24h)
+      );
+      title = "Top Gainers (24h)";
+    } else if (type === "losers") {
+      list.sort(
+        (a, b) =>
+          safe(a.price_change_percentage_24h) -
+          safe(b.price_change_percentage_24h)
+      );
+      title = "Top Losers (24h)";
+    } else if (type === "volume") {
+      list.sort((a, b) => safe(b.total_volume) - safe(a.total_volume));
+      title = "Volume Leaders";
+    }
+
+    list = list.slice(0, 10);
+
+    return ctx.reply(formatCoinsBlock(title, list), {
       parse_mode: "HTML",
       disable_web_page_preview: true,
       reply_markup: buildMainKeyboard().reply_markup
     });
   } catch (error) {
-    return replyWithError(ctx, error, "Error daily");
+    return replyWithError(ctx, error, `Error ${type}`);
+  }
+}
+
+async function sendTrending(ctx) {
+  try {
+    const [trending, markets] = await Promise.all([getTrending(), getMarkets()]);
+    const marketMap = new Map(
+      markets.map((coin) => [(coin.id || "").toLowerCase(), coin])
+    );
+
+    const coins = trending?.coins || [];
+
+    const lines = coins
+      .slice(0, 10)
+      .map((entry, i) => {
+        const item = entry.item || {};
+        const symbol = (item.symbol || "").toUpperCase();
+        const marketCoin = marketMap.get((item.id || "").toLowerCase());
+        const change = marketCoin?.price_change_percentage_24h ?? 0;
+        const price = marketCoin?.current_price;
+        const emotion = getEmotionByChange(change);
+        const links = buildTradeLinksFromSymbol(symbol);
+
+        const extra =
+          price !== undefined
+            ? ` · ${formatUsd(price)} · ${formatPercent(change)}`
+            : "";
+
+        return (
+          `${i + 1}. ${emotion.emoji} <b>${escapeHTML(
+            item.name || "Unknown"
+          )}</b> (${escapeHTML(symbol)})${extra}\n` +
+          `   🔗 <a href="${links.binanceFutures}">Futures</a> · <a href="${links.tradingView}">Chart</a>`
+        );
+      })
+      .join("\n\n");
+
+    return ctx.reply(
+      `🔥 <b>Trending Coins</b>\n\n` +
+        `${lines || "No trending coins found."}\n\n` +
+        `⚠️ Trending does not mean safe entry.\n\n` +
+        `🌐 wojakmeter.com`,
+      {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
+  } catch (error) {
+    return replyWithError(ctx, error, "Error trending");
   }
 }
 
@@ -2318,138 +1776,54 @@ async function sendEmotionCoins(ctx, emotionEmoji) {
   }
 }
 
-async function sendTopGainers(ctx) {
-  try {
-    const markets = await getMarkets();
-
-    const gainers = [...markets]
-      .filter((c) => c.price_change_percentage_24h != null)
-      .sort((a, b) => safe(b.price_change_percentage_24h, 0) - safe(a.price_change_percentage_24h, 0))
-      .slice(0, 10);
-
-    const avgChange = gainers.length
-      ? gainers.reduce((s, c) => s + safe(c.price_change_percentage_24h, 0), 0) / gainers.length
-      : 0;
-
-    await sendEmotionSticker(ctx, getEmotionByChange(avgChange).key);
-
-    return ctx.reply(
-      formatCoinsBlock("Top Gainers (24h)", gainers) +
-      `\n\n⚠️ <b>Discipline</b>\nStrong gainers can become FOMO traps. Wait for pullback or confirmation.`,
-      {
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        reply_markup: buildMainKeyboard().reply_markup
-      }
-    );
-  } catch (error) {
-    return replyWithError(ctx, error, "Error top gainers");
-  }
-}
-
-async function sendTopLosers(ctx) {
-  try {
-    const markets = await getMarkets();
-
-    const losers = [...markets]
-      .filter((c) => c.price_change_percentage_24h != null)
-      .sort((a, b) => safe(a.price_change_percentage_24h, 0) - safe(b.price_change_percentage_24h, 0))
-      .slice(0, 10);
-
-    const avgChange = losers.length
-      ? losers.reduce((s, c) => s + safe(c.price_change_percentage_24h, 0), 0) / losers.length
-      : 0;
-
-    await sendEmotionSticker(ctx, getEmotionByChange(avgChange).key);
-
-    return ctx.reply(
-      formatCoinsBlock("Top Losers (24h)", losers) +
-      `\n\n⚠️ <b>Discipline</b>\nHeavy losers can be falling knives. Wait for stabilization before any entry.`,
-      {
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        reply_markup: buildMainKeyboard().reply_markup
-      }
-    );
-  } catch (error) {
-    return replyWithError(ctx, error, "Error top losers");
-  }
-}
-
-async function sendTrending(ctx) {
-  try {
-    const [trending, markets] = await Promise.all([getTrending(), getMarkets()]);
-    const marketMap = new Map(markets.map((coin) => [(coin.id || "").toLowerCase(), coin]));
-
-    let totalChange = 0;
-    let count = 0;
-
-    (trending?.coins || []).forEach((entry) => {
-      const marketCoin = marketMap.get((entry.item?.id || "").toLowerCase());
-
-      if (marketCoin?.price_change_percentage_24h != null) {
-        totalChange += marketCoin.price_change_percentage_24h;
-        count++;
-      }
-    });
-
-    const avgChange = count ? totalChange / count : 0;
-    const emotion = getEmotionByChange(avgChange);
-    const score = scoreFromChange(avgChange);
-
-    await sendEmotionSticker(ctx, emotion.key);
-
-    return ctx.reply(
-      `🔥 <b>Trending Coins</b>\n\n` +
-      `🧠 Mood: <b>${emotion.label}</b>\n` +
-      `📊 Trending Score: <b>${score}/100</b>\n` +
-      `🧪 Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n\n` +
-      `${formatTrendingLines(trending, marketMap)}\n\n` +
-      `⚠️ <b>Discipline</b>\nTrending does not mean safe entry. Avoid chasing without confirmation.\n\n` +
-      `🌐 wojakmeter.com`,
-      {
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        reply_markup: buildMainKeyboard().reply_markup
-      }
-    );
-  } catch (error) {
-    return replyWithError(ctx, error, "Error trending");
-  }
-}
-
-async function sendMarketOverview(ctx) {
+async function sendRisk(ctx) {
   try {
     const global = await getGlobal();
-    const change = global?.data?.market_cap_change_percentage_24h_usd ?? 0;
+    const data = global?.data || {};
+    const change = safe(data.market_cap_change_percentage_24h_usd);
+    const score = scoreFromChange(change);
 
-    await sendEmotionSticker(ctx, getEmotionByChange(change).key);
+    let label = "Balanced";
 
-    return ctx.reply(formatMarketOverview(global), {
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-      reply_markup: buildMainKeyboard().reply_markup
-    });
+    if (score <= 20) label = "Panic";
+    else if (score <= 34) label = "Defensive";
+    else if (score <= 44) label = "Hesitation";
+    else if (score >= 85) label = "Overheated";
+    else if (score >= 70) label = "Constructive";
+    else if (score >= 60) label = "Positive";
+
+    return ctx.reply(
+      `⚠️ <b>Risk Tone</b>\n\n` +
+        `📊 Score: <b>${score}/100</b>\n` +
+        `🧪 Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n` +
+        `🧠 Tone: <b>${label}</b>\n` +
+        `📉 Move: <b>${formatPercent(change)}</b>` +
+        buildSignalQualityBlock(score, change) +
+        `\n\n🌐 wojakmeter.com`,
+      {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
   } catch (error) {
-    return replyWithError(ctx, error, "Error market overview");
+    return replyWithError(ctx, error, "Error risk");
   }
 }
 
 async function sendDiscipline(ctx) {
   return ctx.reply(
     `🧠 <b>WojakMeter Discipline Check</b>\n\n` +
-    `Before entering any trade, answer this:\n\n` +
-    `1. Do I have a clear entry?\n` +
-    `2. Do I have a stop loss?\n` +
-    `3. Is my risk defined?\n` +
-    `4. Am I chasing a green candle?\n` +
-    `5. Am I trying to recover a loss?\n` +
-    `6. Can I accept this loss calmly?\n\n` +
-    `⚠️ <b>Rule:</b>\n` +
-    `If the trade is emotional, it is not a setup.\n\n` +
-    `🧠 <b>WojakMeter Reminder:</b>\n` +
-    `The market does not reward urgency. It rewards patience, risk control and clean execution.\n\n` +
-    `🌐 wojakmeter.com`,
+      `1. Do I have a clear entry?\n` +
+      `2. Do I have a stop loss?\n` +
+      `3. Is my risk defined?\n` +
+      `4. Am I chasing a green candle?\n` +
+      `5. Am I trying to recover a loss?\n` +
+      `6. Can I accept this loss calmly?\n\n` +
+      `⚠️ <b>Rule:</b>\n` +
+      `If the trade is emotional, it is not a setup.\n\n` +
+      `The market does not reward urgency. It rewards patience, risk control and clean execution.\n\n` +
+      `🌐 wojakmeter.com`,
     {
       parse_mode: "HTML",
       disable_web_page_preview: true,
@@ -2458,89 +1832,385 @@ async function sendDiscipline(ctx) {
   );
 }
 
-async function sendRadar(ctx) {
+async function sendAnalysis(ctx) {
+  await ctx.reply("🔍 Analyzing top pairs...", {
+    reply_markup: buildMainKeyboard().reply_markup
+  });
+
   try {
     const markets = await getMarkets();
-    const valid = markets.filter((c) => c.price_change_percentage_24h != null);
 
-    const gainers = [...valid]
-      .sort((a, b) => safe(b.price_change_percentage_24h) - safe(a.price_change_percentage_24h))
-      .slice(0, 5);
+    const valid = markets
+      .filter((c) => c.current_price > 0 && c.total_volume > 0)
+      .slice(0, 30);
 
-    const losers = [...valid]
-      .sort((a, b) => safe(a.price_change_percentage_24h) - safe(b.price_change_percentage_24h))
-      .slice(0, 5);
+    const analyzed = valid
+      .map((c) => {
+        const change1h = safe(c.price_change_percentage_1h_in_currency, 0);
+        const change24h = safe(c.price_change_percentage_24h_in_currency, 0);
+        const change7d = safe(c.price_change_percentage_7d_in_currency, 0);
+        const volume = safe(c.total_volume, 0);
+        const marketCap = safe(c.market_cap, 0);
+        const volToMcap = marketCap > 0 ? (volume / marketCap) * 100 : 0;
 
-    const volumeLeaders = [...valid]
-      .sort((a, b) => safe(b.total_volume) - safe(a.total_volume))
-      .slice(0, 5);
+        let score = 50 + change24h * 3.5 + change1h * 6 + change7d * 1.2;
 
-    const formatRadarLine = (coin) => {
-      const symbol = (coin.symbol || "").toUpperCase();
-      const change = safe(coin.price_change_percentage_24h);
-      const score = scoreFromChange(change);
-      const emotion = getEmotionByChange(change);
-      const links = buildTradeLinksFromSymbol(symbol);
+        if (volToMcap > 10) score += 8;
+        else if (volToMcap > 5) score += 4;
+        else if (volToMcap < 1) score -= 4;
 
-      return (
-        `• ${emotion.emoji} <b>${escapeHTML(symbol)}</b> ${formatPercent(change)} · Score <b>${score}/100</b>\n` +
-        `  Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n` +
-        `  <a href="${links.binanceFutures}">Futures</a> · <a href="${links.binanceSpot}">Spot</a> · <a href="${links.tradingView}">Chart</a>`
-      );
-    };
+        score = Math.round(clamp(score, 0, 100));
+
+        let action = "WAIT";
+
+        if (score >= 75) action = "LONG WATCH";
+        if (score <= 25) action = "SHORT WATCH";
+
+        return {
+          c,
+          score,
+          action,
+          volToMcap,
+          change1h,
+          change24h,
+          change7d
+        };
+      })
+      .sort((a, b) => Math.abs(b.score - 50) - Math.abs(a.score - 50))
+      .slice(0, 10);
+
+    const lines = analyzed
+      .map((a, i) => {
+        const sym = (a.c.symbol || "").toUpperCase();
+        const links = buildTradeLinksFromSymbol(sym);
+
+        return (
+          `${i + 1}. <b>${sym}</b> — <b>${a.action}</b>\n` +
+          `Score: <b>${a.score}/100</b> · ` +
+          `1h:${formatPercent(a.change1h)} · ` +
+          `24h:${formatPercent(a.change24h)} · ` +
+          `Vol/MCap:${a.volToMcap.toFixed(1)}%\n` +
+          `<a href="${links.binanceFutures}">Binance</a> · ` +
+          `<a href="${links.tradingView}">Chart</a>`
+        );
+      })
+      .join("\n\n");
 
     return ctx.reply(
-      `🧪 <b>WojakMeter Radar</b>\n\n` +
-      `This radar highlights movement, not guaranteed entries.\n\n` +
-
-      `🚀 <b>Strongest 24h Gainers</b>\n` +
-      `${gainers.map(formatRadarLine).join("\n\n")}\n\n` +
-
-      `💥 <b>Strongest 24h Losers</b>\n` +
-      `${losers.map(formatRadarLine).join("\n\n")}\n\n` +
-
-      `💸 <b>Volume Leaders</b>\n` +
-      `${volumeLeaders.map(formatRadarLine).join("\n\n")}\n\n` +
-
-      `🧠 <b>Discipline:</b>\n` +
-      `Do not chase. Wait for confirmation. Define risk first.\n\n` +
-      `🌐 wojakmeter.com`,
+      `🧠 <b>WojakMeter Analysis — Top 10</b>\n\n` +
+        `${lines}\n\n` +
+        `⚠️ Readings only. Confirm setup, stop and risk before trading.\n\n` +
+        `🌐 wojakmeter.com`,
       {
         parse_mode: "HTML",
         disable_web_page_preview: true,
         reply_markup: buildMainKeyboard().reply_markup
       }
     );
-  } catch (error) {
-    return replyWithError(ctx, error, "Error radar");
+  } catch (err) {
+    return replyWithError(ctx, err, "Error analyze");
   }
 }
 
 // ===============================
-// AUTO BROADCAST
+// PERSONAL MARKET SCANNER
+// ===============================
+function detectMarketSetup(coin) {
+  if (!coin) return null;
+
+  const symbol = (coin.symbol || "").toUpperCase();
+  const name = coin.name || symbol;
+  const price = safe(coin.current_price);
+  const change24h = safe(coin.price_change_percentage_24h);
+  const volume = safe(coin.total_volume);
+  const marketCap = safe(coin.market_cap);
+
+  if (!symbol || !price || !volume) return null;
+
+  const volumeToMcap = marketCap > 0 ? volume / marketCap : 0;
+
+  let type = "Observation";
+  let direction = "WAIT";
+  let mood = "Neutral";
+  let score = 50;
+  let reason = [];
+  let warning = "This is a scanner alert, not a direct entry.";
+
+  if (change24h >= 3 && volumeToMcap >= 0.03) {
+    type = "Momentum Watch / Strong Gainer";
+    direction = "WAIT FOR PULLBACK";
+    mood = "Optimism / Euphoria";
+    score =
+      65 +
+      Math.min(20, change24h * 2) +
+      Math.min(10, volumeToMcap * 100);
+
+    reason.push(`Strong 24h move: ${formatPercent(change24h)}`);
+    reason.push(
+      `Healthy volume vs market cap: ${(volumeToMcap * 100).toFixed(2)}%`
+    );
+
+    warning =
+      "Avoid chasing. Wait for pullback, retest, or clean confirmation.";
+  }
+
+  if (change24h <= -3 && volumeToMcap >= 0.03) {
+    type = "Capitulation Watch / Heavy Loser";
+    direction = "WAIT FOR STABILIZATION";
+    mood = "Concern / Panic";
+    score =
+      65 +
+      Math.min(20, Math.abs(change24h) * 2) +
+      Math.min(10, volumeToMcap * 100);
+
+    reason.push(`Heavy 24h drop: ${formatPercent(change24h)}`);
+    reason.push(
+      `High activity vs market cap: ${(volumeToMcap * 100).toFixed(2)}%`
+    );
+
+    warning =
+      "Do not catch the knife. Wait for stabilization or reversal structure.";
+  }
+
+  if (Math.abs(change24h) >= 2 && volumeToMcap >= 0.06) {
+    type = change24h > 0 ? "Volume Momentum Watch" : "Volume Stress Watch";
+    direction = change24h > 0 ? "LONG WATCH" : "SHORT / REVERSAL WATCH";
+    mood = change24h > 0 ? "Optimism / Activity" : "Concern / Activity";
+
+    score =
+      Math.max(score, 70) +
+      Math.min(15, Math.abs(change24h) * 2) +
+      Math.min(10, volumeToMcap * 80);
+
+    reason.push(
+      `Unusual volume activity: ${(volumeToMcap * 100).toFixed(
+        2
+      )}% of market cap`
+    );
+    reason.push(`24h move: ${formatPercent(change24h)}`);
+
+    warning = "Volume is active. Wait for confirmation before entering.";
+  }
+
+  score = Math.round(clamp(score, 0, 100));
+
+  if (score < MARKET_MIN_SIGNAL_SCORE) return null;
+
+  return {
+    symbol: `${symbol}USDT`,
+    baseSymbol: symbol,
+    name,
+    interval: "24h",
+    type,
+    direction,
+    mood,
+    score,
+    close: price,
+    move1: change24h,
+    volRatio: volumeToMcap * 100,
+    volume,
+    marketCap,
+    reason,
+    warning
+  };
+}
+
+function buildMarketPersonalSignalMessage(signal) {
+  resetPersonalStateIfNewDay();
+
+  const links = buildTradeLinksFromSymbol(signal.baseSymbol || signal.symbol);
+
+  const reasonLines = signal.reason.length
+    ? signal.reason.map((r) => `• ${escapeHTML(r)}`).join("\n")
+    : "• Market movement detected.";
+
+  return (
+    `🔥 <b>WOJAKMETER PERSONAL SIGNAL</b>\n\n` +
+    `Pair: <b>${escapeHTML(signal.symbol)}</b>\n` +
+    `Source: <b>CoinGecko Market Scanner</b>\n` +
+    `Timeframe: <b>${escapeHTML(signal.interval)}</b>\n` +
+    `Type: <b>${escapeHTML(signal.type)}</b>\n` +
+    `Direction: <b>${escapeHTML(signal.direction)}</b>\n` +
+    `Mood: <b>${escapeHTML(signal.mood)}</b>\n` +
+    `Score: <b>${signal.score}/100</b>\n\n` +
+    `📊 <b>Market Data</b>\n` +
+    `Price: <b>${formatUsd(signal.close)}</b>\n` +
+    `24h Move: <b>${formatPercent(signal.move1)}</b>\n` +
+    `Volume: <b>${formatUsd(signal.volume)}</b>\n` +
+    `Market Cap: <b>${formatUsd(signal.marketCap)}</b>\n` +
+    `Volume/MCap: <b>${signal.volRatio.toFixed(2)}%</b>\n\n` +
+    `🧠 <b>Why it triggered</b>\n${reasonLines}\n\n` +
+    `⚠️ <b>Execution Warning</b>\n${escapeHTML(signal.warning)}\n\n` +
+    `🧠 <b>Your Plan</b>\n` +
+    `Max risk: <b>$${PERSONAL_PLAN.riskPerTrade.toFixed(2)}</b>\n` +
+    `Leverage: <b>${PERSONAL_PLAN.defaultLeverage}x (max ${PERSONAL_PLAN.maxLeverage}x)</b>\n` +
+    `Trades today: <b>${personalTradingState.tradesToday}/${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
+    `PnL today: <b>${
+      personalTradingState.pnlToday >= 0 ? "+" : ""
+    }$${personalTradingState.pnlToday.toFixed(2)}</b>\n\n` +
+    `🔗 <b>Trade / Chart</b>\n` +
+    `<a href="${links.binanceFutures}">Binance Futures</a> · ` +
+    `<a href="${links.tradingView}">TradingView</a>\n\n` +
+    `🚫 This is not financial advice. Wait for confirmation and define stop loss first.\n\n` +
+    `🌐 wojakmeter.com`
+  );
+}
+
+function canSendMarketPersonalSignal(signal) {
+  resetPersonalStateIfNewDay();
+
+  if (!MARKET_SCANNER_ENABLED) return false;
+  if (!PERSONAL_ALERTS_ENABLED) return false;
+  if (!PRIVATE_TELEGRAM_USER_ID) return false;
+  if (signal.score < MARKET_MIN_SIGNAL_SCORE) return false;
+  if (personalTradingState.coolingDown) return false;
+  if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) {
+    return false;
+  }
+
+  if (
+    personalTradingState.pnlToday <=
+    -Math.abs(PERSONAL_PLAN.maxDailyLoss)
+  ) {
+    return false;
+  }
+
+  if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) {
+    return false;
+  }
+
+  const key = `${signal.symbol}:${signal.type}`;
+  const last = lastPersonalMarketAlerts.get(key) || 0;
+
+  if (Date.now() - last < PERSONAL_MARKET_ALERT_COOLDOWN_MS) {
+    return false;
+  }
+
+  lastPersonalMarketAlerts.set(key, Date.now());
+
+  return true;
+}
+
+async function sendMarketPersonalSignal(signal) {
+  try {
+    if (!canSendMarketPersonalSignal(signal)) return;
+
+    await bot.telegram.sendMessage(
+      PRIVATE_TELEGRAM_USER_ID,
+      buildMarketPersonalSignalMessage(signal),
+      {
+        parse_mode: "HTML",
+        disable_web_page_preview: true
+      }
+    );
+
+    console.log(
+      `Market personal signal sent: ${signal.symbol} ${signal.type} score ${signal.score}`
+    );
+  } catch (err) {
+    console.error("Send market personal signal error:", err.message);
+  }
+}
+
+async function scanMarketPersonalSignals() {
+  try {
+    if (!MARKET_SCANNER_ENABLED) return;
+    if (!PERSONAL_ALERTS_ENABLED) return;
+    if (!PRIVATE_TELEGRAM_USER_ID) return;
+
+    resetPersonalStateIfNewDay();
+
+    if (personalTradingState.coolingDown) return;
+    if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) {
+      return;
+    }
+
+    if (
+      personalTradingState.pnlToday <=
+      -Math.abs(PERSONAL_PLAN.maxDailyLoss)
+    ) {
+      return;
+    }
+
+    if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) {
+      return;
+    }
+
+    const markets = await getMarkets(true);
+
+    const allowedBases = MARKET_SCAN_SYMBOLS.map((s) =>
+      String(s).replace("USDT", "").toUpperCase()
+    );
+
+    const filtered = markets.filter((coin) =>
+      allowedBases.includes((coin.symbol || "").toUpperCase())
+    );
+
+    const signals = filtered
+      .map(detectMarketSetup)
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+
+    for (const signal of signals) {
+      await sendMarketPersonalSignal(signal);
+      await sleep(750);
+    }
+  } catch (err) {
+    console.error("Market personal scanner error:", err.message);
+  }
+}
+
+// ===============================
+// BROADCAST + AUTOTRADE EVALUATION
 // ===============================
 function shouldBroadcast(nextState) {
   const now = Date.now();
 
   if (!lastBroadcastState.emotionKey) return true;
 
-  const emotionChanged = nextState.emotionKey !== lastBroadcastState.emotionKey;
+  const emotionChanged =
+    nextState.emotionKey !== lastBroadcastState.emotionKey;
+
   const scoreShift =
-    Math.abs(safe(nextState.score) - safe(lastBroadcastState.score)) >= SCORE_SHIFT_THRESHOLD;
+    Math.abs(safe(nextState.score) - safe(lastBroadcastState.score)) >=
+    SCORE_SHIFT_THRESHOLD;
 
-  const panicEntered = nextState.score <= 20 && safe(lastBroadcastState.score) > 20;
-  const euphoriaEntered = nextState.score >= 85 && safe(lastBroadcastState.score) < 85;
-  const enoughTime = now - lastBroadcastState.ts >= MIN_BROADCAST_GAP_MS;
+  const panicEntered =
+    nextState.score <= 20 && safe(lastBroadcastState.score) > 20;
 
-  return emotionChanged || panicEntered || euphoriaEntered || (scoreShift && enoughTime);
+  const euphoriaEntered =
+    nextState.score >= 85 && safe(lastBroadcastState.score) < 85;
+
+  const enoughTime =
+    now - lastBroadcastState.ts >= MIN_BROADCAST_GAP_MS;
+
+  return (
+    emotionChanged ||
+    panicEntered ||
+    euphoriaEntered ||
+    (scoreShift && enoughTime)
+  );
+}
+
+async function sendMessageToChannel(text) {
+  if (!TELEGRAM_CHANNEL_ID) return;
+
+  try {
+    await bot.telegram.sendMessage(TELEGRAM_CHANNEL_ID, text, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true
+    });
+  } catch (err) {
+    console.error("Channel message error:", err.message);
+  }
 }
 
 async function runChannelBroadcast() {
   try {
     const global = await getGlobal();
-    const markets = await getMarkets();
-
     const data = global?.data || {};
+
     const change = safe(data.market_cap_change_percentage_24h_usd);
     const score = scoreFromChange(change);
     const emotion = getEmotionByChange(change);
@@ -2557,109 +2227,17 @@ async function runChannelBroadcast() {
     };
 
     if (TELEGRAM_CHANNEL_ID && shouldBroadcast(nextState)) {
-      const events = detectMarketEvents(lastBroadcastState, nextState);
+      const text = buildPrettyAlert({
+        title: "WojakMeter Market Update",
+        emotion,
+        score,
+        change,
+        btcDom,
+        volume,
+        narrative: getEmotionNarrative(emotion.key)
+      });
 
-      if (events.length) {
-        await sendStickerToChannel(emotion.key);
-
-        for (const event of events) {
-          let msg = null;
-
-          if (event.type === "emotion_shift") {
-            const prevEmotion =
-              EMOTION_CONFIG.find((e) => e.key === lastBroadcastState.emotionKey) ||
-              { emoji: "⚪", label: "Unknown" };
-
-            msg = buildEmotionShiftAlert({
-              prevEmotion,
-              nextEmotion: emotion,
-              prevScore: safe(lastBroadcastState.score),
-              nextScore: score,
-              change,
-              btcDom,
-              volume
-            });
-          }
-
-          if (event.type === "panic_alert") {
-            msg = buildPanicAlert({ emotion, score, change, btcDom, volume });
-          }
-
-          if (event.type === "euphoria_alert") {
-            msg = buildEuphoriaAlert({ emotion, score, change, btcDom, volume });
-          }
-
-          if (event.type === "volume_spike") {
-            msg = buildVolumeSpikeAlert({
-              emotion,
-              score,
-              change,
-              btcDom,
-              volume,
-              prevVolume: safe(lastBroadcastState.volume)
-            });
-          }
-
-          if (event.type === "btc_dominance_shift") {
-            msg =
-              `₿ <b>BTC Dominance Shift</b>\n\n` +
-              `📊 Score: <b>${score}/100</b>\n` +
-              `🧪 Quality: <b>${escapeHTML(getSignalQuality(score))}</b>\n` +
-              `₿ BTC.D: <b>${btcDom.toFixed(2)}%</b>\n` +
-              `↕ Previous: <b>${safe(lastBroadcastState.btcDom).toFixed(2)}%</b>\n` +
-              `📉 Market Move: <b>${formatPercent(change)}</b>\n\n` +
-              `⚡ Bitcoin dominance is moving fast. Rotation risk is rising.` +
-              buildSignalQualityBlock(score, change) +
-              `\n\n🌐 wojakmeter.com`;
-          }
-
-          if (msg) {
-            await sendMessageToChannel(msg);
-            await sleep(1200);
-          }
-        }
-
-        const scoreJump = Math.abs(score - safe(lastBroadcastState.score));
-
-        if (scoreJump >= BREAKING_SCORE_SHIFT_THRESHOLD) {
-          await sendMessageToChannel(
-            buildBreakingAlert({ emotion, score, change, btcDom, volume })
-          );
-          await sleep(1200);
-        }
-
-        const strongest = getStrongestMover(markets);
-
-        if (strongest) {
-          const coinAlertType = getCoinAlertType(strongest.price_change_percentage_24h);
-
-          if (coinAlertType && strongest.id !== lastBroadcastState.spotlightCoinId) {
-            await sendMessageToChannel(buildCoinExtremeAlert(strongest));
-
-            await sendPersonalAlert(
-              strongest,
-              coinAlertType === "coin_euphoria"
-                ? "FOMO Watch / Strong Mover"
-                : "Capitulation Watch / Heavy Drop"
-            );
-
-            lastBroadcastState.spotlightCoinId = strongest.id;
-            await sleep(1200);
-          }
-        }
-
-        const spotlights = getSpotlights(markets);
-
-        if (score <= 20 && spotlights.topLoser) {
-          await sendMessageToChannel(buildCoinSpotlight("Stress Spotlight", spotlights.topLoser));
-          await sendPersonalAlert(spotlights.topLoser, "Stress Spotlight / Capitulation Watch");
-        } else if (score >= 85 && spotlights.topGainer) {
-          await sendMessageToChannel(buildCoinSpotlight("Momentum Spotlight", spotlights.topGainer));
-          await sendPersonalAlert(spotlights.topGainer, "Momentum Spotlight / FOMO Watch");
-        }
-
-        console.log("Broadcast events:", events.map((e) => e.type));
-      }
+      await sendMessageToChannel(text);
 
       lastBroadcastState = nextState;
     }
@@ -2671,609 +2249,68 @@ async function runChannelBroadcast() {
 }
 
 // ===============================
-// COMMANDS
+// WATCHLIST COMMANDS
 // ===============================
-bot.start(async (ctx) => {
-  const firstName = ctx.from?.first_name ? escapeHTML(ctx.from.first_name) : "trader";
-
-  await ctx.reply(
-    `🤖 <b>Welcome to WojakMeter Bot</b>\n\n` +
-    `Hi, <b>${firstName}</b>.\n` +
-    `Use the buttons or commands to read the market mood.\n\n` +
-    `<b>Main commands:</b>\n` +
-    `🧠 Signal · 📊 Market · 🔥 Trending\n` +
-    `🌟 Spotlight · ⚠️ Risk · ₿ BTC Mood\n` +
-    `🚀 Top Gainers · 💥 Top Losers\n` +
-    `🧪 Radar · 🔍 Analyze · 🧠 Discipline\n` +
-    `📋 My Plan · 🪙 /coin btc · 🧾 /daily\n\n` +
-    `<b>AutoTrade owner only:</b>\n` +
-    `🤖 AutoTrade ON/OFF\n` +
-    `/confirmar · /cancelar · /close\n` +
-    `/position · /orders · /balance_binance\n\n` +
-    `<b>Emotion Trader owner only:</b>\n` +
-    `/emostatus · /emohistory · /emopairs\n` +
-    `/emoconfirmar · /emocancelar · /emocerrar\n\n` +
-    `🌐 wojakmeter.com`,
-    {
-      parse_mode: "HTML",
-      reply_markup: buildMainKeyboard().reply_markup
-    }
-  );
-});
-
-bot.help(async (ctx) => {
-  await ctx.reply(
-    `🛠 <b>WojakMeter Bot Help</b>\n\n` +
-    `<b>Market Commands:</b>\n` +
-    `/signal · /market · /trending · /spotlight\n` +
-    `/risk · /moodbtc · /gainers · /losers\n` +
-    `/radar · /analyze · /discipline\n` +
-    `/coin btc · /daily\n\n` +
-
-    `<b>AutoTrade:</b>\n` +
-    `/confirmar → confirm pending BTC auto-trade\n` +
-    `/cancelar → discard pending BTC auto-trade\n` +
-    `/close → close BTC auto-trade position\n` +
-    `/position → open position status\n` +
-    `/orders → active SL/TP orders\n` +
-    `/balance_binance → futures balance\n\n` +
-
-    `<b>Emotion Trader:</b>\n` +
-    `/emostatus\n` +
-    `/emohistory\n` +
-    `/emopairs\n` +
-    `/emoconfirmar\n` +
-    `/emocancelar\n` +
-    `/emocerrar\n\n` +
-
-    `<b>Private Plan:</b>\n` +
-    `/myplan\n` +
-    `/balance 103\n` +
-    `/trade win 1.25\n` +
-    `/trade loss 1.00\n` +
-    `/cooldown\n` +
-    `/resetday\n` +
-    `/scan\n` +
-    `/scandebug\n` +
-    `/testsignal\n\n` +
-
-    `<b>Watchlist:</b>\n` +
-    `/watch btc\n` +
-    `/unwatch btc\n` +
-    `/mywatchlist\n\n` +
-    `<b>Emotion Filters:</b>\n` +
-    `🤩 😌 🙂 😐 🤔 😟 😡`,
-    {
-      parse_mode: "HTML",
-      reply_markup: buildMainKeyboard().reply_markup
-    }
-  );
-});
-
-bot.command("signal", sendSignal);
-bot.command("market", sendMarketOverview);
-bot.command("trending", sendTrending);
-bot.command("spotlight", sendSpotlight);
-bot.command("risk", sendRisk);
-bot.command("moodbtc", sendBtcMood);
-bot.command("daily", sendDaily);
-bot.command("gainers", sendTopGainers);
-bot.command("losers", sendTopLosers);
-bot.command("radar", sendRadar);
-bot.command("discipline", sendDiscipline);
-bot.command("analyze", sendAnalysis);
-
-bot.command("emostatus", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-  return emotionTrader.handleEmoStatus(ctx);
-});
-
-bot.command("emohistory", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-  return emotionTrader.handleEmoHistory(ctx);
-});
-
-bot.command("emopairs", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-  return emotionTrader.handleEmoPairs(ctx);
-});
-
-bot.command("emoconfirmar", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-  return emotionTrader.handleEmoConfirmar(ctx);
-});
-
-bot.command("emocancelar", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-  return emotionTrader.handleEmoCancelar(ctx);
-});
-
-bot.command("emocerrar", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-  return emotionTrader.handleEmoCerrar(ctx);
-});
-
-bot.command("confirmar", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  if (!pendingConfirm) {
-    return ctx.reply("⚠️ No pending order to confirm.");
-  }
-
-  const { side, symbol, qty, price, score } = pendingConfirm;
-  const savedPending = pendingConfirm;
-  pendingConfirm = null;
-
-  await ctx.reply(`✅ Confirmed. Executing ${side} on ${symbol}...`);
-
-  pendingConfirm = savedPending;
-  await atExecuteConfirmed(symbol, side, qty, price, score);
-  pendingConfirm = null;
-});
-
-bot.command("cancelar", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  if (!pendingConfirm) {
-    return ctx.reply("⚠️ No pending order.");
-  }
-
-  const { side, symbol } = pendingConfirm;
-  pendingConfirm = null;
-
-  return ctx.reply(`❌ ${side} order on ${symbol} cancelled.`);
-});
-
-bot.command("close", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  if (!openPosition) {
-    return ctx.reply("⚠️ No open position to close.");
-  }
-
-  await ctx.reply("⏳ Closing position...");
-  await atClosePosition("Manual via Telegram");
-});
-
-bot.command("cerrar", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  if (!openPosition) {
-    return ctx.reply("⚠️ No open position to close.");
-  }
-
-  await ctx.reply("⏳ Closing position...");
-  await atClosePosition("Manual via Telegram");
-});
-
-bot.command("position", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  try {
-    const positions = await atGetOpenPositions();
-
-    if (!positions.length && !openPosition) {
-      return ctx.reply(
-        `📈 <b>Current Position</b>\n\n` +
-        `No open position.\n\n` +
-        `🤖 AutoTrade: <b>${autoTradeActive ? "ON ✅" : "OFF 🛑"}</b>\n` +
-        `Confirmation: <b>${AUTO_TRADE_CONFIRM ? "Required ✅" : "Disabled ⚠️"}</b>\n` +
-        `Testnet: <b>${USE_TESTNET ? "Yes" : "❗ REAL MONEY"}</b>\n` +
-        `Leverage: <b>${AT_LEVERAGE}x</b>`,
-        {
-          parse_mode: "HTML"
-        }
-      );
-    }
-
-    const lines = positions.map((p) => {
-      const amt = parseFloat(p.positionAmt);
-      const pnl = parseFloat(p.unRealizedProfit);
-
-      return (
-        `${amt > 0 ? "📈 LONG" : "📉 SHORT"} <b>${escapeHTML(p.symbol)}</b>\n` +
-        `Entry: <b>${formatUsd(parseFloat(p.entryPrice))}</b>\n` +
-        `Mark: <b>${formatUsd(parseFloat(p.markPrice))}</b>\n` +
-        `Unrealized PnL: <b>${pnl >= 0 ? "+" : ""}${formatUsd(pnl)}</b>\n` +
-        `Qty: <b>${Math.abs(amt)}</b> | Leverage: <b>${p.leverage}x</b>`
-      );
-    });
-
-    const pendingInfo = pendingConfirm
-      ? `\n\n⏳ <b>Pending order:</b>\n${pendingConfirm.side} ${pendingConfirm.symbol} — use /confirmar or /cancelar`
-      : "";
-
-    return ctx.reply(
-      `📈 <b>Current Position</b>\n\n` +
-      `${lines.join("\n\n")}${pendingInfo}\n\n` +
-      `🤖 AutoTrade: <b>${autoTradeActive ? "ON ✅" : "OFF 🛑"}</b>\n` +
-      `Testnet: <b>${USE_TESTNET ? "Yes" : "❗ REAL MONEY"}</b>\n\n` +
-      `Use /close to exit manually.`,
-      {
-        parse_mode: "HTML"
-      }
-    );
-  } catch (err) {
-    return ctx.reply(`⚠️ Error getting position:\n${err.message}`);
-  }
-});
-
-bot.command("orders", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  try {
-    const symbol = openPosition?.symbol || pendingConfirm?.symbol || "BTCUSDT";
-    const orders = await atGetOpenOrders(symbol);
-
-    if (!orders.length) {
-      return ctx.reply(`📋 No open orders for ${symbol}.`);
-    }
-
-    const lines = orders.slice(0, 10).map((o) =>
-      `• <b>${escapeHTML(o.type)}</b> ${escapeHTML(o.side)} ${o.origQty}\n` +
-      `  Stop: <b>${formatUsd(o.stopPrice || o.price)}</b> | ID: <code>${o.orderId}</code>`
-    );
-
-    return ctx.reply(
-      `📋 <b>Open Orders — ${escapeHTML(symbol)}</b>\n\n${lines.join("\n\n")}`,
-      {
-        parse_mode: "HTML"
-      }
-    );
-  } catch (err) {
-    return ctx.reply(`⚠️ Error getting orders:\n${err.message}`);
-  }
-});
-
-bot.command("balance_binance", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  try {
-    const balance = await atGetFuturesBalance();
-
-    return ctx.reply(
-      `💵 <b>Binance Futures Balance</b>\n\n` +
-      `Available USDT: <b>${formatUsd(balance)}</b>\n\n` +
-      `Risk per trade: <b>${formatUsd(PERSONAL_PLAN.riskPerTrade)}</b>\n` +
-      `Leverage: <b>${AT_LEVERAGE}x</b>\n` +
-      `SL: <b>${SL_PCT}%</b> | TP: <b>${TP_PCT}%</b>\n` +
-      `R/R: <b>1:${(TP_PCT / SL_PCT).toFixed(1)}</b>\n` +
-      `Testnet: <b>${USE_TESTNET ? "Yes" : "❗ REAL MONEY"}</b>`,
-      {
-        parse_mode: "HTML"
-      }
-    );
-  } catch (err) {
-    return ctx.reply(`⚠️ Error getting balance:\n${err.message}`);
-  }
-});
-
-bot.command("testsignal", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  if (!PRIVATE_TELEGRAM_USER_ID) {
-    return ctx.reply("⚠️ PRIVATE_TELEGRAM_USER_ID is missing.", {
-      reply_markup: buildMainKeyboard().reply_markup
-    });
-  }
-
-  const fakeSignal = {
-    symbol: "BTCUSDT",
-    baseSymbol: "BTC",
-    interval: "24h",
-    type: "TEST SIGNAL",
-    direction: "LONG WATCH",
-    mood: "Test / Bot working",
-    score: 99,
-    close: 65000,
-    move1: 1.25,
-    volume: 25000000000,
-    marketCap: 1200000000000,
-    volRatio: 2.08,
-    reason: [
-      "This is a manual test signal.",
-      "If you see this, private market alerts are working."
-    ],
-    warning: "This is only a test. Do not trade this."
-  };
-
-  try {
-    await bot.telegram.sendMessage(
-      PRIVATE_TELEGRAM_USER_ID,
-      buildMarketPersonalSignalMessage(fakeSignal),
-      {
-        parse_mode: "HTML",
-        disable_web_page_preview: true
-      }
-    );
-
-    return ctx.reply("✅ Test signal sent to your private Telegram.", {
-      reply_markup: buildMainKeyboard().reply_markup
-    });
-  } catch (err) {
-    return ctx.reply(`⚠️ Test signal failed:\n\n${err.message}`, {
-      reply_markup: buildMainKeyboard().reply_markup
-    });
-  }
-});
-
-bot.command("scandebug", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  resetPersonalStateIfNewDay();
-
-  await ctx.reply("🧪 Running CoinGecko market scan debug...", {
-    reply_markup: buildMainKeyboard().reply_markup
-  });
-
-  let checked = 0;
-  let found = [];
-  let errors = [];
-  let blockedReasons = [];
-
-  if (!MARKET_SCANNER_ENABLED) blockedReasons.push("MARKET_SCANNER_ENABLED is false");
-  if (!PERSONAL_ALERTS_ENABLED) blockedReasons.push("PERSONAL_ALERTS_ENABLED is false");
-  if (!PRIVATE_TELEGRAM_USER_ID) blockedReasons.push("PRIVATE_TELEGRAM_USER_ID is missing");
-  if (personalTradingState.coolingDown) blockedReasons.push("Cooling down is active");
-  if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) blockedReasons.push("Max trades reached");
-  if (personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)) blockedReasons.push("Max daily loss reached");
-  if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) blockedReasons.push("Daily profit lock reached");
-
-  try {
-    const markets = await getMarkets(true);
-
-    const allowedBases = MARKET_SCAN_SYMBOLS.map((s) =>
-      String(s).replace("USDT", "").toUpperCase()
-    );
-
-    const filtered = markets.filter((coin) =>
-      allowedBases.includes((coin.symbol || "").toUpperCase())
-    );
-
-    checked = filtered.length;
-
-    found = filtered
-      .map(detectMarketSetup)
-      .filter(Boolean)
-      .sort((a, b) => b.score - a.score);
-  } catch (err) {
-    errors.push(err.message);
-  }
-
-  const topSignals = found
-    .slice(0, 8)
-    .map((s, i) =>
-      `${i + 1}. <b>${escapeHTML(s.symbol)}</b>\n` +
-      `Type: <b>${escapeHTML(s.type)}</b>\n` +
-      `Score: <b>${s.score}/100</b>\n` +
-      `24h: <b>${formatPercent(s.move1)}</b>`
-    )
-    .join("\n\n");
-
-  return ctx.reply(
-    `✅ <b>Scan Debug Complete</b>\n\n` +
-    `Coins checked: <b>${checked}</b>\n` +
-    `Signals found: <b>${found.length}</b>\n\n` +
-
-    `🚧 <b>Blocks</b>\n` +
-    `${blockedReasons.length ? blockedReasons.map((r) => `• ${escapeHTML(r)}`).join("\n") : "• None"}\n\n` +
-
-    `⚠️ <b>Errors</b>\n` +
-    `${errors.length ? errors.map((e) => `• ${escapeHTML(e)}`).join("\n") : "• None"}\n\n` +
-
-    (found.length ? `🔥 <b>Top Signals</b>\n${topSignals}` : `🧠 No signals found.`),
-    {
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-      reply_markup: buildMainKeyboard().reply_markup
-    }
-  );
-});
-
-bot.command("scan", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  await ctx.reply("🧪 Running CoinGecko market scanner...", {
-    reply_markup: buildMainKeyboard().reply_markup
-  });
-
-  await scanMarketPersonalSignals();
-
-  return ctx.reply("✅ Scan complete.", {
-    reply_markup: buildMainKeyboard().reply_markup
-  });
-});
-
-bot.command("myplan", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  return ctx.reply(buildMyPlanMessage(), {
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    reply_markup: buildMainKeyboard().reply_markup
-  });
-});
-
-bot.command("balance", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  const parts = (ctx.message.text || "").split(" ").filter(Boolean);
-  const newBalance = Number(parts[1]);
-
-  if (!Number.isFinite(newBalance) || newBalance <= 0) {
-    return ctx.reply("Usage:\n/balance 103\n/balance 104.25", {
-      reply_markup: buildMainKeyboard().reply_markup
-    });
-  }
-
-  PERSONAL_PLAN.balance = newBalance;
-
-  return ctx.reply(
-    `✅ Balance updated to <b>$${PERSONAL_PLAN.balance.toFixed(2)}</b>\n\n` +
-    buildMyPlanMessage(),
-    {
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-      reply_markup: buildMainKeyboard().reply_markup
-    }
-  );
-});
-
-bot.command("trade", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  resetPersonalStateIfNewDay();
-
-  const parts = (ctx.message.text || "").split(" ").filter(Boolean);
-  const result = (parts[1] || "").toLowerCase();
-  const amount = Number(parts[2] || 0);
-
-  if (!["win", "loss"].includes(result) || !Number.isFinite(amount) || amount <= 0) {
-    return ctx.reply("Usage:\n/trade win 1.25\n/trade loss 1.00", {
-      reply_markup: buildMainKeyboard().reply_markup
-    });
-  }
-
-  personalTradingState.tradesToday += 1;
-
-  if (result === "win") {
-    personalTradingState.pnlToday += amount;
-    PERSONAL_PLAN.balance += amount;
-  } else {
-    personalTradingState.pnlToday -= amount;
-    PERSONAL_PLAN.balance -= amount;
-  }
-
-  let status = "✅ Trade logged.\n\n";
-
-  if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) {
-    personalTradingState.coolingDown = true;
-    status += "🔒 Daily profit lock reached.\n\n";
-  }
-
-  if (personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)) {
-    personalTradingState.coolingDown = true;
-    status += "🛑 Max daily loss reached.\n\n";
-  }
-
-  if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) {
-    personalTradingState.coolingDown = true;
-    status += "📌 Max trades reached.\n\n";
-  }
-
-  return ctx.reply(status + buildMyPlanMessage(), {
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    reply_markup: buildMainKeyboard().reply_markup
-  });
-});
-
-bot.command("cooldown", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  resetPersonalStateIfNewDay();
-  personalTradingState.coolingDown = true;
-
-  return ctx.reply("🧊 Cooling down activated.\n\n" + buildMyPlanMessage(), {
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    reply_markup: buildMainKeyboard().reply_markup
-  });
-});
-
-bot.command("resetday", async (ctx) => {
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  personalTradingState = {
-    date: new Date().toISOString().slice(0, 10),
-    tradesToday: 0,
-    pnlToday: 0,
-    coolingDown: false
-  };
-
-  return ctx.reply("🔄 Day reset.\n\n" + buildMyPlanMessage(), {
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    reply_markup: buildMainKeyboard().reply_markup
-  });
-});
-
-bot.command("coin", async (ctx) => {
-  const parts = (ctx.message.text || "").split(" ").filter(Boolean);
-  const query = parts.slice(1).join(" ");
-
-  if (!query) {
-    return ctx.reply("Usage: /coin btc", {
-      reply_markup: buildMainKeyboard().reply_markup
-    });
-  }
-
-  return sendCoinSignal(ctx, query);
-});
-
 bot.command("watch", async (ctx) => {
   const userId = ctx.from?.id;
-  const parts = (ctx.message.text || "").split(" ").filter(Boolean);
-  const query = normalizeCoinKey(parts[1]);
+  const query = normalizeCoinKey((ctx.message.text || "").split(" ")[1]);
 
   if (!userId || !query) {
-    return ctx.reply("Usage: /watch btc", {
-      reply_markup: buildMainKeyboard().reply_markup
-    });
+    return ctx.reply("Usage: /watch btc");
   }
 
   getUserWatchlist(userId).add(query);
 
-  return ctx.reply(`👁 Added <b>${escapeHTML(query.toUpperCase())}</b> to your watchlist.`, {
-    parse_mode: "HTML",
-    reply_markup: buildMainKeyboard().reply_markup
-  });
+  return ctx.reply(
+    `👁 Added <b>${escapeHTML(query.toUpperCase())}</b> to your watchlist.`,
+    {
+      parse_mode: "HTML"
+    }
+  );
 });
 
 bot.command("unwatch", async (ctx) => {
   const userId = ctx.from?.id;
-  const parts = (ctx.message.text || "").split(" ").filter(Boolean);
-  const query = normalizeCoinKey(parts[1]);
+  const query = normalizeCoinKey((ctx.message.text || "").split(" ")[1]);
 
   if (!userId || !query) {
-    return ctx.reply("Usage: /unwatch btc", {
-      reply_markup: buildMainKeyboard().reply_markup
-    });
+    return ctx.reply("Usage: /unwatch btc");
   }
 
   getUserWatchlist(userId).delete(query);
 
-  return ctx.reply(`🗑 Removed <b>${escapeHTML(query.toUpperCase())}</b> from your watchlist.`, {
-    parse_mode: "HTML",
-    reply_markup: buildMainKeyboard().reply_markup
-  });
+  return ctx.reply(
+    `🗑 Removed <b>${escapeHTML(query.toUpperCase())}</b> from your watchlist.`,
+    {
+      parse_mode: "HTML"
+    }
+  );
 });
 
 bot.command("mywatchlist", async (ctx) => {
   const userId = ctx.from?.id;
+
   if (!userId) return;
 
   const list = [...getUserWatchlist(userId)];
 
   if (!list.length) {
-    return ctx.reply("Your watchlist is empty.", {
-      reply_markup: buildMainKeyboard().reply_markup
-    });
+    return ctx.reply("Your watchlist is empty.");
   }
 
   return ctx.reply(
     `👁 <b>Your Watchlist</b>\n\n` +
-    list.map((x, i) => `${i + 1}. ${escapeHTML(x.toUpperCase())}`).join("\n"),
+      list.map((x, i) => `${i + 1}. ${escapeHTML(x.toUpperCase())}`).join("\n"),
     {
-      parse_mode: "HTML",
-      reply_markup: buildMainKeyboard().reply_markup
+      parse_mode: "HTML"
     }
   );
 });
 
 bot.command("id", async (ctx) => {
   await ctx.reply(
-    `Chat ID: <code>${ctx.chat.id}</code>\nUser ID: <code>${ctx.from?.id}</code>`,
+    `Chat ID: <code>${ctx.chat.id}</code>\n` +
+      `User ID: <code>${ctx.from?.id}</code>`,
     {
       parse_mode: "HTML",
       reply_markup: buildMainKeyboard().reply_markup
@@ -3281,51 +2318,16 @@ bot.command("id", async (ctx) => {
   );
 });
 
-bot.command("teststicker", async (ctx) => {
-  try {
-    await ctx.replyWithSticker(STICKERS.neutral, {
-      reply_markup: buildMainKeyboard().reply_markup
-    });
-  } catch (err) {
-    await ctx.reply("⚠️ Could not send test sticker.", {
-      reply_markup: buildMainKeyboard().reply_markup
-    });
-  }
-});
-
 bot.command("testchannel", async (ctx) => {
-  try {
-    if (!process.env.TELEGRAM_CHANNEL_ID) {
-      return ctx.reply("⚠️ TELEGRAM_CHANNEL_ID is missing.");
-    }
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
 
-    await bot.telegram.sendMessage(
-      process.env.TELEGRAM_CHANNEL_ID,
-      "✅ WojakMeter connected to channel"
-    );
-
-    await ctx.reply("Sent to channel 🚀", {
-      reply_markup: buildMainKeyboard().reply_markup
-    });
-  } catch (err) {
-    await ctx.reply(`Channel error: ${err.message}`, {
-      reply_markup: buildMainKeyboard().reply_markup
-    });
+  if (!TELEGRAM_CHANNEL_ID) {
+    return ctx.reply("⚠️ TELEGRAM_CHANNEL_ID is missing.");
   }
-});
 
-// ===============================
-// STICKER CAPTURE
-// ===============================
-bot.on("sticker", async (ctx) => {
-  const fileId = ctx.message.sticker.file_id;
+  await sendMessageToChannel("✅ WojakMeter connected to channel");
 
-  console.log("Sticker file_id:", fileId);
-
-  await ctx.reply(`📌 Sticker captured:\n\n<code>${fileId}</code>`, {
-    parse_mode: "HTML",
-    reply_markup: buildMainKeyboard().reply_markup
-  });
+  return ctx.reply("Sent to channel 🚀");
 });
 
 // ===============================
@@ -3343,14 +2345,61 @@ bot.on("text", async (ctx) => {
   if (text.includes("Signal")) return sendSignal(ctx);
   if (text.includes("Market")) return sendMarketOverview(ctx);
   if (text.includes("Trending")) return sendTrending(ctx);
-  if (text.includes("Spotlight")) return sendSpotlight(ctx);
+
+  if (text.includes("Spotlight")) {
+    return bot.telegram.sendMessage(ctx.chat.id, "Use /spotlight");
+  }
+
+  if (text.includes("Risk Status")) {
+    return ctx.reply(buildRiskStatusMessage(), {
+      parse_mode: "HTML",
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  }
+
   if (text.includes("Risk")) return sendRisk(ctx);
-  if (text.includes("BTC Mood")) return sendBtcMood(ctx);
-  if (text.includes("Top Gainers")) return sendTopGainers(ctx);
-  if (text.includes("Top Losers")) return sendTopLosers(ctx);
-  if (text.includes("Radar")) return sendRadar(ctx);
+  if (text.includes("BTC Mood")) return sendCoinSignal(ctx, "btc");
+  if (text.includes("Top Gainers")) return sendListByType(ctx, "gainers");
+  if (text.includes("Top Losers")) return sendListByType(ctx, "losers");
+  if (text.includes("Radar")) return sendListByType(ctx, "volume");
   if (text.includes("Analyze")) return sendAnalysis(ctx);
   if (text.includes("Discipline")) return sendDiscipline(ctx);
+
+  if (text.includes("Futures")) {
+    return bot
+      .handleUpdate({
+        update_id: Date.now(),
+        message: { ...ctx.message, text: "/futures" }
+      })
+      .catch(() => {});
+  }
+
+  if (text.includes("Positions")) {
+    return bot
+      .handleUpdate({
+        update_id: Date.now(),
+        message: { ...ctx.message, text: "/positions" }
+      })
+      .catch(() => {});
+  }
+
+  if (text.includes("Orders")) {
+    return bot
+      .handleUpdate({
+        update_id: Date.now(),
+        message: { ...ctx.message, text: "/orders_all" }
+      })
+      .catch(() => {});
+  }
+
+  if (text.includes("My Plan")) {
+    return bot
+      .handleUpdate({
+        update_id: Date.now(),
+        message: { ...ctx.message, text: "/myplan" }
+      })
+      .catch(() => {});
+  }
 
   if (text.includes("Emo Status")) {
     if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
@@ -3369,14 +2418,13 @@ bot.on("text", async (ctx) => {
 
     return ctx.reply(
       `🤖 <b>AutoTrade ACTIVATED</b>\n\n` +
-      `Mode: <b>Manual confirmation required ✅</b>\n` +
-      `Score LONG: ≥${SCORE_LONG_MIN}/100\n` +
-      `Score SHORT: ≤${SCORE_SHORT_MAX}/100\n` +
-      `Leverage: <b>${AT_LEVERAGE}x</b>\n` +
-      `SL: <b>${SL_PCT}%</b> | TP: <b>${TP_PCT}%</b>\n` +
-      `R/R: <b>1:${(TP_PCT / SL_PCT).toFixed(1)}</b>\n` +
-      `Testnet: <b>${USE_TESTNET ? "Yes (safe)" : "❗ REAL MONEY"}</b>\n\n` +
-      `The bot will send proposals only. You must use /confirmar to execute.`,
+        `Mode: <b>Manual confirmation required ✅</b>\n` +
+        `Score LONG: ≥${SCORE_LONG_MIN}/100\n` +
+        `Score SHORT: ≤${SCORE_SHORT_MAX}/100\n` +
+        `Leverage: <b>${AT_LEVERAGE}x</b>\n` +
+        `SL: <b>${SL_PCT}%</b> | TP: <b>${TP_PCT}%</b>\n` +
+        `Testnet: <b>${USE_TESTNET ? "Yes" : "❗ REAL MONEY"}</b>\n\n` +
+        `The bot sends proposals only. Use /confirmar to execute.`,
       {
         parse_mode: "HTML",
         reply_markup: buildMainKeyboard().reply_markup
@@ -3391,45 +2439,12 @@ bot.on("text", async (ctx) => {
 
     return ctx.reply(
       `🛑 <b>AutoTrade DEACTIVATED</b>\n\n` +
-      `No new automatic order proposals will be generated.\n` +
-      `Existing positions remain active.`,
+        `No new proposals will be generated.`,
       {
         parse_mode: "HTML",
         reply_markup: buildMainKeyboard().reply_markup
       }
     );
-  }
-
-  if (text.includes("Position")) {
-    if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-    return ctx.reply(
-      `Use /position to check your Binance futures position.`,
-      {
-        reply_markup: buildMainKeyboard().reply_markup
-      }
-    );
-  }
-
-  if (text.includes("Orders")) {
-    if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-    return ctx.reply(
-      `Use /orders to check open SL/TP orders.`,
-      {
-        reply_markup: buildMainKeyboard().reply_markup
-      }
-    );
-  }
-
-  if (text.includes("My Plan")) {
-    if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-    return ctx.reply(buildMyPlanMessage(), {
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-      reply_markup: buildMainKeyboard().reply_markup
-    });
   }
 
   if (EMOJI_SET.has(text)) {
@@ -3446,6 +2461,20 @@ bot.on("text", async (ctx) => {
 });
 
 // ===============================
+// STICKER CAPTURE
+// ===============================
+bot.on("sticker", async (ctx) => {
+  const fileId = ctx.message.sticker.file_id;
+
+  console.log("Sticker file_id:", fileId);
+
+  await ctx.reply(`📌 Sticker captured:\n\n<code>${fileId}</code>`, {
+    parse_mode: "HTML",
+    reply_markup: buildMainKeyboard().reply_markup
+  });
+});
+
+// ===============================
 // SAFETY
 // ===============================
 bot.catch((err, ctx) => {
@@ -3457,7 +2486,7 @@ bot.catch((err, ctx) => {
 });
 
 // ===============================
-// CACHE WARMUP / REFRESH
+// STARTUP
 // ===============================
 async function warmUpCache() {
   try {
@@ -3506,7 +2535,7 @@ app.listen(PORT, "0.0.0.0", () => {
 });
 
 // ===============================
-// START EMOTION TRADER
+// EMOTION TRADER START
 // ===============================
 emotionTrader.start({
   bot,
@@ -3520,7 +2549,7 @@ emotionTrader.start({
 });
 
 // ===============================
-// START BOT
+// BOT START
 // ===============================
 (async () => {
   await bot.launch({
