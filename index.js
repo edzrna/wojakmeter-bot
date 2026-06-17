@@ -155,6 +155,278 @@ bot.start(async (ctx) => {
   );
 });
 
+// ===============================
+// EMERGENCY FUTURES / DEBUG COMMANDS
+// Put this immediately after emergency /ping and /start
+// ===============================
+function emergencyTimeout(promise, ms, label = "Request timeout") {
+  let timer;
+
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(label)), ms);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+bot.command("futures", async (ctx) => {
+  console.log("[FUTURES] command received");
+
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  await ctx.reply("⏳ Loading Futures panel...");
+
+  try {
+    const [account, positions] = await Promise.all([
+      emergencyTimeout(atGetFuturesAccount(), 10000, "Binance account timeout after 10 seconds"),
+      emergencyTimeout(atGetOpenPositions(), 10000, "Binance positions timeout after 10 seconds")
+    ]);
+
+    return ctx.reply(
+      buildFuturesAccountMessage(account) +
+        `\n\n━━━━━━━━━━━━━━\n\n` +
+        buildPositionsMessage(positions) +
+        `\n\n━━━━━━━━━━━━━━\n\n` +
+        `📋 Orders are separate:\n` +
+        `/orders_all\n\n` +
+        `Commands:\n` +
+        `/account\n` +
+        `/positions\n` +
+        `/riskstatus\n` +
+        `/scandebug`,
+      {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
+  } catch (err) {
+    console.error("[FUTURES] error:", err.message);
+
+    return ctx.reply(
+      `⚠️ <b>Futures error</b>\n\n` +
+        `${escapeHTML(err.message)}\n\n` +
+        `Possible causes:\n` +
+        `• Binance API blocked from Railway location\n` +
+        `• Futures API permission not enabled\n` +
+        `• Wrong API key/secret\n` +
+        `• Mainnet/Testnet mismatch`,
+      {
+        parse_mode: "HTML",
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
+  }
+});
+
+bot.command("account", async (ctx) => {
+  console.log("[ACCOUNT] command received");
+
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  await ctx.reply("⏳ Checking Binance Futures account...");
+
+  try {
+    const account = await emergencyTimeout(
+      atGetFuturesAccount(),
+      10000,
+      "Binance account timeout after 10 seconds"
+    );
+
+    return ctx.reply(buildFuturesAccountMessage(account), {
+      parse_mode: "HTML",
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  } catch (err) {
+    console.error("[ACCOUNT] error:", err.message);
+
+    return ctx.reply(
+      `⚠️ <b>Account error</b>\n\n${escapeHTML(err.message)}`,
+      {
+        parse_mode: "HTML",
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
+  }
+});
+
+bot.command("positions", async (ctx) => {
+  console.log("[POSITIONS] command received");
+
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  await ctx.reply("⏳ Checking open futures positions...");
+
+  try {
+    const positions = await emergencyTimeout(
+      atGetOpenPositions(),
+      10000,
+      "Binance positions timeout after 10 seconds"
+    );
+
+    return ctx.reply(buildPositionsMessage(positions), {
+      parse_mode: "HTML",
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  } catch (err) {
+    console.error("[POSITIONS] error:", err.message);
+
+    return ctx.reply(
+      `⚠️ <b>Positions error</b>\n\n${escapeHTML(err.message)}`,
+      {
+        parse_mode: "HTML",
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
+  }
+});
+
+bot.command("orders_all", async (ctx) => {
+  console.log("[ORDERS_ALL] command received");
+
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  await ctx.reply("⏳ Checking open orders...");
+
+  try {
+    const orders = await emergencyTimeout(
+      atGetAllOpenOrdersForTrackedSymbols(),
+      15000,
+      "Binance open orders timeout after 15 seconds"
+    );
+
+    return ctx.reply(buildAllOrdersMessage(orders), {
+      parse_mode: "HTML",
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  } catch (err) {
+    console.error("[ORDERS_ALL] error:", err.message);
+
+    return ctx.reply(
+      `⚠️ <b>Orders error</b>\n\n${escapeHTML(err.message)}`,
+      {
+        parse_mode: "HTML",
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
+  }
+});
+
+bot.command("riskstatus", async (ctx) => {
+  console.log("[RISKSTATUS] command received");
+
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  try {
+    return ctx.reply(buildRiskStatusMessage(), {
+      parse_mode: "HTML",
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  } catch (err) {
+    console.error("[RISKSTATUS] error:", err.message);
+
+    return ctx.reply(
+      `⚠️ <b>Risk status error</b>\n\n${escapeHTML(err.message)}`,
+      {
+        parse_mode: "HTML",
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
+  }
+});
+
+bot.command("scandebug", async (ctx) => {
+  console.log("[SCANDEBUG] command received");
+
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  resetPersonalStateIfNewDay();
+
+  await ctx.reply("🧪 Running scanner debug...");
+
+  try {
+    let checked = 0;
+    let found = [];
+    let blockedReasons = [];
+
+    if (!MARKET_SCANNER_ENABLED) blockedReasons.push("MARKET_SCANNER_ENABLED is false");
+    if (!PERSONAL_ALERTS_ENABLED) blockedReasons.push("PERSONAL_ALERTS_ENABLED is false");
+    if (!PRIVATE_TELEGRAM_USER_ID) blockedReasons.push("PRIVATE_TELEGRAM_USER_ID is missing");
+    if (personalTradingState.coolingDown) blockedReasons.push("Cooling down is active");
+    if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) blockedReasons.push("Max trades reached");
+
+    if (personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)) {
+      blockedReasons.push("Max daily loss reached");
+    }
+
+    if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) {
+      blockedReasons.push("Daily profit lock reached");
+    }
+
+    const markets = await emergencyTimeout(
+      getMarkets(true),
+      15000,
+      "CoinGecko market request timeout after 15 seconds"
+    );
+
+    const allowedBases = MARKET_SCAN_SYMBOLS.map((s) =>
+      String(s).replace("USDT", "").toUpperCase()
+    );
+
+    const filtered = markets.filter((coin) =>
+      allowedBases.includes((coin.symbol || "").toUpperCase())
+    );
+
+    checked = filtered.length;
+
+    found = filtered
+      .map(detectMarketSetup)
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score);
+
+    const topSignals = found
+      .slice(0, 8)
+      .map(
+        (s, i) =>
+          `${i + 1}. <b>${escapeHTML(s.symbol)}</b>\n` +
+          `Type: <b>${escapeHTML(s.type)}</b>\n` +
+          `Score: <b>${s.score}/100</b>\n` +
+          `24h: <b>${formatPercent(s.move1)}</b>`
+      )
+      .join("\n\n");
+
+    return ctx.reply(
+      `✅ <b>Scan Debug Complete</b>\n\n` +
+        `Coins checked: <b>${checked}</b>\n` +
+        `Signals found: <b>${found.length}</b>\n\n` +
+        `🚧 <b>Blocks</b>\n` +
+        `${
+          blockedReasons.length
+            ? blockedReasons.map((r) => `• ${escapeHTML(r)}`).join("\n")
+            : "• None"
+        }\n\n` +
+        (found.length
+          ? `🔥 <b>Top Signals</b>\n${topSignals}`
+          : `🧠 No signals found.`),
+      {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
+  } catch (err) {
+    console.error("[SCANDEBUG] error:", err.message);
+
+    return ctx.reply(
+      `⚠️ <b>Scan debug error</b>\n\n${escapeHTML(err.message)}`,
+      {
+        parse_mode: "HTML",
+        reply_markup: buildMainKeyboard().reply_markup
+      }
+    );
+  }
+});
+
 const binanceClient = new Binance().options({
   APIKEY: BINANCE_API_KEY,
   APISECRET: BINANCE_API_SECRET,
