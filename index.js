@@ -121,6 +121,53 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
+bot.command("bintest", async (ctx) => {
+  console.log("[BINTEST] command received");
+
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  await ctx.reply("🧪 Testing Binance Futures connection...");
+
+  try {
+    const controller = new AbortController();
+
+    const timer = setTimeout(() => {
+      controller.abort();
+    }, 10000);
+
+    const res = await fetch("https://fapi.binance.com/fapi/v1/time", {
+      method: "GET",
+      headers: {
+        "User-Agent": "WojakMeterBot/1.0",
+        Accept: "application/json"
+      },
+      signal: controller.signal
+    });
+
+    clearTimeout(timer);
+
+    const text = await res.text();
+
+    return ctx.reply(
+      `🧪 <b>Binance Futures API Test</b>\n\n` +
+        `Status: <b>${res.status}</b>\n\n` +
+        `<pre>${escapeHTML(text.slice(0, 1000))}</pre>`,
+      {
+        parse_mode: "HTML"
+      }
+    );
+  } catch (err) {
+    return ctx.reply(
+      `⚠️ <b>Binance Futures API Test Failed</b>\n\n` +
+        `${escapeHTML(err.message)}\n\n` +
+        `This usually means Railway cannot reach Binance Futures API from this server/IP.`,
+      {
+        parse_mode: "HTML"
+      }
+    );
+  }
+});
+
 // ===============================
 // EMERGENCY COMMAND TEST
 // Put this immediately after TELEGRAM UPDATE DEBUG
