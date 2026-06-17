@@ -121,6 +121,40 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
+// ===============================
+// EMERGENCY COMMAND TEST
+// Put this immediately after TELEGRAM UPDATE DEBUG
+// ===============================
+bot.command("ping", async (ctx) => {
+  console.log("[PING] command received");
+
+  return ctx.reply("🏓 Pong. Bot commands are working.");
+});
+
+bot.start(async (ctx) => {
+  console.log("[START] command received");
+
+  const firstName = ctx.from?.first_name || "trader";
+
+  return ctx.reply(
+    `🤖 <b>Welcome to WojakMeter Bot</b>\n\n` +
+      `Hi, <b>${escapeHTML(firstName)}</b>.\n\n` +
+      `✅ Telegram updates are working.\n` +
+      `✅ Bot command handlers are working.\n\n` +
+      `Try:\n` +
+      `/futures\n` +
+      `/account\n` +
+      `/positions\n` +
+      `/riskstatus\n` +
+      `/scandebug\n\n` +
+      `🌐 wojakmeter.com`,
+    {
+      parse_mode: "HTML",
+      reply_markup: buildMainKeyboard().reply_markup
+    }
+  );
+});
+
 const binanceClient = new Binance().options({
   APIKEY: BINANCE_API_KEY,
   APISECRET: BINANCE_API_SECRET,
