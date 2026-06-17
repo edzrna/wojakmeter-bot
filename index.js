@@ -168,6 +168,72 @@ bot.command("bintest", async (ctx) => {
   }
 });
 
+const crypto = require("crypto");
+
+function signBinanceQuery(queryString, secret) {
+  return crypto
+    .createHmac("sha256", secret)
+    .update(queryString)
+    .digest("hex");
+}
+
+bot.command("privtest", async (ctx) => {
+  console.log("[PRIVTEST] command received");
+
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  await ctx.reply("🧪 Testing Binance PRIVATE Futures API...");
+
+  try {
+    if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
+      return ctx.reply("⚠️ Missing BINANCE_API_KEY or BINANCE_API_SECRET.");
+    }
+
+    const baseUrl = USE_TESTNET
+      ? "https://testnet.binancefuture.com"
+      : "https://fapi.binance.com";
+
+    const timestamp = Date.now();
+    const query = `timestamp=${timestamp}&recvWindow=10000`;
+    const signature = signBinanceQuery(query, BINANCE_API_SECRET);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+
+    const res = await fetch(
+      `${baseUrl}/fapi/v2/account?${query}&signature=${signature}`,
+      {
+        method: "GET",
+        headers: {
+          "X-MBX-APIKEY": BINANCE_API_KEY,
+          "User-Agent": "WojakMeterBot/1.0",
+          Accept: "application/json"
+        },
+        signal: controller.signal
+      }
+    );
+
+    clearTimeout(timer);
+
+    const text = await res.text();
+
+    return ctx.reply(
+      `🧪 <b>Binance Private Futures API Test</b>\n\n` +
+        `Mode: <b>${USE_TESTNET ? "TESTNET" : "MAINNET"}</b>\n` +
+        `Status: <b>${res.status}</b>\n\n` +
+        `<pre>${escapeHTML(text.slice(0, 2500))}</pre>`,
+      { parse_mode: "HTML" }
+    );
+  } catch (err) {
+    return ctx.reply(
+      `⚠️ <b>Private Binance API Test Failed</b>\n\n` +
+        `${escapeHTML(err.message)}\n\n` +
+        `If /bintest works but /privtest fails, the issue is API keys, permissions, IP restriction, or mainnet/testnet mismatch.`,
+      { parse_mode: "HTML" }
+    );
+  }
+});
+
 // ===============================
 // EMERGENCY COMMAND TEST
 // Put this immediately after TELEGRAM UPDATE DEBUG
