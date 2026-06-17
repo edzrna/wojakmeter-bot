@@ -100,11 +100,6 @@ let lastTradeSignalTs = 0;
 
 const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000;
 
-// ===============================
-// APP / BOT / BINANCE
-// ===============================
-const app = express();
-app.use(express.json());
 
 // ===============================
 // APP / BOT
