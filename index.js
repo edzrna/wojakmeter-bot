@@ -106,7 +106,25 @@ const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000;
 const app = express();
 app.use(express.json());
 
+// ===============================
+// APP / BOT
+// ===============================
+const app = express();
+app.use(express.json());
+
 const bot = new Telegraf(BOT_TOKEN);
+
+// ===============================
+// TELEGRAM UPDATE DEBUG
+// Confirms if Telegram commands are reaching the bot
+// ===============================
+bot.use(async (ctx, next) => {
+  console.log(
+    `[Telegram Update] type=${ctx.updateType} from=${ctx.from?.id || "unknown"} text=${ctx.message?.text || ""}`
+  );
+
+  return next();
+});
 
 const binanceClient = new Binance().options({
   APIKEY: BINANCE_API_KEY,
@@ -2486,6 +2504,28 @@ bot.catch((err, ctx) => {
 });
 
 // ===============================
+// GLOBAL ERROR DEBUG
+// ===============================
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
+
+// ===============================
+// BOT SAFETY CATCH
+// ===============================
+bot.catch((err, ctx) => {
+  console.error("BOT ERROR:", err);
+
+  try {
+    ctx.reply("⚠️ Unexpected bot error.");
+  } catch (_) {}
+});
+
+// ===============================
 // STARTUP
 // ===============================
 async function warmUpCache() {
@@ -2551,18 +2591,45 @@ emotionTrader.start({
 // ===============================
 // BOT START
 // ===============================
+// ===============================
+// BOT START
+// ===============================
 (async () => {
-  await bot.launch({
-    dropPendingUpdates: true,
-    allowedUpdates: []
-  });
+  try {
+    console.log("Starting WojakMeter bot...");
 
-  console.log("WojakMeter bot running...");
+    const me = await bot.telegram.getMe();
 
-  await warmUpCache().catch(console.error);
-  await runChannelBroadcast().catch(console.error);
-  await scanMarketPersonalSignals().catch(console.error);
+    console.log(`Bot connected as @${me.username} (${me.id})`);
+
+    await bot.telegram.deleteWebhook({
+      drop_pending_updates: true
+    });
+
+    console.log("Webhook deleted. Starting polling...");
+
+    await bot.launch({
+      dropPendingUpdates: true
+    });
+
+    console.log("✅ WojakMeter bot running with polling...");
+
+    await warmUpCache().catch((err) => {
+      console.error("WarmUp error:", err.message);
+    });
+
+    await runChannelBroadcast().catch((err) => {
+      console.error("Initial broadcast error:", err.message);
+    });
+
+    await scanMarketPersonalSignals().catch((err) => {
+      console.error("Initial scan error:", err.message);
+    });
+  } catch (err) {
+    console.error("❌ BOT LAUNCH FAILED:", err);
+  }
 })();
+
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
