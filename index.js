@@ -100,7 +100,6 @@ let lastTradeSignalTs = 0;
 
 const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000;
 
-
 // ===============================
 // APP / BOT
 // ===============================
@@ -121,121 +120,11 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
-bot.command("bintest", async (ctx) => {
-  console.log("[BINTEST] command received");
-
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  await ctx.reply("🧪 Testing Binance Futures connection...");
-
-  try {
-    const controller = new AbortController();
-
-    const timer = setTimeout(() => {
-      controller.abort();
-    }, 10000);
-
-    const res = await fetch("https://fapi.binance.com/fapi/v1/time", {
-      method: "GET",
-      headers: {
-        "User-Agent": "WojakMeterBot/1.0",
-        Accept: "application/json"
-      },
-      signal: controller.signal
-    });
-
-    clearTimeout(timer);
-
-    const text = await res.text();
-
-    return ctx.reply(
-      `🧪 <b>Binance Futures API Test</b>\n\n` +
-        `Status: <b>${res.status}</b>\n\n` +
-        `<pre>${escapeHTML(text.slice(0, 1000))}</pre>`,
-      {
-        parse_mode: "HTML"
-      }
-    );
-  } catch (err) {
-    return ctx.reply(
-      `⚠️ <b>Binance Futures API Test Failed</b>\n\n` +
-        `${escapeHTML(err.message)}\n\n` +
-        `This usually means Railway cannot reach Binance Futures API from this server/IP.`,
-      {
-        parse_mode: "HTML"
-      }
-    );
-  }
-});
-
-const crypto = require("crypto");
-
-function signBinanceQuery(queryString, secret) {
-  return crypto
-    .createHmac("sha256", secret)
-    .update(queryString)
-    .digest("hex");
-}
-
-bot.command("privtest", async (ctx) => {
-  console.log("[PRIVTEST] command received");
-
-  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
-
-  await ctx.reply("🧪 Testing Binance PRIVATE Futures API...");
-
-  try {
-    if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
-      return ctx.reply("⚠️ Missing BINANCE_API_KEY or BINANCE_API_SECRET.");
-    }
-
-    const baseUrl = USE_TESTNET
-      ? "https://testnet.binancefuture.com"
-      : "https://fapi.binance.com";
-
-    const timestamp = Date.now();
-    const query = `timestamp=${timestamp}&recvWindow=10000`;
-    const signature = signBinanceQuery(query, BINANCE_API_SECRET);
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
-
-    const res = await fetch(
-      `${baseUrl}/fapi/v2/account?${query}&signature=${signature}`,
-      {
-        method: "GET",
-        headers: {
-          "X-MBX-APIKEY": BINANCE_API_KEY,
-          "User-Agent": "WojakMeterBot/1.0",
-          Accept: "application/json"
-        },
-        signal: controller.signal
-      }
-    );
-
-    clearTimeout(timer);
-
-    const text = await res.text();
-
-    return ctx.reply(
-      `🧪 <b>Binance Private Futures API Test</b>\n\n` +
-        `Mode: <b>${USE_TESTNET ? "TESTNET" : "MAINNET"}</b>\n` +
-        `Status: <b>${res.status}</b>\n\n` +
-        `<pre>${escapeHTML(text.slice(0, 2500))}</pre>`,
-      { parse_mode: "HTML" }
-    );
-  } catch (err) {
-    return ctx.reply(
-      `⚠️ <b>Private Binance API Test Failed</b>\n\n` +
-        `${escapeHTML(err.message)}\n\n` +
-        `If /bintest works but /privtest fails, the issue is API keys, permissions, IP restriction, or mainnet/testnet mismatch.`,
-      { parse_mode: "HTML" }
-    );
-  }
-});
-
-const crypto = require("crypto");
-
+// ===============================
+// BINANCE SIGNED REQUEST HELPERS
+// Direct Binance Futures REST requests
+// Replaces node-binance-api private account/position reads
+// ===============================
 function signBinanceQuery(queryString, secret) {
   return crypto
     .createHmac("sha256", secret)
@@ -303,12 +192,19 @@ async function signedBinanceFuturesRequest(path, params = {}, timeoutMs = 15000)
   }
 }
 
+// ===============================
+// BINANCE DIRECT ACCOUNT FUNCTIONS
+// ===============================
 async function atGetFuturesAccount() {
   return signedBinanceFuturesRequest("/fapi/v2/account", {}, 15000);
 }
 
 async function atGetOpenPositions() {
-  const positions = await signedBinanceFuturesRequest("/fapi/v2/positionRisk", {}, 15000);
+  const positions = await signedBinanceFuturesRequest(
+    "/fapi/v2/positionRisk",
+    {},
+    15000
+  );
 
   return Array.isArray(positions)
     ? positions.filter((p) => Number(p.positionAmt) !== 0)
@@ -328,6 +224,90 @@ async function atGetFuturesBalance() {
 
   return Number(usdt?.availableBalance || usdt?.balance || 0);
 }
+
+// ===============================
+// BINANCE PUBLIC CONNECTION TEST
+// ===============================
+bot.command("bintest", async (ctx) => {
+  console.log("[BINTEST] command received");
+
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  await ctx.reply("🧪 Testing Binance Futures connection...");
+
+  try {
+    const controller = new AbortController();
+
+    const timer = setTimeout(() => {
+      controller.abort();
+    }, 10000);
+
+    const res = await fetch("https://fapi.binance.com/fapi/v1/time", {
+      method: "GET",
+      headers: {
+        "User-Agent": "WojakMeterBot/1.0",
+        Accept: "application/json"
+      },
+      signal: controller.signal
+    });
+
+    clearTimeout(timer);
+
+    const text = await res.text();
+
+    return ctx.reply(
+      `🧪 <b>Binance Futures API Test</b>\n\n` +
+        `Status: <b>${res.status}</b>\n\n` +
+        `<pre>${escapeHTML(text.slice(0, 1000))}</pre>`,
+      {
+        parse_mode: "HTML"
+      }
+    );
+  } catch (err) {
+    return ctx.reply(
+      `⚠️ <b>Binance Futures API Test Failed</b>\n\n` +
+        `${escapeHTML(err.message)}\n\n` +
+        `This usually means Railway cannot reach Binance Futures API from this server/IP.`,
+      {
+        parse_mode: "HTML"
+      }
+    );
+  }
+});
+
+// ===============================
+// BINANCE PRIVATE CONNECTION TEST
+// ===============================
+bot.command("privtest", async (ctx) => {
+  console.log("[PRIVTEST] command received");
+
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  await ctx.reply("🧪 Testing Binance PRIVATE Futures API...");
+
+  try {
+    const account = await signedBinanceFuturesRequest(
+      "/fapi/v2/account",
+      {},
+      15000
+    );
+
+    return ctx.reply(
+      `🧪 <b>Binance Private Futures API Test</b>\n\n` +
+        `Mode: <b>${USE_TESTNET ? "TESTNET" : "MAINNET"}</b>\n` +
+        `Status: <b>200</b>\n\n` +
+        `<pre>${escapeHTML(JSON.stringify(account).slice(0, 2500))}</pre>`,
+      { parse_mode: "HTML" }
+    );
+  } catch (err) {
+    return ctx.reply(
+      `⚠️ <b>Private Binance API Test Failed</b>\n\n` +
+        `${escapeHTML(err.message)}\n\n` +
+        `If /bintest works but /privtest fails, the issue is API keys, permissions, IP restriction, or mainnet/testnet mismatch.`,
+      { parse_mode: "HTML" }
+    );
+  }
+});
 
 // ===============================
 // EMERGENCY COMMAND TEST
