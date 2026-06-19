@@ -1222,20 +1222,6 @@ async function atGetMarkPrice(symbol) {
   return parseFloat(res?.markPrice || res?.price || 0);
 }
 
-async function atGetFuturesBalance() {
-  const balances = await promisifyBinance((cb) =>
-    binanceClient.futuresBalance(cb)
-  );
-
-  const usdt = (balances || []).find((b) => b.asset === "USDT");
-
-  return parseFloat(usdt?.availableBalance || 0);
-}
-
-async function atGetFuturesAccount() {
-  return promisifyBinance((cb) => binanceClient.futuresAccount(cb));
-}
-
 async function atGetExchangeInfo(symbol) {
   const info = await promisifyBinance((cb) =>
     binanceClient.futuresExchangeInfo(cb)
@@ -1382,56 +1368,6 @@ async function atCancelAllOrders(symbol) {
   return promisifyBinance((cb) =>
     binanceClient.futuresCancelAll(symbol, cb)
   );
-}
-
-async function atGetOpenPositions() {
-  const positions = await promisifyBinance((cb) =>
-    binanceClient.futuresPositionRisk(cb)
-  );
-
-  return (positions || []).filter((p) => parseFloat(p.positionAmt) !== 0);
-}
-
-async function atGetOpenOrders(symbol) {
-  return promisifyBinance((cb) =>
-    binanceClient.futuresOpenOrders(symbol, cb)
-  );
-}
-
-async function atGetAllOpenOrdersForTrackedSymbols() {
-  const symbols = Array.from(
-    new Set([
-      ...MARKET_SCAN_SYMBOLS,
-      "BTCUSDT",
-      "ETHUSDT",
-      "SOLUSDT",
-      "BNBUSDT",
-      "XRPUSDT",
-      "DOGEUSDT",
-      "ADAUSDT",
-      "AVAXUSDT",
-      "LINKUSDT",
-      "NEARUSDT",
-      "PEPEUSDT",
-      "WIFUSDT"
-    ])
-  );
-
-  const all = [];
-
-  for (const symbol of symbols) {
-    try {
-      const orders = await atGetOpenOrders(symbol);
-
-      for (const order of orders) {
-        all.push(order);
-      }
-
-      await sleep(150);
-    } catch (_) {}
-  }
-
-  return all;
 }
 
 function calculateQtyByRisk({ markPrice, symbolInfo, riskUsd, slPct }) {
