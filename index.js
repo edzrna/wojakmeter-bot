@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
 const Binance = require("node-binance-api");
+const crypto = require("crypto");
 const emotionTrader = require("./emotion-trader");
 
 // ===============================
