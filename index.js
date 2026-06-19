@@ -234,6 +234,101 @@ bot.command("privtest", async (ctx) => {
   }
 });
 
+const crypto = require("crypto");
+
+function signBinanceQuery(queryString, secret) {
+  return crypto
+    .createHmac("sha256", secret)
+    .update(queryString)
+    .digest("hex");
+}
+
+function getBinanceFuturesBaseUrl() {
+  return USE_TESTNET
+    ? "https://testnet.binancefuture.com"
+    : "https://fapi.binance.com";
+}
+
+async function signedBinanceFuturesRequest(path, params = {}, timeoutMs = 15000) {
+  if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
+    throw new Error("Missing BINANCE_API_KEY or BINANCE_API_SECRET");
+  }
+
+  const baseUrl = getBinanceFuturesBaseUrl();
+
+  const queryParams = new URLSearchParams({
+    ...params,
+    timestamp: String(Date.now()),
+    recvWindow: "10000"
+  });
+
+  const query = queryParams.toString();
+  const signature = signBinanceQuery(query, BINANCE_API_SECRET);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(`${baseUrl}${path}?${query}&signature=${signature}`, {
+      method: "GET",
+      headers: {
+        "X-MBX-APIKEY": BINANCE_API_KEY,
+        "User-Agent": "WojakMeterBot/1.0",
+        Accept: "application/json"
+      },
+      signal: controller.signal
+    });
+
+    const text = await res.text();
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      data = text;
+    }
+
+    if (!res.ok) {
+      const msg =
+        typeof data === "object"
+          ? JSON.stringify(data)
+          : String(data);
+
+      throw new Error(`Binance API error ${res.status}: ${msg}`);
+    }
+
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function atGetFuturesAccount() {
+  return signedBinanceFuturesRequest("/fapi/v2/account", {}, 15000);
+}
+
+async function atGetOpenPositions() {
+  const positions = await signedBinanceFuturesRequest("/fapi/v2/positionRisk", {}, 15000);
+
+  return Array.isArray(positions)
+    ? positions.filter((p) => Number(p.positionAmt) !== 0)
+    : [];
+}
+
+async function atGetAllOpenOrdersForTrackedSymbols() {
+  return signedBinanceFuturesRequest("/fapi/v1/openOrders", {}, 15000);
+}
+
+async function atGetFuturesBalance() {
+  const balances = await signedBinanceFuturesRequest("/fapi/v2/balance", {}, 15000);
+
+  if (!Array.isArray(balances)) return 0;
+
+  const usdt = balances.find((b) => b.asset === "USDT");
+
+  return Number(usdt?.availableBalance || usdt?.balance || 0);
+}
+
 // ===============================
 // EMERGENCY COMMAND TEST
 // Put this immediately after TELEGRAM UPDATE DEBUG
