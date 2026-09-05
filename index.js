@@ -1793,6 +1793,9 @@ async function atCloseTrackedPosition(reason = "Manual") {
 
     openPosition = null;
 
+    // Feed the circuit breaker on manual closes too
+    recordSmartTradeResult(pnl >= 0);
+
     await sendPrivate(
       `${pnl >= 0 ? "💚" : "💔"} <b>POSITION CLOSED</b>\n\n` +
       `Reason: <b>${escapeHTML(reason)}</b>\n` +
@@ -2925,14 +2928,17 @@ bot.command("testchannel", async (ctx) => {
 // ===============================
 // TEXT / BUTTON HANDLERS
 // ===============================
-bot.on("text", async (ctx) => {
+bot.on("text", async (ctx, next) => {
   const userId = ctx.from?.id;
 
   if (userId && isUserCoolingDown(userId)) return;
 
   const text = (ctx.message?.text || "").trim();
 
-  if (text.startsWith("/")) return;
+  // CRITICAL FIX: must call next() so commands registered
+  // AFTER this handler still run. A bare `return` here kills
+  // the middleware chain and silently breaks every later command.
+  if (text.startsWith("/")) return next();
 
   if (text.includes("Signal")) return sendSignal(ctx);
   if (text.includes("Market")) return sendMarketOverview(ctx);
@@ -3133,6 +3139,11 @@ const SMART_AT = {
   cooldownMs:           Number(process.env.AT_COOLDOWN_MS                || 20 * 60 * 1000),
   minSignalsRequired:   Number(process.env.AT_MIN_SIGNALS                || 2),
   maxConsecutiveLosses: Number(process.env.AT_MAX_CONSECUTIVE_LOSSES     || 2),
+
+  // FULL AUTONOMOUS MODE
+  // When true, 2/3 signals also execute without asking.
+  // When false, only 3/3 auto-executes and 2/3 asks for /confirmar.
+  autoOnMedium:         process.env.AT_AUTO_ON_MEDIUM === "true",
 };
 
 let smartAtState = {
@@ -3280,19 +3291,37 @@ async function smartEvaluateAndTrade(nextState) {
       smartAtState.lastExecutionTs = Date.now();
       smartAtState.totalAutoTrades++;
 
-    // MEDIUM confidence (2/3) → send for confirmation
-    } else if (ev.confidence === "medium" && !pendingConfirm) {
-      await sendPrivate(
-        `🟡 <b>SMART SIGNAL — 2/3 ALIGNED</b>\n\n` +
-        `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
-        `Confidence: <b>MEDIUM — ${ev.alignedCount}/3 signals</b>\n\n` +
-        `📊 <b>Signals</b>\n${ev.details.join("\n")}\n\n` +
-        `✅ /confirmar — execute\n` +
-        `❌ /cancelar  — discard\n\n` +
-        `⏱ Expires in 3 minutes.`
-      );
+    // MEDIUM confidence (2/3)
+    } else if (ev.confidence === "medium") {
 
-      await atExecuteTrade(side, symbol, ev.globalScore);
+      // Fully autonomous: execute 2/3 without asking
+      if (SMART_AT.autoOnMedium && SMART_AT.autoExecuteOnTriple) {
+        await sendPrivate(
+          `🤖 <b>SMART AUTOTRADE — EXECUTING</b>\n\n` +
+          `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
+          `Confidence: <b>MEDIUM — ${ev.alignedCount}/3 signals</b>\n\n` +
+          `📊 <b>Signals</b>\n${ev.details.join("\n")}\n\n` +
+          `⚡ Executing now (autonomous mode)...`
+        );
+
+        await smartExecuteAuto(symbol, side, ev.globalScore, ev);
+        smartAtState.lastExecutionTs = Date.now();
+        smartAtState.totalAutoTrades++;
+
+      // Semi-auto: ask for confirmation
+      } else if (!pendingConfirm) {
+        await sendPrivate(
+          `🟡 <b>SMART SIGNAL — 2/3 ALIGNED</b>\n\n` +
+          `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
+          `Confidence: <b>MEDIUM — ${ev.alignedCount}/3 signals</b>\n\n` +
+          `📊 <b>Signals</b>\n${ev.details.join("\n")}\n\n` +
+          `✅ /confirmar — execute\n` +
+          `❌ /cancelar  — discard\n\n` +
+          `⏱ Expires in 3 minutes.`
+        );
+
+        await atExecuteTrade(side, symbol, ev.globalScore);
+      }
     }
 
   } catch (err) {
@@ -3413,8 +3442,15 @@ bot.command("smartstatus", async (ctx) => {
       `Signals aligned: <b>${ev.alignedCount}/3</b>\n\n` +
       `📊 <b>Signal Breakdown</b>\n${ev.details.join("\n")}\n\n` +
       `🤖 Status: ${tradingStatus}\n` +
-      `Auto-execute on HIGH: <b>${SMART_AT.autoExecuteOnTriple ? "YES ✅" : "NO — manual confirm"}</b>\n` +
-      `Min signals required: <b>${SMART_AT.minSignalsRequired}/3</b>\n\n` +
+      `Mode: <b>${
+        SMART_AT.autoExecuteOnTriple && SMART_AT.autoOnMedium
+          ? "FULL AUTONOMOUS 🔥"
+          : SMART_AT.autoExecuteOnTriple
+            ? "Auto on 3/3, confirm on 2/3"
+            : "Manual confirm always"
+      }</b>\n` +
+      `Min signals required: <b>${SMART_AT.minSignalsRequired}/3</b>\n` +
+      `Position monitor: <b>every ${Math.round(POSITION_MONITOR_MS / 1000)}s</b>\n\n` +
       `📈 <b>Session</b>\n` +
       `Auto-trades: <b>${smartAtState.totalAutoTrades}</b>\n` +
       `Consecutive losses: <b>${smartAtState.consecutiveLosses}/${SMART_AT.maxConsecutiveLosses}</b>\n\n` +
@@ -3438,6 +3474,156 @@ bot.command("resumeat", async (ctx) => {
     { parse_mode: "HTML", reply_markup: buildMainKeyboard().reply_markup }
   );
 });
+
+// ===============================
+// AUTONOMOUS POSITION MONITOR
+// Without this the bot opens ONE trade and then blocks forever:
+// when Binance fills SL/TP the bot never learns the position closed,
+// so openPosition stays set and canOpenTrade() always returns false.
+// ===============================
+const POSITION_MONITOR_MS = Number(process.env.AT_MONITOR_MS || 30 * 1000);
+
+let monitorBusy = false;
+
+async function monitorOpenPosition() {
+  if (monitorBusy) return;
+  if (!openPosition) return;
+
+  monitorBusy = true;
+
+  try {
+    const positions = await atGetOpenPositions();
+
+    const stillOpen = positions.find(
+      (p) => p.symbol === openPosition.symbol && Number(p.positionAmt) !== 0
+    );
+
+    if (stillOpen) {
+      // Position alive — nothing to do
+      monitorBusy = false;
+      return;
+    }
+
+    // Position is gone: SL or TP filled on Binance side.
+    const { symbol, side, qty, entryPrice, slOrderId, tpOrderId, riskUsd } = openPosition;
+
+    // Cancel whichever protective order is still resting
+    if (slOrderId) await atCancelOrder(symbol, slOrderId).catch(() => {});
+    if (tpOrderId) await atCancelOrder(symbol, tpOrderId).catch(() => {});
+
+    // Determine exit price from the last mark price
+    let exitPrice = entryPrice;
+    try {
+      exitPrice = await atGetMarkPrice(symbol);
+    } catch (_) {}
+
+    const pnlRaw =
+      side === "BUY"
+        ? (exitPrice - entryPrice) * qty
+        : (entryPrice - exitPrice) * qty;
+
+    const pnl = parseFloat(pnlRaw.toFixed(2));
+    const won = pnl >= 0;
+
+    personalTradingState.pnlToday += pnl;
+    PERSONAL_PLAN.balance += pnl;
+
+    if (
+      personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock ||
+      personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)
+    ) {
+      personalTradingState.coolingDown = true;
+    }
+
+    const closedSymbol = symbol;
+    const closedSide = side;
+
+    openPosition = null;
+
+    // Feed the circuit breaker — this is what was never wired up
+    recordSmartTradeResult(won);
+
+    await sendPrivate(
+      `${won ? "💚" : "💔"} <b>POSITION CLOSED (auto-detected)</b>\n\n` +
+      `Pair: <b>${escapeHTML(closedSymbol)}</b>\n` +
+      `Side: <b>${closedSide === "BUY" ? "LONG" : "SHORT"}</b>\n` +
+      `Entry: <b>${formatUsd(entryPrice)}</b>\n` +
+      `Exit: <b>${formatUsd(exitPrice)}</b>\n` +
+      `PnL: <b>${pnl >= 0 ? "+" : ""}${formatUsd(pnl)}</b>\n\n` +
+      `Daily PnL: <b>${
+        personalTradingState.pnlToday >= 0 ? "+" : ""
+      }${formatUsd(personalTradingState.pnlToday)}</b>\n` +
+      `Balance: <b>${formatUsd(PERSONAL_PLAN.balance)}</b>\n` +
+      `Consecutive losses: <b>${smartAtState.consecutiveLosses}/${SMART_AT.maxConsecutiveLosses}</b>\n\n` +
+      `🤖 Bot is free to trade again.`
+    );
+
+    console.log(
+      `[Monitor] Position closed: ${closedSymbol} pnl=${pnl} won=${won} consecutiveLosses=${smartAtState.consecutiveLosses}`
+    );
+  } catch (err) {
+    console.error("[Monitor] error:", err.message);
+  } finally {
+    monitorBusy = false;
+  }
+}
+
+// ===============================
+// STARTUP RECONCILIATION
+// Railway restarts wipe in-memory state. On boot, ask Binance
+// what is actually open so the bot does not double-trade.
+// ===============================
+async function reconcileStateOnBoot() {
+  try {
+    const positions = await atGetOpenPositions();
+
+    if (!positions.length) {
+      console.log("[Reconcile] No open positions on Binance. Clean start.");
+      return;
+    }
+
+    const p = positions[0];
+    const amt = Number(p.positionAmt);
+
+    openPosition = {
+      side: amt > 0 ? "BUY" : "SELL",
+      symbol: p.symbol,
+      entryPrice: safe(p.entryPrice),
+      qty: Math.abs(amt),
+      slOrderId: null,
+      tpOrderId: null,
+      score: null,
+      leverage: Number(p.leverage) || AT_LEVERAGE,
+      riskUsd: PERSONAL_PLAN.riskPerTrade,
+      recovered: true,
+      ts: Date.now()
+    };
+
+    // A recovered position counts against today's limit
+    personalTradingState.tradesToday = Math.max(
+      personalTradingState.tradesToday,
+      1
+    );
+
+    console.log(
+      `[Reconcile] Recovered open position: ${p.symbol} ${amt > 0 ? "LONG" : "SHORT"} qty=${Math.abs(amt)}`
+    );
+
+    await sendPrivate(
+      `♻️ <b>State recovered after restart</b>\n\n` +
+      `Found an open position on Binance:\n` +
+      `<b>${escapeHTML(p.symbol)}</b> — <b>${amt > 0 ? "LONG" : "SHORT"}</b>\n` +
+      `Entry: <b>${formatUsd(safe(p.entryPrice))}</b>\n` +
+      `Qty: <b>${Math.abs(amt)}</b>\n\n` +
+      `⚠️ SL/TP order IDs were lost in the restart. Check /orders_all — ` +
+      `if the protective orders are missing, close manually with /close.`
+    );
+  } catch (err) {
+    console.error("[Reconcile] error:", err.message);
+  }
+}
+
+setInterval(monitorOpenPosition, POSITION_MONITOR_MS);
 
 // ===============================
 // HEALTHCHECK
@@ -3501,6 +3687,11 @@ emotionTrader.start({
 
     await warmUpCache().catch((err) => {
       console.error("WarmUp error:", err.message);
+    });
+
+    // Recover real state from Binance before doing anything else
+    await reconcileStateOnBoot().catch((err) => {
+      console.error("Reconcile error:", err.message);
     });
 
     await runChannelBroadcast().catch((err) => {
