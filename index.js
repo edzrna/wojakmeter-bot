@@ -3287,9 +3287,13 @@ async function smartEvaluateAndTrade(nextState) {
         `⚡ Executing now...`
       );
 
-      await smartExecuteAuto(symbol, side, ev.globalScore, ev);
-      smartAtState.lastExecutionTs = Date.now();
-      smartAtState.totalAutoTrades++;
+      const executed = await smartExecuteAuto(symbol, side, ev.globalScore, ev);
+
+      // Only burn the cooldown and count the trade if it really executed
+      if (executed) {
+        smartAtState.lastExecutionTs = Date.now();
+        smartAtState.totalAutoTrades++;
+      }
 
     // MEDIUM confidence (2/3)
     } else if (ev.confidence === "medium") {
@@ -3304,23 +3308,38 @@ async function smartEvaluateAndTrade(nextState) {
           `⚡ Executing now (autonomous mode)...`
         );
 
-        await smartExecuteAuto(symbol, side, ev.globalScore, ev);
-        smartAtState.lastExecutionTs = Date.now();
-        smartAtState.totalAutoTrades++;
+        const executed = await smartExecuteAuto(symbol, side, ev.globalScore, ev);
 
-      // Semi-auto: ask for confirmation
+        if (executed) {
+          smartAtState.lastExecutionTs = Date.now();
+          smartAtState.totalAutoTrades++;
+        }
+
+      // Semi-auto: stage the order FIRST, then announce.
+      // Announcing before atExecuteTrade() means that if the
+      // Binance call fails, the user is told to /confirmar an
+      // order that was never created.
       } else if (!pendingConfirm) {
-        await sendPrivate(
-          `🟡 <b>SMART SIGNAL — 2/3 ALIGNED</b>\n\n` +
-          `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
-          `Confidence: <b>MEDIUM — ${ev.alignedCount}/3 signals</b>\n\n` +
-          `📊 <b>Signals</b>\n${ev.details.join("\n")}\n\n` +
-          `✅ /confirmar — execute\n` +
-          `❌ /cancelar  — discard\n\n` +
-          `⏱ Expires in 3 minutes.`
-        );
-
         await atExecuteTrade(side, symbol, ev.globalScore);
+
+        if (pendingConfirm) {
+          pendingConfirm.smartEvaluation = ev;
+
+          await sendPrivate(
+            `🟡 <b>SMART SIGNAL — ${ev.alignedCount}/3 ALIGNED</b>\n\n` +
+            `📊 <b>Signals</b>\n${ev.details.join("\n")}\n\n` +
+            `☝️ Details of the staged order are in the message above.`
+          );
+        } else {
+          await sendPrivate(
+            `⚠️ <b>Signal detected but order could not be staged</b>\n\n` +
+            `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
+            `Confidence: <b>MEDIUM — ${ev.alignedCount}/3</b>\n\n` +
+            `📊 <b>Signals</b>\n${ev.details.join("\n")}\n\n` +
+            `The Binance API rejected the request. Run /privtest to diagnose.\n` +
+            `Nothing to confirm — no order exists.`
+          );
+        }
       }
     }
 
@@ -3388,9 +3407,18 @@ async function smartExecuteAuto(symbol, side, score, ev) {
 
     console.log(`[SmartAT] Auto-executed: ${side} ${symbol} entry=${fillPrice} qty=${qty} leverage=${leverage}x`);
 
+    return true;
+
   } catch (err) {
     console.error("[SmartAT] smartExecuteAuto error:", err.message);
-    await sendPrivate(`⚠️ <b>Auto-execution error</b>\n\n${escapeHTML(err.message)}`);
+
+    await sendPrivate(
+      `⚠️ <b>Auto-execution FAILED</b>\n\n` +
+      `${escapeHTML(err.message)}\n\n` +
+      `No position was opened. Run /privtest to diagnose Binance access.`
+    );
+
+    return false;
   }
 }
 
