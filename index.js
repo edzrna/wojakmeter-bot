@@ -107,7 +107,6 @@ const SCORE_SHORT_MAX = Number(process.env.AUTO_TRADE_SCORE_SHORT || 35);
 let autoTradeActive = AUTO_TRADE_ENABLED_ENV;
 let pendingConfirm = null;
 let openPosition = null;
-let pendingDangerAction = null;
 let lastTradeSignalTs = 0;
 
 // RECALIBRATED: 30min -> 20min
@@ -224,18 +223,49 @@ async function atGetOpenPositions() {
     : [];
 }
 
-async function atGetAllOpenOrdersForTrackedSymbols() {
-  return signedBinanceFuturesRequest("/fapi/v1/openOrders", {}, 15000);
+async function atGetRealizedPnl(symbol, sinceTs) {
+  // Reads the REAL realized PnL from Binance instead of estimating it
+  // from mark price. Estimating gave wrong numbers because the fill
+  // happens at the stop price, not at whatever the mark is when the
+  // monitor notices, and it ignored fees entirely.
+  const rows = await signedBinanceFuturesRequest(
+    "/fapi/v1/income",
+    {
+      symbol,
+      incomeType: "REALIZED_PNL",
+      startTime: String(Math.max(0, sinceTs - 60000)),
+      limit: "100"
+    },
+    15000
+  );
+
+  if (!Array.isArray(rows) || !rows.length) return null;
+
+  const gross = rows.reduce((sum, r) => sum + safe(r.income), 0);
+
+  // Commissions are a separate income type
+  let fees = 0;
+  try {
+    const commissions = await signedBinanceFuturesRequest(
+      "/fapi/v1/income",
+      {
+        symbol,
+        incomeType: "COMMISSION",
+        startTime: String(Math.max(0, sinceTs - 60000)),
+        limit: "100"
+      },
+      15000
+    );
+    if (Array.isArray(commissions)) {
+      fees = commissions.reduce((sum, r) => sum + safe(r.income), 0);
+    }
+  } catch (_) {}
+
+  return parseFloat((gross + fees).toFixed(4));
 }
 
-async function atGetFuturesBalance() {
-  const balances = await signedBinanceFuturesRequest("/fapi/v2/balance", {}, 15000);
-
-  if (!Array.isArray(balances)) return 0;
-
-  const usdt = balances.find((b) => b.asset === "USDT");
-
-  return Number(usdt?.availableBalance || usdt?.balance || 0);
+async function atGetAllOpenOrdersForTrackedSymbols() {
+  return signedBinanceFuturesRequest("/fapi/v1/openOrders", {}, 15000);
 }
 
 // ===============================
@@ -754,7 +784,6 @@ let lastBroadcastState = {
 const BROADCAST_INTERVAL_MS = 2 * 60 * 1000;
 const MIN_BROADCAST_GAP_MS = 10 * 60 * 1000;
 const SCORE_SHIFT_THRESHOLD = 8;
-const BREAKING_SCORE_SHIFT_THRESHOLD = 15;
 
 // ===============================
 // HELPERS
@@ -1016,29 +1045,6 @@ function resetPersonalStateIfNewDay() {
       coolingDown: false
     };
   }
-}
-
-function canSendPersonalAlert(score) {
-  resetPersonalStateIfNewDay();
-
-  if (!PERSONAL_ALERTS_ENABLED) return false;
-  if (!PRIVATE_TELEGRAM_USER_ID) return false;
-  if (score < PERSONAL_PLAN.minSignalScore) return false;
-  if (personalTradingState.coolingDown) return false;
-  if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) return false;
-
-  if (
-    personalTradingState.pnlToday <=
-    -Math.abs(PERSONAL_PLAN.maxDailyLoss)
-  ) {
-    return false;
-  }
-
-  if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) {
-    return false;
-  }
-
-  return true;
 }
 
 function normalizeCoinKey(input) {
@@ -1803,7 +1809,8 @@ async function atCloseTrackedPosition(reason = "Manual") {
       `Side: <b>${side === "BUY" ? "LONG" : "SHORT"}</b>\n` +
       `Entry: <b>${formatUsd(entryPrice)}</b>\n` +
       `Exit: <b>${formatUsd(exitPrice)}</b>\n` +
-      `PnL: <b>${pnl >= 0 ? "+" : ""}${formatUsd(pnl)}</b>\n\n` +
+      `PnL: <b>${pnl >= 0 ? "+" : ""}${formatUsd(pnl)}</b>` +
+      `${pnlSource === "estimated" ? " <i>(estimated)</i>" : ""}\n\n` +
       `Daily PnL: <b>${
         personalTradingState.pnlToday >= 0 ? "+" : ""
       }${formatUsd(personalTradingState.pnlToday)}</b>\n` +
@@ -1814,12 +1821,6 @@ async function atCloseTrackedPosition(reason = "Manual") {
       `⚠️ <b>Error closing tracked position</b>\n\n${escapeHTML(err.message)}`
     );
   }
-}
-
-// evaluateAndTrade is replaced by smartEvaluateAndTrade below
-// kept as alias for backward compatibility
-async function evaluateAndTrade(nextState) {
-  return smartEvaluateAndTrade(nextState);
 }
 
 // ===============================
@@ -2926,6 +2927,201 @@ bot.command("testchannel", async (ctx) => {
 });
 
 // ===============================
+// MARKET COMMANDS
+// These were referenced in the keyboard and help text
+// but never actually registered, so they silently did nothing.
+// ===============================
+bot.command("signal",     sendSignal);
+bot.command("market",     sendMarketOverview);
+bot.command("trending",   sendTrending);
+bot.command("risk",       sendRisk);
+bot.command("daily",      sendDaily);
+bot.command("discipline", sendDiscipline);
+bot.command("analyze",    sendAnalysis);
+
+bot.command("gainers", (ctx) => sendListByType(ctx, "gainers"));
+bot.command("losers",  (ctx) => sendListByType(ctx, "losers"));
+bot.command("radar",   (ctx) => sendListByType(ctx, "volume"));
+
+bot.command("coin", async (ctx) => {
+  const query = (ctx.message.text || "").split(" ").slice(1).join(" ").trim();
+
+  if (!query) {
+    return ctx.reply("Usage: /coin btc", {
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  }
+
+  return sendCoinSignal(ctx, query);
+});
+
+bot.command("spotlight", async (ctx) => {
+  try {
+    const markets = await getMarkets();
+
+    const strongest = [...markets]
+      .filter((c) => c.price_change_percentage_24h != null)
+      .sort(
+        (a, b) =>
+          Math.abs(safe(b.price_change_percentage_24h)) -
+          Math.abs(safe(a.price_change_percentage_24h))
+      )[0];
+
+    if (!strongest) {
+      return ctx.reply("⚠️ No spotlight coin available right now.", {
+        reply_markup: buildMainKeyboard().reply_markup
+      });
+    }
+
+    return sendCoinSignal(ctx, (strongest.symbol || "").toLowerCase());
+  } catch (err) {
+    return replyWithError(ctx, err, "Error spotlight");
+  }
+});
+
+bot.help(async (ctx) => {
+  return ctx.reply(
+    `🛠 <b>WojakMeter Bot — Commands</b>\n\n` +
+    `<b>Market</b>\n` +
+    `/signal /market /trending /spotlight\n` +
+    `/risk /daily /gainers /losers /radar\n` +
+    `/analyze /discipline /coin btc\n\n` +
+    `<b>Futures (owner)</b>\n` +
+    `/futures /account /positions /orders_all\n` +
+    `/riskstatus /myplan\n` +
+    `/close — close tracked position\n` +
+    `/closepos BTCUSDT — close any position\n` +
+    `/cancelall BTCUSDT — cancel open orders\n\n` +
+    `<b>AutoTrade</b>\n` +
+    `/smartstatus — live signal breakdown\n` +
+    `/confirmar /cancelar\n` +
+    `/resumeat — clear circuit breaker\n\n` +
+    `<b>EmoTrader</b>\n` +
+    `/emostatus /emohistory /emopairs\n` +
+    `/emoconfirmar /emocancelar /emocerrar\n\n` +
+    `<b>Diagnostics</b>\n` +
+    `/ping /bintest /privtest /scandebug /scan\n\n` +
+    `<b>Watchlist</b>\n` +
+    `/watch btc /unwatch btc /mywatchlist\n\n` +
+    `🌐 wojakmeter.com`,
+    {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: buildMainKeyboard().reply_markup
+    }
+  );
+});
+
+// ===============================
+// EMOTRADER COMMANDS
+// Only the text-button path existed; typing the command did nothing.
+// ===============================
+bot.command("emostatus", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+  return emotionTrader.handleEmoStatus(ctx);
+});
+
+bot.command("emohistory", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+  return emotionTrader.handleEmoHistory(ctx);
+});
+
+bot.command("emopairs", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+  return emotionTrader.handleEmoPairs(ctx);
+});
+
+bot.command("emoconfirmar", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+  return emotionTrader.handleEmoConfirmar(ctx);
+});
+
+bot.command("emocancelar", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+  return emotionTrader.handleEmoCancelar(ctx);
+});
+
+bot.command("emocerrar", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+  return emotionTrader.handleEmoCerrar(ctx);
+});
+
+// ===============================
+// POSITION MANAGEMENT COMMANDS
+// buildPositionsMessage told the user to run /closepos and
+// buildAllOrdersMessage told them to run /cancelall — neither existed.
+// ===============================
+bot.command("closepos", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  const symbol = ((ctx.message.text || "").split(" ")[1] || "")
+    .trim()
+    .toUpperCase();
+
+  if (!symbol) {
+    return ctx.reply("Usage: /closepos BTCUSDT");
+  }
+
+  await ctx.reply(`⏳ Closing ${symbol}...`);
+
+  try {
+    const positions = await atGetOpenPositions();
+    const pos = positions.find((p) => p.symbol === symbol);
+
+    if (!pos) {
+      return ctx.reply(`⚠️ No open position found for ${escapeHTML(symbol)}.`);
+    }
+
+    const amt = Number(pos.positionAmt);
+    const closeSide = amt > 0 ? "SELL" : "BUY";
+    const qty = Math.abs(amt);
+
+    await atCancelAllOrders(symbol).catch(() => {});
+    await sleep(300);
+    await atPlaceMarketOrder(symbol, closeSide, qty);
+
+    if (openPosition && openPosition.symbol === symbol) {
+      openPosition = null;
+    }
+
+    return ctx.reply(
+      `✅ <b>Closed ${escapeHTML(symbol)}</b>\n\n` +
+      `Side closed: <b>${amt > 0 ? "LONG" : "SHORT"}</b>\n` +
+      `Qty: <b>${qty}</b>\n\n` +
+      `Run /positions to verify.`,
+      { parse_mode: "HTML", reply_markup: buildMainKeyboard().reply_markup }
+    );
+  } catch (err) {
+    return ctx.reply(`⚠️ Error closing ${escapeHTML(symbol)}:\n${escapeHTML(err.message)}`, {
+      parse_mode: "HTML"
+    });
+  }
+});
+
+bot.command("cancelall", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  const symbol = ((ctx.message.text || "").split(" ")[1] || "")
+    .trim()
+    .toUpperCase();
+
+  if (!symbol) {
+    return ctx.reply("Usage: /cancelall BTCUSDT");
+  }
+
+  try {
+    await atCancelAllOrders(symbol);
+
+    return ctx.reply(`✅ All open orders cancelled for <b>${escapeHTML(symbol)}</b>.`, {
+      parse_mode: "HTML",
+      reply_markup: buildMainKeyboard().reply_markup
+    });
+  } catch (err) {
+    return ctx.reply(`⚠️ Error: ${escapeHTML(err.message)}`, { parse_mode: "HTML" });
+  }
+});
+
+// ===============================
 // TEXT / BUTTON HANDLERS
 // ===============================
 bot.on("text", async (ctx, next) => {
@@ -2945,7 +3141,10 @@ bot.on("text", async (ctx, next) => {
   if (text.includes("Trending")) return sendTrending(ctx);
 
   if (text.includes("Spotlight")) {
-    return bot.telegram.sendMessage(ctx.chat.id, "Use /spotlight");
+    return bot.handleUpdate({
+      update_id: Date.now(),
+      message: { ...ctx.message, text: "/spotlight" }
+    }).catch(() => {});
   }
 
   if (text.includes("Risk Status")) {
@@ -3591,18 +3790,33 @@ async function monitorOpenPosition() {
     if (slOrderId) await atCancelOrder(symbol, slOrderId).catch(() => {});
     if (tpOrderId) await atCancelOrder(symbol, tpOrderId).catch(() => {});
 
-    // Determine exit price from the last mark price
+    // Ask Binance for the REAL realized PnL (fees included).
+    // Fall back to a mark-price estimate only if the income
+    // endpoint gives us nothing.
     let exitPrice = entryPrice;
+    let pnl = null;
+    let pnlSource = "binance";
+
     try {
-      exitPrice = await atGetMarkPrice(symbol);
-    } catch (_) {}
+      pnl = await atGetRealizedPnl(symbol, openPosition.ts);
+    } catch (err) {
+      console.error("[Monitor] realized pnl read failed:", err.message);
+    }
 
-    const pnlRaw =
-      side === "BUY"
-        ? (exitPrice - entryPrice) * qty
-        : (entryPrice - exitPrice) * qty;
+    if (pnl === null) {
+      pnlSource = "estimated";
+      try {
+        exitPrice = await atGetMarkPrice(symbol);
+      } catch (_) {}
 
-    const pnl = parseFloat(pnlRaw.toFixed(2));
+      const pnlRaw =
+        side === "BUY"
+          ? (exitPrice - entryPrice) * qty
+          : (entryPrice - exitPrice) * qty;
+
+      pnl = parseFloat(pnlRaw.toFixed(2));
+    }
+
     const won = pnl >= 0;
 
     personalTradingState.pnlToday += pnl;
@@ -3653,6 +3867,72 @@ async function monitorOpenPosition() {
 // Railway restarts wipe in-memory state. On boot, ask Binance
 // what is actually open so the bot does not double-trade.
 // ===============================
+async function rebuildDailyStateFromBinance() {
+  // In-memory counters reset on every restart, which let the bot
+  // exceed maxTradesPerDay and ignore a daily-loss lockout.
+  // Binance already knows what happened today — ask it.
+  try {
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+
+    const rows = await signedBinanceFuturesRequest(
+      "/fapi/v1/income",
+      {
+        incomeType: "REALIZED_PNL",
+        startTime: String(startOfDay.getTime()),
+        limit: "500"
+      },
+      15000
+    );
+
+    if (!Array.isArray(rows)) return;
+
+    const realized = rows.reduce((sum, r) => sum + safe(r.income), 0);
+
+    let fees = 0;
+    try {
+      const commissions = await signedBinanceFuturesRequest(
+        "/fapi/v1/income",
+        {
+          incomeType: "COMMISSION",
+          startTime: String(startOfDay.getTime()),
+          limit: "500"
+        },
+        15000
+      );
+      if (Array.isArray(commissions)) {
+        fees = commissions.reduce((sum, r) => sum + safe(r.income), 0);
+      }
+    } catch (_) {}
+
+    personalTradingState.pnlToday = parseFloat((realized + fees).toFixed(2));
+    personalTradingState.tradesToday = rows.length;
+
+    if (
+      personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock ||
+      personalTradingState.pnlToday <= -Math.abs(PERSONAL_PLAN.maxDailyLoss)
+    ) {
+      personalTradingState.coolingDown = true;
+    }
+
+    console.log(
+      `[Reconcile] Today from Binance: trades=${personalTradingState.tradesToday} ` +
+      `pnl=${personalTradingState.pnlToday} coolingDown=${personalTradingState.coolingDown}`
+    );
+
+    if (personalTradingState.tradesToday > 0) {
+      await sendPrivate(
+        `📊 <b>Daily state rebuilt from Binance</b>\n\n` +
+        `Trades today: <b>${personalTradingState.tradesToday}/${PERSONAL_PLAN.maxTradesPerDay}</b>\n` +
+        `PnL today: <b>${personalTradingState.pnlToday >= 0 ? "+" : ""}${formatUsd(personalTradingState.pnlToday)}</b>\n` +
+        `Cooling down: <b>${personalTradingState.coolingDown ? "Yes 🧊" : "No"}</b>`
+      );
+    }
+  } catch (err) {
+    console.error("[Reconcile] daily state rebuild failed:", err.message);
+  }
+}
+
 async function reconcileStateOnBoot() {
   try {
     const positions = await atGetOpenPositions();
@@ -3679,24 +3959,58 @@ async function reconcileStateOnBoot() {
       ts: Date.now()
     };
 
-    // A recovered position counts against today's limit
-    personalTradingState.tradesToday = Math.max(
-      personalTradingState.tradesToday,
-      1
-    );
-
     console.log(
       `[Reconcile] Recovered open position: ${p.symbol} ${amt > 0 ? "LONG" : "SHORT"} qty=${Math.abs(amt)}`
     );
 
+    // A restart loses the SL/TP order IDs. If the protective orders
+    // are gone too, the position is running naked — re-arm it.
+    let protectionNote = "";
+
+    try {
+      const openOrders = await signedBinanceFuturesRequest(
+        "/fapi/v1/openOrders",
+        { symbol: p.symbol },
+        15000
+      );
+
+      const hasStop = Array.isArray(openOrders) &&
+        openOrders.some((o) => String(o.type).includes("STOP"));
+
+      const hasTp = Array.isArray(openOrders) &&
+        openOrders.some((o) => String(o.type).includes("TAKE_PROFIT"));
+
+      if (hasStop && hasTp) {
+        protectionNote = "✅ SL and TP orders are still live on Binance.";
+      } else {
+        // Naked position — rebuild protection immediately
+        const { slPrice, tpPrice, slOrderId, tpOrderId } =
+          await atPlaceSlTpOrders(
+            p.symbol,
+            openPosition.side,
+            openPosition.qty,
+            openPosition.entryPrice
+          );
+
+        openPosition.slOrderId = slOrderId;
+        openPosition.tpOrderId = tpOrderId;
+
+        protectionNote =
+          `🛡 <b>Position was unprotected — SL/TP re-armed</b>\n` +
+          `SL: <b>${formatUsd(slPrice)}</b> · TP: <b>${formatUsd(tpPrice)}</b>`;
+      }
+    } catch (err) {
+      protectionNote =
+        `⚠️ Could not verify or re-arm SL/TP: ${escapeHTML(err.message)}\n` +
+        `Check /orders_all and consider /close.`;
+    }
+
     await sendPrivate(
       `♻️ <b>State recovered after restart</b>\n\n` +
-      `Found an open position on Binance:\n` +
       `<b>${escapeHTML(p.symbol)}</b> — <b>${amt > 0 ? "LONG" : "SHORT"}</b>\n` +
       `Entry: <b>${formatUsd(safe(p.entryPrice))}</b>\n` +
       `Qty: <b>${Math.abs(amt)}</b>\n\n` +
-      `⚠️ SL/TP order IDs were lost in the restart. Check /orders_all — ` +
-      `if the protective orders are missing, close manually with /close.`
+      protectionNote
     );
   } catch (err) {
     console.error("[Reconcile] error:", err.message);
@@ -3770,6 +4084,10 @@ emotionTrader.start({
     });
 
     // Recover real state from Binance before doing anything else
+    await rebuildDailyStateFromBinance().catch((err) => {
+      console.error("Daily state rebuild error:", err.message);
+    });
+
     await reconcileStateOnBoot().catch((err) => {
       console.error("Reconcile error:", err.message);
     });
