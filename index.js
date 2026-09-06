@@ -3144,6 +3144,10 @@ const SMART_AT = {
   // When true, 2/3 signals also execute without asking.
   // When false, only 3/3 auto-executes and 2/3 asks for /confirmar.
   autoOnMedium:         process.env.AT_AUTO_ON_MEDIUM === "true",
+
+  // Aggressive: allow single-signal (1/3) trades.
+  // Off by default because one signal has no cross-confirmation.
+  autoOnLow:            process.env.AT_AUTO_ON_LOW === "true",
 };
 
 let smartAtState = {
@@ -3239,12 +3243,23 @@ async function evaluateSmartSignals() {
     const shortCount = all.filter(s => s === "SHORT").length;
     result.alignedCount = Math.max(longCount, shortCount);
 
-    if (longCount >= SMART_AT.minSignalsRequired && longCount >= shortCount) {
+    // SAFETY: if signals point in opposite directions, there is no
+    // edge — do not resolve the tie arbitrarily. Previously a 1-vs-1
+    // split silently became LONG because of a `>=` comparison, which
+    // meant the bot could open a leveraged position on a coin flip.
+    if (longCount > 0 && shortCount > 0) {
+      result.direction  = null;
+      result.confidence = "none";
+      result.conflict   = true;
+      result.details.push(
+        `⛔ Conflicting signals (${longCount} LONG vs ${shortCount} SHORT) — standing down`
+      );
+    } else if (longCount >= SMART_AT.minSignalsRequired) {
       result.direction  = "LONG";
-      result.confidence = longCount === 3 ? "high" : "medium";
-    } else if (shortCount >= SMART_AT.minSignalsRequired && shortCount > longCount) {
+      result.confidence = longCount === 3 ? "high" : longCount === 2 ? "medium" : "low";
+    } else if (shortCount >= SMART_AT.minSignalsRequired) {
       result.direction  = "SHORT";
-      result.confidence = shortCount === 3 ? "high" : "medium";
+      result.confidence = shortCount === 3 ? "high" : shortCount === 2 ? "medium" : "low";
     }
 
   } catch (err) {
@@ -3338,6 +3353,41 @@ async function smartEvaluateAndTrade(nextState) {
             `📊 <b>Signals</b>\n${ev.details.join("\n")}\n\n` +
             `The Binance API rejected the request. Run /privtest to diagnose.\n` +
             `Nothing to confirm — no order exists.`
+          );
+        }
+      }
+
+    // LOW confidence (1/3) — a single signal, no cross-confirmation.
+    // Requires AT_AUTO_ON_LOW=true to execute without asking.
+    } else if (ev.confidence === "low") {
+
+      if (SMART_AT.autoOnLow && SMART_AT.autoExecuteOnTriple) {
+        await sendPrivate(
+          `🟠 <b>SMART AUTOTRADE — LOW CONFIDENCE</b>\n\n` +
+          `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
+          `Confidence: <b>LOW — only 1/3 signals</b>\n\n` +
+          `📊 <b>Signals</b>\n${ev.details.join("\n")}\n\n` +
+          `⚠️ No cross-confirmation. Executing because AT_AUTO_ON_LOW=true.`
+        );
+
+        const executed = await smartExecuteAuto(symbol, side, ev.globalScore, ev);
+
+        if (executed) {
+          smartAtState.lastExecutionTs = Date.now();
+          smartAtState.totalAutoTrades++;
+        }
+
+      } else if (!pendingConfirm) {
+        await atExecuteTrade(side, symbol, ev.globalScore);
+
+        if (pendingConfirm) {
+          pendingConfirm.smartEvaluation = ev;
+
+          await sendPrivate(
+            `🟠 <b>LOW CONFIDENCE SIGNAL — 1/3</b>\n\n` +
+            `📊 <b>Signals</b>\n${ev.details.join("\n")}\n\n` +
+            `⚠️ Only one signal fired, nothing confirms it.\n` +
+            `Order staged above — /confirmar or /cancelar.`
           );
         }
       }
@@ -3451,7 +3501,7 @@ bot.command("smartstatus", async (ctx) => {
   try {
     const ev = await evaluateSmartSignals();
 
-    const icon = { high: "🟢", medium: "🟡", none: "⚪" }[ev.confidence] || "⚪";
+    const icon = { high: "🟢", medium: "🟡", low: "🟠", none: "⚪" }[ev.confidence] || "⚪";
 
     const tradingStatus = !autoTradeActive
       ? "🛑 AutoTrade OFF"
@@ -3467,7 +3517,9 @@ bot.command("smartstatus", async (ctx) => {
       `🧠 <b>Smart AutoTrade Status</b>\n\n` +
       `${icon} Confidence: <b>${ev.confidence.toUpperCase()}</b>\n` +
       `Direction: <b>${ev.direction || "None"}</b>\n` +
-      `Signals aligned: <b>${ev.alignedCount}/3</b>\n\n` +
+      `Signals aligned: <b>${ev.alignedCount}/3</b>\n` +
+      (ev.conflict ? `⛔ <b>Signals conflict — standing down</b>\n` : ``) +
+      `\n` +
       `📊 <b>Signal Breakdown</b>\n${ev.details.join("\n")}\n\n` +
       `🤖 Status: ${tradingStatus}\n` +
       `Mode: <b>${
