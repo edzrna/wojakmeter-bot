@@ -1214,6 +1214,36 @@ async function getGlobal(force = false) {
 // ===============================
 // BINANCE FUTURES HELPERS
 // ===============================
+// ===============================
+// NOTIFICATION CONTROL
+// The bot was announcing every evaluation and repeating the
+// same Binance failure on every cycle. Signals that cannot
+// execute are logged, not messaged.
+// ===============================
+const QUIET_MODE = process.env.AT_QUIET_MODE !== "false";
+const ERROR_REPEAT_MS = Number(process.env.AT_ERROR_REPEAT_MS || 60 * 60 * 1000);
+
+const lastErrorSent = new Map();
+
+// Sends an error at most once per ERROR_REPEAT_MS per unique key.
+async function sendPrivateError(key, text) {
+  const last = lastErrorSent.get(key) || 0;
+
+  if (Date.now() - last < ERROR_REPEAT_MS) {
+    console.log(`[Notify] suppressed repeat error: ${key}`);
+    return;
+  }
+
+  lastErrorSent.set(key, Date.now());
+  return sendPrivate(text);
+}
+
+// Informational chatter — suppressed while QUIET_MODE is on.
+async function sendPrivateInfo(text) {
+  if (QUIET_MODE) return;
+  return sendPrivate(text);
+}
+
 async function sendPrivate(text) {
   if (!PRIVATE_TELEGRAM_USER_ID) return;
 
@@ -1680,8 +1710,10 @@ async function atExecuteTrade(side, symbol, score) {
   } catch (err) {
     console.error("[AutoTrader] executeTrade error:", err.message);
 
-    await sendPrivate(
-      `⚠️ <b>AutoTrade error</b>\n\n${escapeHTML(err.message)}`
+    await sendPrivateError(
+      "at_execute_error",
+      `⚠️ <b>AutoTrade error</b>\n\n${escapeHTML(err.message)}\n\n` +
+      `<i>Muted for 1h to avoid spam.</i>`
     );
   }
 }
@@ -2609,9 +2641,12 @@ async function scanMarketPersonalSignals() {
       .sort((a, b) => b.score - a.score)
       .slice(0, 5);
 
-    for (const signal of signals) {
-      await sendMarketPersonalSignal(signal);
-      await sleep(750);
+    // Was sending up to 5 alerts every scan cycle. Only the
+    // single best setup is worth interrupting the user for.
+    const best = signals[0];
+
+    if (best) {
+      await sendMarketPersonalSignal(best);
     }
   } catch (err) {
     console.error("Market personal scanner error:", err.message);
@@ -3122,6 +3157,113 @@ bot.command("cancelall", async (ctx) => {
 });
 
 // ===============================
+// /diag — one command that answers
+// "why has the bot not traded yet?"
+// ===============================
+bot.command("diag", async (ctx) => {
+  if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
+
+  await ctx.reply("🔎 Running full diagnostic...");
+
+  const lines = [];
+  let blocker = null;
+
+  // 1. Can we reach Binance at all?
+  try {
+    const res = await fetch("https://fapi.binance.com/fapi/v1/time", {
+      signal: AbortSignal.timeout(10000)
+    });
+    lines.push(res.ok
+      ? "✅ Binance public API reachable"
+      : `❌ Binance public API: HTTP ${res.status}`);
+    if (!res.ok && !blocker) blocker = "Binance blocked from this server region";
+  } catch (err) {
+    lines.push(`❌ Binance public API: ${escapeHTML(err.message)}`);
+    if (!blocker) blocker = "Cannot reach Binance from this server";
+  }
+
+  // 2. Do the API keys actually work? THIS is usually the answer.
+  try {
+    await signedBinanceFuturesRequest("/fapi/v2/account", {}, 12000);
+    lines.push("✅ Binance private API (keys valid)");
+  } catch (err) {
+    const msg = err.message || "";
+    lines.push(`❌ Binance private API: ${escapeHTML(msg.slice(0, 160))}`);
+
+    if (msg.includes("-2015")) {
+      blocker =
+        "API key rejected (-2015). One of:\n" +
+        "• IP restriction — whitelist the Railway IP\n" +
+        "• Futures permission not enabled on the key\n" +
+        "• BINANCE_TESTNET does not match the key type";
+    } else if (!blocker) {
+      blocker = "Binance private API rejected the request";
+    }
+  }
+
+  // 3. Bot-side gates
+  resetPersonalStateIfNewDay();
+
+  if (!autoTradeActive) {
+    lines.push("❌ AutoTrade is OFF");
+    if (!blocker) blocker = "AutoTrade is off — press 🤖 AutoTrade ON";
+  } else {
+    lines.push("✅ AutoTrade is ON");
+  }
+
+  if (smartAtState.paused) {
+    lines.push(`🧊 Circuit breaker: ${escapeHTML(String(smartAtState.pauseReason))}`);
+    if (!blocker) blocker = "Circuit breaker active — run /resumeat";
+  }
+
+  if (openPosition) {
+    lines.push(`📈 Position open: ${escapeHTML(openPosition.symbol)} — blocks new trades`);
+  }
+
+  if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) {
+    lines.push(`📌 Daily trade limit reached (${personalTradingState.tradesToday}/${PERSONAL_PLAN.maxTradesPerDay})`);
+    if (!blocker) blocker = "Daily trade limit reached";
+  }
+
+  if (personalTradingState.coolingDown) {
+    lines.push("🧊 Cooling down (daily loss or profit lock hit)");
+    if (!blocker) blocker = "Cooling down for the rest of the day";
+  }
+
+  const cooldownLeft = SMART_AT.cooldownMs - (Date.now() - smartAtState.lastExecutionTs);
+  if (cooldownLeft > 0 && smartAtState.lastExecutionTs > 0) {
+    lines.push(`⏱ Signal cooldown: ${Math.ceil(cooldownLeft / 60000)} min left`);
+  }
+
+  // 4. Current signal read
+  let signalLine = "";
+  try {
+    const ev = await evaluateSmartSignals();
+    signalLine =
+      `\n📊 <b>Right now</b>\n` +
+      `Direction: <b>${ev.direction || "none"}</b> · ` +
+      `Confidence: <b>${ev.confidence}</b> · ` +
+      `Aligned: <b>${ev.alignedCount}/3</b>\n` +
+      ev.details.join("\n");
+  } catch (_) {}
+
+  return ctx.reply(
+    `🔎 <b>WojakMeter Diagnostic</b>\n\n` +
+    lines.join("\n") +
+    signalLine +
+    `\n\n` +
+    (blocker
+      ? `🚧 <b>Main blocker</b>\n${blocker}`
+      : `✅ <b>Nothing blocking — waiting for a valid signal.</b>`),
+    {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: buildMainKeyboard().reply_markup
+    }
+  );
+});
+
+// ===============================
 // TEXT / BUTTON HANDLERS
 // ===============================
 bot.on("text", async (ctx, next) => {
@@ -3493,13 +3635,7 @@ async function smartEvaluateAndTrade(nextState) {
 
     // HIGH confidence (3/3) + AUTO_TRADE_CONFIRM=false → execute automatically
     if (ev.confidence === "high" && SMART_AT.autoExecuteOnTriple) {
-      await sendPrivate(
-        `🤖 <b>SMART AUTOTRADE — EXECUTING</b>\n\n` +
-        `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
-        `Confidence: <b>HIGH — 3/3 signals aligned 🔥</b>\n\n` +
-        `📊 <b>Signals</b>\n${ev.details.join("\n")}\n\n` +
-        `⚡ Executing now...`
-      );
+      console.log(`[SmartAT] HIGH 3/3 ${side} — attempting execution`);
 
       const executed = await smartExecuteAuto(symbol, side, ev.globalScore, ev);
 
@@ -3514,13 +3650,7 @@ async function smartEvaluateAndTrade(nextState) {
 
       // Fully autonomous: execute 2/3 without asking
       if (SMART_AT.autoOnMedium && SMART_AT.autoExecuteOnTriple) {
-        await sendPrivate(
-          `🤖 <b>SMART AUTOTRADE — EXECUTING</b>\n\n` +
-          `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
-          `Confidence: <b>MEDIUM — ${ev.alignedCount}/3 signals</b>\n\n` +
-          `📊 <b>Signals</b>\n${ev.details.join("\n")}\n\n` +
-          `⚡ Executing now (autonomous mode)...`
-        );
+        console.log(`[SmartAT] MEDIUM ${ev.alignedCount}/3 ${side} — attempting execution`);
 
         const executed = await smartExecuteAuto(symbol, side, ev.globalScore, ev);
 
@@ -3545,7 +3675,8 @@ async function smartEvaluateAndTrade(nextState) {
             `☝️ Details of the staged order are in the message above.`
           );
         } else {
-          await sendPrivate(
+          await sendPrivateError(
+            "stage_failed",
             `⚠️ <b>Signal detected but order could not be staged</b>\n\n` +
             `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
             `Confidence: <b>MEDIUM — ${ev.alignedCount}/3</b>\n\n` +
@@ -3561,13 +3692,7 @@ async function smartEvaluateAndTrade(nextState) {
     } else if (ev.confidence === "low") {
 
       if (SMART_AT.autoOnLow && SMART_AT.autoExecuteOnTriple) {
-        await sendPrivate(
-          `🟠 <b>SMART AUTOTRADE — LOW CONFIDENCE</b>\n\n` +
-          `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
-          `Confidence: <b>LOW — only 1/3 signals</b>\n\n` +
-          `📊 <b>Signals</b>\n${ev.details.join("\n")}\n\n` +
-          `⚠️ No cross-confirmation. Executing because AT_AUTO_ON_LOW=true.`
-        );
+        console.log(`[SmartAT] LOW 1/3 ${side} — attempting execution`);
 
         const executed = await smartExecuteAuto(symbol, side, ev.globalScore, ev);
 
@@ -3661,10 +3786,12 @@ async function smartExecuteAuto(symbol, side, score, ev) {
   } catch (err) {
     console.error("[SmartAT] smartExecuteAuto error:", err.message);
 
-    await sendPrivate(
+    await sendPrivateError(
+      "auto_exec_failed",
       `⚠️ <b>Auto-execution FAILED</b>\n\n` +
       `${escapeHTML(err.message)}\n\n` +
-      `No position was opened. Run /privtest to diagnose Binance access.`
+      `No position was opened. Run /privtest to diagnose.\n` +
+      `<i>This alert is muted for 1h to avoid spam.</i>`
     );
 
     return false;
