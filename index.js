@@ -5,6 +5,8 @@ const { Telegraf, Markup } = require("telegraf");
 const Binance = require("node-binance-api");
 const crypto = require("crypto");
 const emotionTrader = require("./emotion-trader");
+const runtime = require("./desk-runtime").createRuntime();
+let latestEvaluation = null;
 
 // ===============================
 // WOJAKMETER BOT — INDEX
@@ -1607,9 +1609,34 @@ function buildRiskStatusMessage() {
 // ===============================
 // AUTOTRADE CORE
 // ===============================
+function entryAllowed(engine) {
+  resetPersonalStateIfNewDay();
+  return runtime.state.ready && !smartAtState.paused && autoTradeActive &&
+    !openPosition && !emotionTrader.getEmoPosition() &&
+    !(engine === "smart" ? emotionTrader.getPending() : pendingConfirm) &&
+    !personalTradingState.coolingDown &&
+    personalTradingState.tradesToday < PERSONAL_PLAN.maxTradesPerDay &&
+    personalTradingState.pnlToday > -Math.abs(PERSONAL_PLAN.maxDailyLoss) &&
+    personalTradingState.pnlToday < PERSONAL_PLAN.dailyProfitLock;
+}
+function entryTask(engine, task) {
+  return runtime.exclusive(() => entryAllowed(engine), task);
+}
+function atExecuteTrade(...args) { return runtime.exclusive(() => entryAllowed("smart") && !pendingConfirm, () => stageSmartTrade(...args)); }
+function atExecuteConfirmed(...args) {
+  const staged = args[5];
+  return runtime.exclusive(() => entryAllowed("smart") && pendingConfirm === staged && staged && Date.now() - staged.ts < 180000, async () => {
+    pendingConfirm = null;
+    await executeConfirmedInternal(...args);
+    return true;
+  });
+}
+function smartExecuteAuto(...args) { return runtime.exclusive(() => entryAllowed("smart") && !pendingConfirm, () => executeAutoInternal(...args)); }
+
 function canOpenTrade() {
   resetPersonalStateIfNewDay();
 
+  if (!entryAllowed("smart")) return false;
   if (!autoTradeActive) return false;
   if (openPosition) return false;
   if (pendingConfirm) return false;
@@ -1622,7 +1649,7 @@ function canOpenTrade() {
   return true;
 }
 
-async function atExecuteTrade(side, symbol, score) {
+async function stageSmartTrade(side, symbol, score) {
   try {
     const safeLeverage = Math.max(
       1,
@@ -1718,7 +1745,7 @@ async function atExecuteTrade(side, symbol, score) {
   }
 }
 
-async function atExecuteConfirmed(symbol, side, qty, price, score, pendingData = null) {
+async function executeConfirmedInternal(symbol, side, qty, price, score, pendingData = null) {
   try {
     const leverage = pendingData?.leverage || AT_LEVERAGE;
     const riskUsd = pendingData?.riskUsd || PERSONAL_PLAN.riskPerTrade;
@@ -1733,6 +1760,10 @@ async function atExecuteConfirmed(symbol, side, qty, price, score, pendingData =
     const order = await atPlaceMarketOrder(symbol, side, qty);
     const fillPrice = parseFloat(order.avgPrice || order.price || price);
 
+    openPosition = {side, symbol, qty, entryPrice: fillPrice, score, leverage, riskUsd,
+      ts: Date.now(), protectionPending: true};
+    lastTradeSignalTs = Date.now();
+    personalTradingState.tradesToday++;
     await sleep(500);
 
     const { slPrice, tpPrice, slOrderId, tpOrderId } =
@@ -1752,7 +1783,7 @@ async function atExecuteConfirmed(symbol, side, qty, price, score, pendingData =
     };
 
     lastTradeSignalTs = Date.now();
-    personalTradingState.tradesToday += 1;
+
 
     const potentialWin = (riskUsd * (TP_PCT / SL_PCT)).toFixed(2);
 
@@ -1773,6 +1804,8 @@ async function atExecuteConfirmed(symbol, side, qty, price, score, pendingData =
       `🌐 wojakmeter.com`
     );
   } catch (err) {
+    smartAtState.paused = true;
+    smartAtState.pauseReason = "Execution interrupted — verify exchange position and protection before resuming";
     console.error("[AutoTrader] executeConfirmed error:", err.message);
 
     await sendPrivate(
@@ -2734,7 +2767,7 @@ async function runChannelBroadcast() {
       lastBroadcastState = nextState;
     }
 
-    await smartEvaluateAndTrade(nextState);
+    // Trading runs on its own serialized scheduler, independently of broadcasts.
   } catch (err) {
     console.error("Broadcast loop error:", err.message);
   }
@@ -2753,11 +2786,8 @@ bot.command("confirmar", async (ctx) => {
   const { side, symbol, qty, price, score } = pendingConfirm;
   const pendingData = pendingConfirm;
 
-  pendingConfirm = null;
-
-  await ctx.reply(`✅ Confirmed. Executing ${side} on ${symbol}...`);
-
-  await atExecuteConfirmed(symbol, side, qty, price, score, pendingData);
+  const accepted = await atExecuteConfirmed(symbol, side, qty, price, score, pendingData);
+  if (!accepted) await ctx.reply("Entry blocked or expired. Check Desk status; no new execution was started.");
 });
 
 bot.command("cancelar", async (ctx) => {
@@ -3462,8 +3492,8 @@ setInterval(async () => {
   }
 }, 90 * 1000);
 
-setInterval(runChannelBroadcast, BROADCAST_INTERVAL_MS);
-setInterval(scanMarketPersonalSignals, MARKET_SCAN_INTERVAL_MS);
+setInterval(() => { if (runtime.state.ready) runChannelBroadcast(); }, BROADCAST_INTERVAL_MS);
+setInterval(() => { if (runtime.state.ready) scanMarketPersonalSignals(); }, MARKET_SCAN_INTERVAL_MS);
 
 // ===============================
 // SMART AUTOTRADE ENGINE
@@ -3471,7 +3501,7 @@ setInterval(scanMarketPersonalSignals, MARKET_SCAN_INTERVAL_MS);
 // ===============================
 
 const SMART_AT = {
-  autoExecuteOnTriple:  process.env.AUTO_TRADE_CONFIRM !== "true",
+  autoExecuteOnTriple:  !AUTO_TRADE_CONFIRM,
   globalLong:           Number(process.env.AUTO_TRADE_SCORE_LONG        || 65),
   globalShort:          Number(process.env.AUTO_TRADE_SCORE_SHORT       || 35),
   btcMomentumThreshold: Number(process.env.AT_BTC_MOMENTUM_PCT          || 1.0),
@@ -3506,8 +3536,8 @@ async function evaluateSmartSignals() {
     globalSignal:     null,
     btcSignal:        null,
     confluenceSignal: null,
-    globalScore:      50,
-    btcChange1h:      0,
+    globalScore:      null,
+    btcChange1h:      null,
     confluenceCount:  0,
     alignedCount:     0,
     direction:        null,
@@ -3518,7 +3548,8 @@ async function evaluateSmartSignals() {
   try {
     // ── Signal 1: Global Market Score ──
     const global    = await getGlobal();
-    const change24h = safe(global?.data?.market_cap_change_percentage_24h_usd);
+    const change24h = global?.data?.market_cap_change_percentage_24h_usd;
+    if (typeof change24h !== "number" || !Number.isFinite(change24h)) throw new Error("Global market data unavailable");
     result.globalScore = scoreFromChange(change24h);
 
     if (result.globalScore >= SMART_AT.globalLong) {
@@ -3535,7 +3566,7 @@ async function evaluateSmartSignals() {
     const markets = await getMarkets();
     const btc = markets.find(c => (c.symbol || "").toLowerCase() === "btc");
 
-    if (btc) {
+    if (btc && Number.isFinite(btc.price_change_percentage_1h_in_currency) && Number.isFinite(btc.price_change_percentage_24h)) {
       const btc1h  = safe(btc.price_change_percentage_1h_in_currency, 0);
       const btc24h = safe(btc.price_change_percentage_24h, 0);
       result.btcChange1h = btc1h;
@@ -3551,7 +3582,7 @@ async function evaluateSmartSignals() {
         result.details.push(`⚪ BTC 1h ${btc1h.toFixed(2)}% — no clear momentum`);
       }
     } else {
-      result.details.push(`⚪ BTC data unavailable`);
+      throw new Error("BTC momentum data unavailable");
     }
 
     // ── Signal 3: Scanner Confluence ──
@@ -3604,6 +3635,7 @@ async function evaluateSmartSignals() {
     }
 
   } catch (err) {
+    result.error = err.message; result.direction = null; result.confidence = "none";
     console.error("[SmartAT] evaluateSmartSignals error:", err.message);
     result.details.push(`❌ Error: ${err.message}`);
   }
@@ -3611,7 +3643,7 @@ async function evaluateSmartSignals() {
   return result;
 }
 
-async function smartEvaluateAndTrade(nextState) {
+async function smartEvaluateAndTrade(ev) {
   try {
     if (!autoTradeActive || !canOpenTrade()) return;
     if (smartAtState.paused) {
@@ -3620,7 +3652,7 @@ async function smartEvaluateAndTrade(nextState) {
     }
     if (Date.now() - smartAtState.lastExecutionTs < SMART_AT.cooldownMs) return;
 
-    const ev = await evaluateSmartSignals();
+    if (!ev || ev.error || !ev.direction) return;
 
     console.log(
       `[SmartAT] Score:${ev.globalScore} BTC:${ev.btcSignal} ` +
@@ -3646,7 +3678,7 @@ async function smartEvaluateAndTrade(nextState) {
       }
 
     // MEDIUM confidence (2/3)
-    } else if (ev.confidence === "medium") {
+    } else if (ev.confidence === "medium" || ev.confidence === "high") {
 
       // Fully autonomous: execute 2/3 without asking
       if (SMART_AT.autoOnMedium && SMART_AT.autoExecuteOnTriple) {
@@ -3722,7 +3754,7 @@ async function smartEvaluateAndTrade(nextState) {
   }
 }
 
-async function smartExecuteAuto(symbol, side, score, ev) {
+async function executeAutoInternal(symbol, side, score, ev) {
   try {
     const leverage = AT_LEVERAGE;
     const riskUsd  = PERSONAL_PLAN.riskPerTrade;
@@ -3748,6 +3780,10 @@ async function smartExecuteAuto(symbol, side, score, ev) {
 
     const order     = await atPlaceMarketOrder(symbol, side, qty);
     const fillPrice = parseFloat(order.avgPrice || order.price || markPrice);
+    openPosition = {side, symbol, qty, entryPrice: fillPrice, score, leverage, riskUsd,
+      ts: Date.now(), protectionPending: true};
+    lastTradeSignalTs = Date.now();
+    personalTradingState.tradesToday++;
     await sleep(500);
 
     const { slPrice, tpPrice, slOrderId, tpOrderId } =
@@ -3761,7 +3797,7 @@ async function smartExecuteAuto(symbol, side, score, ev) {
     };
 
     lastTradeSignalTs = Date.now();
-    personalTradingState.tradesToday++;
+
 
     const potentialWin = (riskUsd * (TP_PCT / SL_PCT)).toFixed(2);
 
@@ -3784,13 +3820,15 @@ async function smartExecuteAuto(symbol, side, score, ev) {
     return true;
 
   } catch (err) {
+    smartAtState.paused = true;
+    smartAtState.pauseReason = "Execution interrupted — verify exchange position and protection before resuming";
     console.error("[SmartAT] smartExecuteAuto error:", err.message);
 
     await sendPrivateError(
       "auto_exec_failed",
       `⚠️ <b>Auto-execution FAILED</b>\n\n` +
       `${escapeHTML(err.message)}\n\n` +
-      `No position was opened. Run /privtest to diagnose.\n` +
+      `Execution state must be verified on Binance. An entry may exist without complete protection. Further entries are paused.\n` +
       `<i>This alert is muted for 1h to avoid spam.</i>`
     );
 
@@ -4012,7 +4050,7 @@ async function rebuildDailyStateFromBinance() {
       15000
     );
 
-    if (!Array.isArray(rows)) return;
+    if (!Array.isArray(rows)) throw new Error("Invalid account income response");
 
     const realized = rows.reduce((sum, r) => sum + safe(r.income), 0);
 
@@ -4057,12 +4095,14 @@ async function rebuildDailyStateFromBinance() {
     }
   } catch (err) {
     console.error("[Reconcile] daily state rebuild failed:", err.message);
+    throw err;
   }
 }
 
 async function reconcileStateOnBoot() {
   try {
     const positions = await atGetOpenPositions();
+    if (positions.length > 1) throw new Error("Multiple exchange positions found; reconcile them before starting the single-position engine");
 
     if (!positions.length) {
       console.log("[Reconcile] No open positions on Binance. Clean start.");
@@ -4141,10 +4181,11 @@ async function reconcileStateOnBoot() {
     );
   } catch (err) {
     console.error("[Reconcile] error:", err.message);
+    throw err;
   }
 }
 
-setInterval(monitorOpenPosition, POSITION_MONITOR_MS);
+setInterval(() => { if (runtime.state.ready) monitorOpenPosition(); }, POSITION_MONITOR_MS);
 
 // ===============================
 // HEALTHCHECK
@@ -4169,7 +4210,9 @@ app.listen(PORT, "0.0.0.0", () => {
 // ===============================
 // EMOTION TRADER START
 // ===============================
-emotionTrader.start({
+function startEmotionEngine() { emotionTrader.start({
+  entryTask,
+  pauseEntries: () => { smartAtState.paused = true; smartAtState.pauseReason = "Emotion execution interrupted — verify exchange protection"; },
   bot,
   PERSONAL_PLAN,
   personalTradingState,
@@ -4178,7 +4221,7 @@ emotionTrader.start({
   binanceApiKey: BINANCE_API_KEY,
   binanceApiSecret: BINANCE_API_SECRET,
   useTestnet: USE_TESTNET
-});
+}); }
 
 // ===============================
 // DESK API
@@ -4193,9 +4236,11 @@ deskApi.mount(app, {
     personalTradingState,
     smartAtState,
     PERSONAL_PLAN,
-    SMART_AT
+    SMART_AT,
+    runtime: runtime.state,
+    emotion: { position: emotionTrader.getEmoPosition(), pending: emotionTrader.getPending(), transitions: emotionTrader.getHistory().slice(-8) }
   }),
-  evaluateSmartSignals,
+  evaluateSmartSignals: async () => latestEvaluation || {details:["Waiting for first evaluation"], confidence:"none"},
   closePosition: atCloseTrackedPosition,
   setPaused: (v, reason) => {
     smartAtState.paused = v;
@@ -4222,39 +4267,31 @@ deskApi.mount(app, {
 
     console.log("Webhook deleted. Starting polling...");
 
-    await bot.launch({
-      dropPendingUpdates: true
+    await warmUpCache();
+    try {
+      await rebuildDailyStateFromBinance();
+      await reconcileStateOnBoot();
+      runtime.state.ready = true;
+    } catch (err) {
+      runtime.state.bootError = "Account recovery failed: " + err.message;
+      console.error(runtime.state.bootError);
+    }
+    startEmotionEngine();
+    runtime.start(async () => {
+      await runtime.refreshContext();
+      latestEvaluation = await evaluateSmartSignals();
+      latestEvaluation.ts = Date.now();
+      await smartEvaluateAndTrade(latestEvaluation);
     });
+    // launch() owns the long-polling loop; all initialization must precede it.
+    await bot.launch({dropPendingUpdates: true});
 
-    console.log("✅ WojakMeter bot running with polling...");
-    console.log(
-      `[Config] AutoTrade LONG>=${SCORE_LONG_MIN} SHORT<=${SCORE_SHORT_MAX} | Leverage=${AT_LEVERAGE}x | SL=${SL_PCT}% TP=${TP_PCT}% | Risk/trade=$${PERSONAL_PLAN.riskPerTrade}`
-    );
-
-    await warmUpCache().catch((err) => {
-      console.error("WarmUp error:", err.message);
-    });
-
-    // Recover real state from Binance before doing anything else
-    await rebuildDailyStateFromBinance().catch((err) => {
-      console.error("Daily state rebuild error:", err.message);
-    });
-
-    await reconcileStateOnBoot().catch((err) => {
-      console.error("Reconcile error:", err.message);
-    });
-
-    await runChannelBroadcast().catch((err) => {
-      console.error("Initial broadcast error:", err.message);
-    });
-
-    await scanMarketPersonalSignals().catch((err) => {
-      console.error("Initial scan error:", err.message);
-    });
   } catch (err) {
-    console.error("❌ BOT LAUNCH FAILED:", err);
+    runtime.state.ready = false;
+    runtime.state.bootError = err.message;
+    console.error("❌ BOT LAUNCH FAILED:", err.message);
   }
 })();
 
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+process.once("SIGINT", () => { runtime.stop(); bot.stop("SIGINT"); });
+process.once("SIGTERM", () => { runtime.stop(); bot.stop("SIGTERM"); });

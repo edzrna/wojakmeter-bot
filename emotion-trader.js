@@ -857,7 +857,10 @@ async function atCancelOrder(symbol, orderId) {
 // ===============================
 // EXECUTE EMOTION TRADE — CONFIRMATION REQUIRED
 // ===============================
-async function executeEmoTrade(symbol, side, leverage, rule, data) {
+function executeEmoTrade(...args) {
+  return _config?.entryTask ? _config.entryTask("emotion", () => stageEmotionInternal(...args)) : false;
+}
+async function stageEmotionInternal(symbol, side, leverage, rule, data) {
   try {
     if (!_config?.PERSONAL_PLAN) return;
 
@@ -993,7 +996,10 @@ async function executeEmoTrade(symbol, side, leverage, rule, data) {
   }
 }
 
-async function confirmEmoTrade() {
+function confirmEmoTrade() {
+  return _config?.entryTask ? _config.entryTask("emotion", confirmEmotionInternal) : false;
+}
+async function confirmEmotionInternal() {
   if (!_pendingEmoTrade) return;
 
   const {
@@ -1021,6 +1027,8 @@ async function confirmEmoTrade() {
     const order = await atPlaceMarketOrder(symbol, side, qty);
     const fillPrice = parseFloat(order.avgPrice || order.price || price);
 
+    emoPosition = {symbol, side, qty, entryPrice: fillPrice, leverage, rule, riskUsd, slPct, tpPct, ts:Date.now(), protectionPending:true};
+    if (_config?.personalTradingState) _config.personalTradingState.tradesToday += 1;
     await sleep(500);
 
     const { slPrice, tpPrice, slOrderId, tpOrderId } =
@@ -1043,9 +1051,7 @@ async function confirmEmoTrade() {
 
     lastSignalTs = Date.now();
 
-    if (_config?.personalTradingState) {
-      _config.personalTradingState.tradesToday += 1;
-    }
+
 
     const potentialWin = (riskUsd * (tpPct / slPct)).toFixed(2);
 
@@ -1065,6 +1071,7 @@ async function confirmEmoTrade() {
         `🌐 wojakmeter.com`
     );
   } catch (err) {
+    _config?.pauseEntries?.();
     console.error("[EmoTrader] confirmEmoTrade:", err.message);
 
     await sendPrivate(
@@ -1348,6 +1355,7 @@ module.exports = {
   handleEmoCerrar,
 
   getEmoPosition: () => emoPosition,
+  getPending: () => _pendingEmoTrade,
 
   getPairState: () => Object.fromEntries(pairState),
 

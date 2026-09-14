@@ -134,6 +134,29 @@ function mount(app, deps) {
     res.json({
       ok: true,
       ts: Date.now(),
+      engine: {
+        ready: Boolean(s.runtime?.ready),
+        bootError: s.runtime?.bootError || null,
+        evaluating: Boolean(s.runtime?.evaluating),
+        lastEvaluation: s.runtime?.lastEvaluation || null,
+        executionBusy: Boolean(s.runtime?.executionBusy),
+        mode: s.SMART_AT?.autoExecuteOnTriple ? "Automatic" : "Confirmation required",
+        blockers: [
+          !s.runtime?.ready && "Account recovery is not complete",
+          !s.autoTradeActive && "AutoTrade is OFF — enable it in the owner Telegram controls",
+          s.smartAtState?.paused && (s.smartAtState.pauseReason || "Paused"),
+          (s.openPosition || s.emotion?.position) && "Position already open",
+          (s.pendingConfirm || s.emotion?.pending) && "Waiting for Telegram confirmation",
+          s.personalTradingState?.coolingDown && "Daily risk lock",
+          s.personalTradingState?.tradesToday >= s.PERSONAL_PLAN?.maxTradesPerDay && "Daily trade limit reached",
+          s.personalTradingState?.pnlToday <= -Math.abs(s.PERSONAL_PLAN?.maxDailyLoss) && "Daily loss limit reached",
+          s.personalTradingState?.pnlToday >= s.PERSONAL_PLAN?.dailyProfitLock && "Daily profit lock reached",
+          Date.now() - (s.smartAtState?.lastExecutionTs || 0) < (s.SMART_AT?.cooldownMs || 0) && "Execution cooldown"
+        ].filter(Boolean)
+      },
+      market: s.runtime?.context && Date.now() - s.runtime.context.ts <= 1800000 ? s.runtime.context : null,
+      marketError: s.runtime?.contextError || null,
+      emotionEngine: { mode: "Confirmation required", position: s.emotion?.position ? {symbol:s.emotion.position.symbol, side:s.emotion.position.side} : null, pending: s.emotion?.pending ? {symbol:s.emotion.pending.symbol, side:s.emotion.pending.side} : null, transitions:s.emotion?.transitions || [] },
       autoTrade: {
         active: s.autoTradeActive,
         paused: s.smartAtState?.paused || false,
@@ -149,6 +172,8 @@ function mount(app, deps) {
             entryPrice: s.openPosition.entryPrice,
             qty: s.openPosition.qty,
             leverage: s.openPosition.leverage,
+            riskUsd: s.openPosition.riskUsd,
+            protectionPending: Boolean(s.openPosition.protectionPending),
             markPrice,
             livePnl,
             openedAt: s.openPosition.ts
@@ -175,6 +200,8 @@ function mount(app, deps) {
 
     res.json({
       ok: true,
+      ts: ev.ts || null,
+      error: ev.error || null,
       direction: ev.direction,
       confidence: ev.confidence,
       aligned: ev.alignedCount,
