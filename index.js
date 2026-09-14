@@ -4181,6 +4181,31 @@ emotionTrader.start({
 });
 
 // ===============================
+// DESK API
+// ===============================
+const deskApi = require("./desk-api");
+
+deskApi.mount(app, {
+  getState: () => ({
+    autoTradeActive,
+    openPosition,
+    pendingConfirm,
+    personalTradingState,
+    smartAtState,
+    PERSONAL_PLAN,
+    SMART_AT
+  }),
+  evaluateSmartSignals,
+  closePosition: atCloseTrackedPosition,
+  setPaused: (v, reason) => {
+    smartAtState.paused = v;
+    smartAtState.pauseReason = reason;
+  },
+  getMarkPrice: atGetMarkPrice,
+  getOpenPositions: atGetOpenPositions
+});
+
+// ===============================
 // BOT START
 // ===============================
 (async () => {
