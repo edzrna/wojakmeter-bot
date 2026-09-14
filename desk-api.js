@@ -1,0 +1,237 @@
+// ===============================
+// WOJAKMETER — DESK API (bot side)
+// Drop this file next to index.js on Railway.
+//
+// Exposes a small authenticated surface that the Vercel site
+// proxies to. Every request must carry a fresh HMAC signature,
+// so even if the URL leaks, nobody can call it.
+//
+// Wire it up in index.js with:
+//
+//   const deskApi = require("./desk-api");
+//   deskApi.mount(app, {
+//     getState: () => ({
+//       autoTradeActive, openPosition, pendingConfirm,
+//       personalTradingState, smartAtState,
+//       PERSONAL_PLAN, SMART_AT
+//     }),
+//     evaluateSmartSignals,
+//     closePosition: atCloseTrackedPosition,
+//     setPaused: (v, reason) => {
+//       smartAtState.paused = v;
+//       smartAtState.pauseReason = reason;
+//     },
+//     getMarkPrice: atGetMarkPrice,
+//     getOpenPositions: atGetOpenPositions
+//   });
+// ===============================
+
+const crypto = require("crypto");
+
+// Requests older than this are rejected, so a captured request
+// cannot be replayed hours later.
+const MAX_SKEW_MS = 5 * 60 * 1000;
+
+function sign(message, secret) {
+  return crypto.createHmac("sha256", secret).update(message).digest("hex");
+}
+
+function safeEqual(a, b) {
+  const bufA = Buffer.from(String(a));
+  const bufB = Buffer.from(String(b));
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function verify(req) {
+  const secret = process.env.BOT_API_SECRET;
+
+  if (!secret) {
+    return { ok: false, error: "BOT_API_SECRET not set on the bot" };
+  }
+
+  const ts = req.headers["x-wm-timestamp"];
+  const signature = req.headers["x-wm-signature"];
+
+  if (!ts || !signature) {
+    return { ok: false, error: "Missing signature headers" };
+  }
+
+  const age = Math.abs(Date.now() - Number(ts));
+
+  if (!Number.isFinite(age) || age > MAX_SKEW_MS) {
+    return { ok: false, error: "Signature expired" };
+  }
+
+  const body = req.method === "POST" ? JSON.stringify(req.body || {}) : "";
+  const payload = `${ts}.${req.path}.${body}`;
+
+  if (!safeEqual(signature, sign(payload, secret))) {
+    return { ok: false, error: "Invalid signature" };
+  }
+
+  return { ok: true };
+}
+
+function guard(handler) {
+  return async (req, res) => {
+    const check = verify(req);
+
+    if (!check.ok) {
+      console.warn(`[DeskAPI] rejected ${req.path}: ${check.error}`);
+      return res.status(401).json({ ok: false, error: check.error });
+    }
+
+    try {
+      await handler(req, res);
+    } catch (err) {
+      console.error(`[DeskAPI] ${req.path} error:`, err.message);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  };
+}
+
+// Rolling log of closed trades, kept in memory
+const tradeHistory = [];
+const MAX_HISTORY = 50;
+
+function recordTrade(entry) {
+  tradeHistory.unshift({ ...entry, ts: entry.ts || Date.now() });
+  if (tradeHistory.length > MAX_HISTORY) tradeHistory.pop();
+}
+
+function mount(app, deps) {
+  const {
+    getState,
+    evaluateSmartSignals,
+    closePosition,
+    setPaused,
+    getMarkPrice,
+    getOpenPositions
+  } = deps;
+
+  // ── STATUS: everything the desk needs for one render ──
+  app.get("/desk/status", guard(async (req, res) => {
+    const s = getState();
+
+    let livePnl = null;
+    let markPrice = null;
+
+    // If a position is open, price it right now so the Wojak
+    // on screen reflects the actual unrealized PnL.
+    if (s.openPosition) {
+      try {
+        markPrice = await getMarkPrice(s.openPosition.symbol);
+
+        const diff = s.openPosition.side === "BUY"
+          ? markPrice - s.openPosition.entryPrice
+          : s.openPosition.entryPrice - markPrice;
+
+        livePnl = parseFloat((diff * s.openPosition.qty).toFixed(2));
+      } catch (_) {}
+    }
+
+    res.json({
+      ok: true,
+      ts: Date.now(),
+      autoTrade: {
+        active: s.autoTradeActive,
+        paused: s.smartAtState?.paused || false,
+        pauseReason: s.smartAtState?.pauseReason || null,
+        consecutiveLosses: s.smartAtState?.consecutiveLosses || 0,
+        maxConsecutiveLosses: s.SMART_AT?.maxConsecutiveLosses || 2,
+        totalTrades: s.smartAtState?.totalAutoTrades || 0
+      },
+      position: s.openPosition
+        ? {
+            symbol: s.openPosition.symbol,
+            side: s.openPosition.side,
+            entryPrice: s.openPosition.entryPrice,
+            qty: s.openPosition.qty,
+            leverage: s.openPosition.leverage,
+            markPrice,
+            livePnl,
+            openedAt: s.openPosition.ts
+          }
+        : null,
+      pending: s.pendingConfirm
+        ? { symbol: s.pendingConfirm.symbol, side: s.pendingConfirm.side }
+        : null,
+      day: {
+        trades: s.personalTradingState?.tradesToday || 0,
+        maxTrades: s.PERSONAL_PLAN?.maxTradesPerDay || 0,
+        pnl: s.personalTradingState?.pnlToday || 0,
+        coolingDown: s.personalTradingState?.coolingDown || false,
+        balance: s.PERSONAL_PLAN?.balance || 0,
+        maxDailyLoss: s.PERSONAL_PLAN?.maxDailyLoss || 0,
+        profitLock: s.PERSONAL_PLAN?.dailyProfitLock || 0
+      }
+    });
+  }));
+
+  // ── SIGNALS: the live 3-way read ──
+  app.get("/desk/signals", guard(async (req, res) => {
+    const ev = await evaluateSmartSignals();
+
+    res.json({
+      ok: true,
+      direction: ev.direction,
+      confidence: ev.confidence,
+      aligned: ev.alignedCount,
+      conflict: ev.conflict || false,
+      globalScore: ev.globalScore,
+      btcChange1h: ev.btcChange1h,
+      confluenceCount: ev.confluenceCount,
+      details: ev.details
+    });
+  }));
+
+  // ── POSITIONS: raw from Binance ──
+  app.get("/desk/positions", guard(async (req, res) => {
+    const positions = await getOpenPositions();
+
+    res.json({
+      ok: true,
+      positions: positions.map((p) => ({
+        symbol: p.symbol,
+        side: Number(p.positionAmt) > 0 ? "LONG" : "SHORT",
+        qty: Math.abs(Number(p.positionAmt)),
+        entryPrice: Number(p.entryPrice),
+        markPrice: Number(p.markPrice),
+        unrealizedPnl: Number(p.unRealizedProfit),
+        leverage: Number(p.leverage)
+      }))
+    });
+  }));
+
+  // ── HISTORY ──
+  app.get("/desk/history", guard(async (req, res) => {
+    res.json({ ok: true, trades: tradeHistory });
+  }));
+
+  // ── CONTROLS ──
+  app.post("/desk/pause", guard(async (req, res) => {
+    setPaused(true, "Paused from desk");
+    res.json({ ok: true, paused: true });
+  }));
+
+  app.post("/desk/resume", guard(async (req, res) => {
+    setPaused(false, null);
+    res.json({ ok: true, paused: false });
+  }));
+
+  app.post("/desk/close", guard(async (req, res) => {
+    const s = getState();
+
+    if (!s.openPosition) {
+      return res.status(400).json({ ok: false, error: "No open position" });
+    }
+
+    await closePosition("Closed from desk");
+    res.json({ ok: true });
+  }));
+
+  console.log("[DeskAPI] mounted — /desk/* endpoints are live and signed");
+}
+
+module.exports = { mount, recordTrade, tradeHistory };
