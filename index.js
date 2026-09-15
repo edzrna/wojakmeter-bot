@@ -1611,7 +1611,7 @@ function buildRiskStatusMessage() {
 // ===============================
 function entryAllowed(engine) {
   resetPersonalStateIfNewDay();
-  return runtime.state.ready && !smartAtState.paused && autoTradeActive &&
+  return runtime.state.ready && !runtime.state.recovering && !smartAtState.paused && autoTradeActive &&
     !openPosition && !emotionTrader.getEmoPosition() &&
     !(engine === "smart" ? emotionTrader.getPending() : pendingConfirm) &&
     !personalTradingState.coolingDown &&
@@ -4228,7 +4228,46 @@ function startEmotionEngine() { emotionTrader.start({
 // ===============================
 const deskApi = require("./desk-api");
 
+const {createAccountReader, createRecovery} = require("./desk-account");
+const readDeskAccount = createAccountReader(atGetFuturesAccount);
+const deskRecovery = createRecovery({
+  state: runtime.state,
+  isBusy: () => runtime.state.executionBusy || runtime.state.evaluating,
+  pause: () => {
+    smartAtState.paused = true;
+    smartAtState.pauseReason = "Account recovery requested — review results before resuming";
+  },
+  read: async () => {
+    if (openPosition || emotionTrader.getEmoPosition() || pendingConfirm || emotionTrader.getPending()) {
+      throw new Error("A position or confirmation is tracked. Recovery left entries paused; review it before retrying.");
+    }
+    const since = new Date(); since.setHours(0,0,0,0);
+    async function checked(label, task) {
+      try { return await task(); } catch (err) { throw new Error(label + ": " + err.message); }
+    }
+    const [account, positions, income, fees] = await Promise.all([
+      checked("Account", atGetFuturesAccount),
+      checked("Positions", atGetOpenPositions),
+      checked("Income history", () => signedBinanceFuturesRequest("/fapi/v1/income", {incomeType:"REALIZED_PNL", startTime:String(since.getTime()), limit:"500"})),
+      checked("Commission history", () => signedBinanceFuturesRequest("/fapi/v1/income", {incomeType:"COMMISSION", startTime:String(since.getTime()), limit:"500"}))
+    ]);
+    if (!account || !Number.isFinite(Number(account.totalWalletBalance))) throw new Error("Invalid account response");
+    if (!Array.isArray(positions) || positions.length) throw new Error("Exchange positions require manual reconciliation; no orders were changed.");
+    if (![income, fees].every(rows => Array.isArray(rows) && rows.length < 500 && rows.every(r => r.income != null && Number.isFinite(Number(r.income))))) throw new Error("Incomplete or invalid income history");
+    return {pnl: [...income,...fees].reduce((sum,r) => sum + Number(r.income),0), count:income.length};
+  },
+  apply: ({pnl,count}) => {
+    resetPersonalStateIfNewDay();
+    personalTradingState.pnlToday = pnl;
+    // Never lower a known entry count using the legacy income-record estimate.
+    personalTradingState.tradesToday = Math.max(personalTradingState.tradesToday, count);
+    personalTradingState.coolingDown = personalTradingState.coolingDown || pnl <= -Math.abs(PERSONAL_PLAN.maxDailyLoss) || pnl >= PERSONAL_PLAN.dailyProfitLock;
+  }
+});
+
 deskApi.mount(app, {
+  readAccount: readDeskAccount,
+  recoverAccount: () => deskRecovery.start(),
   getState: () => ({
     autoTradeActive,
     openPosition,
@@ -4243,6 +4282,7 @@ deskApi.mount(app, {
   evaluateSmartSignals: async () => latestEvaluation || {details:["Waiting for first evaluation"], confidence:"none"},
   closePosition: atCloseTrackedPosition,
   setPaused: (v, reason) => {
+    if (!v && runtime.state.recovering) throw new Error("Account recovery is still running");
     smartAtState.paused = v;
     smartAtState.pauseReason = reason;
   },

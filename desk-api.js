@@ -113,6 +113,7 @@ function mount(app, deps) {
   // ── STATUS: everything the desk needs for one render ──
   app.get("/desk/status", guard(async (req, res) => {
     const s = getState();
+    const account = await deps.readAccount();
 
     let livePnl = null;
     let markPrice = null;
@@ -134,7 +135,11 @@ function mount(app, deps) {
     res.json({
       ok: true,
       ts: Date.now(),
+      account,
       engine: {
+        recovering: Boolean(s.runtime?.recovering),
+        recoveryError: s.runtime?.recoveryError || null,
+        recoveredAt: s.runtime?.recoveredAt || null,
         ready: Boolean(s.runtime?.ready),
         bootError: s.runtime?.bootError || null,
         evaluating: Boolean(s.runtime?.evaluating),
@@ -187,7 +192,7 @@ function mount(app, deps) {
         maxTrades: s.PERSONAL_PLAN?.maxTradesPerDay || 0,
         pnl: s.personalTradingState?.pnlToday || 0,
         coolingDown: s.personalTradingState?.coolingDown || false,
-        balance: s.PERSONAL_PLAN?.balance || 0,
+        balance: account.ok ? account.walletBalance : null,
         maxDailyLoss: s.PERSONAL_PLAN?.maxDailyLoss || 0,
         profitLock: s.PERSONAL_PLAN?.dailyProfitLock || 0
       }
@@ -234,6 +239,11 @@ function mount(app, deps) {
   // ── HISTORY ──
   app.get("/desk/history", guard(async (req, res) => {
     res.json({ ok: true, trades: tradeHistory });
+  }));
+
+  app.post("/desk/recover", guard(async (req, res) => {
+    if (!deps.recoverAccount()) return res.status(409).json({ok:false, error:"Engine is busy. Retry when the current cycle finishes."});
+    res.status(202).json({ok:true, recovering:true});
   }));
 
   // ── CONTROLS ──
