@@ -412,25 +412,7 @@ async function fetchCoinGeckoFallback() {
       "https://api.coingecko.com/api/v3/coins/markets" +
       "?vs_currency=usd&order=market_cap_desc&per_page=250&page=1&sparkline=false&price_change_percentage=24h";
 
-    const headers = {
-      "User-Agent": "WojakMeterBot/4.0",
-      Accept: "application/json"
-    };
-
-    if (process.env.COINGECKO_API_KEY) {
-      headers["x-cg-demo-api-key"] = process.env.COINGECKO_API_KEY;
-    }
-
-    const res = await fetch(url, {
-      headers,
-      signal: AbortSignal.timeout(15000)
-    });
-
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`);
-    }
-
-    const coins = await res.json();
+    const coins = await require("./market-http").getMarketJSON(url);
 
     if (!Array.isArray(coins)) return;
 

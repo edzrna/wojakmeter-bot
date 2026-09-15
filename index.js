@@ -1088,73 +1088,12 @@ function buildMainKeyboard() {
 // ===============================
 // FETCH + COINGECKO
 // ===============================
-async function fetchJSON(url, options = {}) {
-  const maxRetries = options.maxRetries ?? 3;
-  const timeoutMs = options.timeoutMs ?? 15000;
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), timeoutMs);
-
-    try {
-      const headers = {
-        Accept: "application/json",
-        "User-Agent": "WojakMeterBot/1.0"
-      };
-
-      if (process.env.COINGECKO_API_KEY) {
-        headers["x-cg-demo-api-key"] = process.env.COINGECKO_API_KEY;
-      }
-
-      const res = await fetch(url, {
-        method: "GET",
-        headers,
-        signal: controller.signal
-      });
-
-      clearTimeout(t);
-
-      if (res.status === 429) {
-        if (attempt < maxRetries) {
-          await sleep(1500 * attempt);
-          continue;
-        }
-
-        const err = new Error("Request failed: 429");
-        err.status = 429;
-        throw err;
-      }
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        const err = new Error(`Request failed: ${res.status} ${text}`.trim());
-        err.status = res.status;
-        throw err;
-      }
-
-      return await res.json();
-    } catch (err) {
-      clearTimeout(t);
-
-      const isLast = attempt === maxRetries;
-      const isTimeout = err.name === "AbortError";
-
-      if (!isLast && (isTimeout || err.status === 429)) {
-        await sleep(1000 * attempt);
-        continue;
-      }
-
-      throw err;
-    }
-  }
-}
+const {getMarketJSON: fetchJSON} = require("./market-http");
 
 async function getMarkets(force = false) {
   const now = Date.now();
 
-  if (!force && cache.markets.data && now - cache.markets.ts < MARKET_CACHE_TTL) {
-    return cache.markets.data;
-  }
+  // Freshness and concurrent requests are managed by market-http.
 
   const url =
     `${API_BASE}/coins/markets?vs_currency=${VS_CURRENCY}` +
@@ -1176,9 +1115,7 @@ async function getMarkets(force = false) {
 async function getTrending(force = false) {
   const now = Date.now();
 
-  if (!force && cache.trending.data && now - cache.trending.ts < TRENDING_CACHE_TTL) {
-    return cache.trending.data;
-  }
+  // Freshness and concurrent requests are managed by market-http.
 
   const data = await fetchJSON(`${API_BASE}/search/trending`, {
     maxRetries: 3,
@@ -1196,9 +1133,7 @@ async function getTrending(force = false) {
 async function getGlobal(force = false) {
   const now = Date.now();
 
-  if (!force && cache.global.data && now - cache.global.ts < GLOBAL_CACHE_TTL) {
-    return cache.global.data;
-  }
+  // Freshness and concurrent requests are managed by market-http.
 
   const data = await fetchJSON(`${API_BASE}/global`, {
     maxRetries: 3,
@@ -3471,22 +3406,24 @@ process.on("uncaughtException", (err) => {
 // ===============================
 async function warmUpCache() {
   try {
-    await Promise.allSettled([getMarkets(), getTrending(), getGlobal()]);
-    console.log("Cache warmed.");
+    const results = await Promise.allSettled([getMarkets(), getTrending(), getGlobal()]);
+    logCacheResults("Warmup", results);
   } catch (err) {
     console.error("Warm cache failed:", err.message);
   }
 }
 
+function logCacheResults(label, results) {
+  const failed = results.filter(r => r.status === "rejected");
+  if (failed.length) console.warn(`[MarketData] ${label}: ${failed.length} failed`, failed.map(r => r.reason.message).join(" | "));
+  else console.log(`[MarketData] ${label}: all data available`);
+}
 setInterval(async () => {
   try {
-    await Promise.allSettled([
-      getMarkets(true),
-      getTrending(true),
-      getGlobal(true)
+    const results = await Promise.allSettled([
+      getMarkets(), getTrending(), getGlobal()
     ]);
-
-    console.log("Background cache refresh OK");
+    logCacheResults("Refresh", results);
   } catch (err) {
     console.error("Background cache refresh failed:", err.message);
   }
