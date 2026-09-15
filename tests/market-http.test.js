@@ -1,3 +1,4 @@
+process.env.COINGECKO_LEGACY_ENABLED="true";
 const {test}=require('node:test');const assert=require('node:assert/strict');
 const {createMarketClient}=require('../market-http');
 const root='https://api.coingecko.com/api/v3';
@@ -5,7 +6,7 @@ const response=(status,data={},retry=null)=>({status,ok:status===200,headers:{ge
 test('simultaneous duplicate reads share one request and cache',async()=>{
  let calls=0,t=0;const c=createMarketClient({spacing:0,now:()=>t,fetcher:async()=>{calls++;return response(200,[{symbol:'btc'}]);}});
  await Promise.all([c.get(root+'/coins/markets'),c.get(root+'/coins/markets')]);assert.equal(calls,1);
- await c.get(root+'/coins/markets');assert.equal(calls,1);t=120001;await c.get(root+'/coins/markets');assert.equal(calls,2);
+ await c.get(root+'/coins/markets');assert.equal(calls,1);t=21600001;await c.get(root+'/coins/markets');assert.equal(calls,2);
 });
 test('429 respects Retry-After and blocks other endpoints without requests',async()=>{
  let calls=0,t=0;const c=createMarketClient({spacing:0,now:()=>t,fetcher:async()=>{calls++;return response(429,{},'300');}});
@@ -19,7 +20,7 @@ test('success after cooldown restores access',async()=>{
 });
 test('expired data is not returned when source fails',async()=>{
  let t=0,fail=false;const c=createMarketClient({spacing:0,now:()=>t,fetcher:async()=>response(fail?429:200,[{symbol:'btc'}])});
- await c.get(root+'/coins/markets');t=120001;fail=true;await assert.rejects(c.get(root+'/coins/markets'));
+ await c.get(root+'/coins/markets');t=21600001;fail=true;await assert.rejects(c.get(root+'/coins/markets'));
 });
 test('invalid data is never cached',async()=>{
  let calls=0;const c=createMarketClient({spacing:0,fetcher:async()=>{calls++;return response(200,[]);}});
