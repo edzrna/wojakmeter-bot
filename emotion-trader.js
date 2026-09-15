@@ -227,21 +227,13 @@ function pushPrice(symbol, price) {
 }
 
 function calcPct(symbol, windowMs) {
-  const buf = priceBuffer.get(symbol);
-
-  if (!buf || buf.length < 2) return 0;
-
-  const cutoff = Date.now() - windowMs;
-  const recent = buf.filter((p) => p.ts >= cutoff);
-
-  if (recent.length < 2) return 0;
-
-  const oldest = recent[0].price;
-  const newest = recent[recent.length - 1].price;
-
-  if (!oldest || oldest <= 0) return 0;
-
-  return ((newest - oldest) / oldest) * 100;
+  const buf=priceBuffer.get(symbol);
+  if(!buf || buf.length<2) return null;
+  const now=Date.now(), target=now-windowMs, newest=buf[buf.length-1];
+  if(now-newest.ts>90000) return null;
+  const first=buf.find(p=>p.ts>=target);
+  if(!first || first.ts-target>90000 || newest.ts-first.ts<windowMs-90000) return null;
+  return ((newest.price-first.price)/first.price)*100;
 }
 
 function getRecentLiquidations(symbol, side) {
@@ -406,44 +398,15 @@ async function fetchFundingRates() {
 // ===============================
 // REST FALLBACK — COINGECKO
 // ===============================
-async function fetchCoinGeckoFallback() {
+async function refreshBinancePrices() {
   try {
-    const url =
-      "https://api.coingecko.com/api/v3/coins/markets" +
-      "?vs_currency=usd&order=market_cap_desc&per_page=250&page=1&sparkline=false&price_change_percentage=24h";
-
-    const coins = await require("./market-http").getMarketJSON(url);
-
-    if (!Array.isArray(coins)) return;
-
-    let loaded = 0;
-
-    for (const c of coins) {
-      const symbol = `${(c.symbol || "").toUpperCase()}USDT`;
-
-      if (EMOTION_TRADE_PAIRS.includes(symbol)) {
-        const buf = priceBuffer.get(symbol);
-
-        const hasRecentData =
-          buf &&
-          buf.length > 0 &&
-          Date.now() - buf[buf.length - 1].ts < 2 * 60 * 1000;
-
-        if (!hasRecentData) {
-          pushPrice(symbol, c.current_price);
-          loaded++;
-        }
-      }
+    const rows=await require("./binance-market").tickers();
+    for(const row of rows) {
+      if(!EMOTION_TRADE_PAIRS.includes(row.symbol))continue;
+      const buf=priceBuffer.get(row.symbol),last=buf?.[buf.length-1];
+      if(!last || Date.now()-last.ts>30000)pushPrice(row.symbol,row.lastPrice);
     }
-
-    if (loaded > 0) {
-      console.log(
-        `[EmoTrader] CoinGecko fallback: ${loaded} pairs without WebSocket data`
-      );
-    }
-  } catch (err) {
-    console.error("[EmoTrader] CoinGecko fallback error:", err.message);
-  }
+  }catch(err){console.warn("[EmoTrader] Binance fallback:",err.message);}
 }
 
 // ===============================
@@ -459,7 +422,7 @@ function startEvaluationLoop() {
       const buf = priceBuffer.get(symbol);
       const price = buf?.length ? buf[buf.length - 1].price : 0;
 
-      if (!price) continue;
+      if (!price || pct5m === null || pct15m === null) continue;
 
       const emo5m = getEmotion(pct5m);
       const emo15m = getEmotion(pct15m);
@@ -1302,15 +1265,15 @@ function start(config) {
   fetchFundingRates();
 
   setTimeout(async () => {
-    await fetchCoinGeckoFallback();
-    console.log("[EmoTrader] Base data loaded via CoinGecko fallback");
+    await refreshBinancePrices();
+    console.log("[EmoTrader] Binance price refresh completed; full windows must accumulate before evaluation.");
   }, 3000);
 
   startEvaluationLoop();
 
   setInterval(fetchFundingRates, FUNDING_REFRESH_MS);
 
-  setInterval(fetchCoinGeckoFallback, 5 * 60 * 1000);
+  setInterval(refreshBinancePrices, 60 * 1000);
 
   console.log(
     `[EmoTrader] ===== STARTED v4 SAFE-CONFIRM ===== ` +

@@ -14,6 +14,7 @@ function normalizeContext(data, now = Date.now()) {
 function createRuntime({fetcher = global.fetch, now = Date.now} = {}) {
   const state = {ready:false, bootError:null, lastEvaluation:null, evaluating:false, executionBusy:false, context:null, contextError:null};
   let timer;
+  let contextAttempt = -Infinity;
   let executionLocked = false;
   return {
     state,
@@ -23,6 +24,8 @@ function createRuntime({fetcher = global.fetch, now = Date.now} = {}) {
       try { return await task(); } finally { executionLocked = state.executionBusy = false; }
     },
     async refreshContext() {
+      if(now() - contextAttempt < 300000) return;
+      contextAttempt = now();
       try {
         const origin = process.env.WOJAKMETER_SITE_URL || 'https://wojakmeter.com';
         const res = await fetcher(new URL('/api/index-score', origin), {signal:AbortSignal.timeout(10000)});

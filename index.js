@@ -7,6 +7,7 @@ const crypto = require("crypto");
 const emotionTrader = require("./emotion-trader");
 const runtime = require("./desk-runtime").createRuntime();
 let latestEvaluation = null;
+const hybridMarket = require("./binance-market");
 
 // ===============================
 // WOJAKMETER BOT — INDEX
@@ -1434,7 +1435,7 @@ function buildFuturesAccountMessage(account) {
     `Cooling down: <b>${personalTradingState.coolingDown ? "Yes" : "No"}</b>\n\n` +
     `🤖 AutoTrade: <b>${autoTradeActive ? "ON ✅" : "OFF 🛑"}</b>\n` +
     `Manual confirmation: <b>${
-      AUTO_TRADE_CONFIRM ? "Required ✅" : "Disabled ⚠️"
+      !SMART_AT.autoExecuteOnTriple ? "Required ✅" : "Disabled ⚠️"
     }</b>\n` +
     `Testnet: <b>${USE_TESTNET ? "Yes" : "❗ REAL MONEY"}</b>`
   );
@@ -1643,7 +1644,7 @@ async function stageSmartTrade(side, symbol, score) {
       `🚨 <b>AUTO-TRADE SIGNAL</b>\n\n` +
       `Pair: <b>${escapeHTML(symbol)}</b>\n` +
       `Direction: <b>${side === "BUY" ? "📈 LONG" : "📉 SHORT"}</b>\n` +
-      `WojakMeter Score: <b>${score}/100</b>\n` +
+      `Binance participation score: <b>${score}/100</b>\n` +
       `Mark Price: <b>${formatUsd(markPrice)}</b>\n` +
       `Qty: <b>${qty}</b>\n` +
       `Leverage: <b>${safeLeverage}x 🔥</b>\n` +
@@ -1922,7 +1923,7 @@ function buildMyPlanMessage() {
     `Status: <b>${autoTradeActive ? "ON ✅" : "OFF 🛑"}</b>\n` +
     `Score LONG: <b>≥${SCORE_LONG_MIN}</b> | Score SHORT: <b>≤${SCORE_SHORT_MAX}</b>\n` +
     `SL: <b>${SL_PCT}%</b> | TP: <b>${TP_PCT}%</b> | Leverage: <b>${AT_LEVERAGE}x</b>\n` +
-    `Manual confirmation: <b>${AUTO_TRADE_CONFIRM ? "Required ✅" : "Disabled ⚠️"}</b>\n` +
+    `Manual confirmation: <b>${!SMART_AT.autoExecuteOnTriple ? "Required ✅" : "Disabled ⚠️"}</b>\n` +
     `Testnet: <b>${USE_TESTNET ? "Yes (safe)" : "❗ REAL MONEY"}</b>\n\n` +
 
     `🧠 <b>Rule</b>\n` +
@@ -2571,54 +2572,12 @@ async function sendMarketPersonalSignal(signal) {
 
 async function scanMarketPersonalSignals() {
   try {
-    if (!MARKET_SCANNER_ENABLED) return;
-    if (!PERSONAL_ALERTS_ENABLED) return;
-    if (!PRIVATE_TELEGRAM_USER_ID) return;
-
-    resetPersonalStateIfNewDay();
-
-    if (personalTradingState.coolingDown) return;
-    if (personalTradingState.tradesToday >= PERSONAL_PLAN.maxTradesPerDay) {
-      return;
-    }
-
-    if (
-      personalTradingState.pnlToday <=
-      -Math.abs(PERSONAL_PLAN.maxDailyLoss)
-    ) {
-      return;
-    }
-
-    if (personalTradingState.pnlToday >= PERSONAL_PLAN.dailyProfitLock) {
-      return;
-    }
-
-    const markets = await getMarkets(true);
-
-    const allowedBases = MARKET_SCAN_SYMBOLS.map((s) =>
-      String(s).replace("USDT", "").toUpperCase()
-    );
-
-    const filtered = markets.filter((coin) =>
-      allowedBases.includes((coin.symbol || "").toUpperCase())
-    );
-
-    const signals = filtered
-      .map(detectMarketSetup)
-      .filter(Boolean)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 5);
-
-    // Was sending up to 5 alerts every scan cycle. Only the
-    // single best setup is worth interrupting the user for.
-    const best = signals[0];
-
-    if (best) {
-      await sendMarketPersonalSignal(best);
-    }
-  } catch (err) {
-    console.error("Market personal scanner error:", err.message);
-  }
+    const ev = await evaluateSmartSignals();
+    if (ev.error || !ev.direction) return;
+    const signal = {symbol:"BTCUSDT",type:"Hybrid "+ev.direction,score:ev.alignedCount===3?90:70};
+    if (!canSendMarketPersonalSignal(signal)) return;
+    await sendPrivate(`<b>BINANCE HYBRID WATCH — ${ev.direction}</b>\n` + ev.details.map(escapeHTML).join("\n") + "\nSignals are observations; they are not orders.");
+  } catch(err) {console.warn("[Hybrid scanner]",err.message);}
 }
 
 // ===============================
@@ -2668,49 +2627,16 @@ async function sendMessageToChannel(text) {
 
 async function runChannelBroadcast() {
   try {
-    const global = await getGlobal();
-    const data = global?.data || {};
-
-    const change = safe(data.market_cap_change_percentage_24h_usd);
-    const score = scoreFromChange(change);
-    const emotion = getEmotionByChange(change);
-    const btcDom = safe(data.market_cap_percentage?.btc);
-    const volume = safe(data.total_volume?.usd);
-
-    const nextState = {
-      emotionKey: emotion.key,
-      score,
-      change,
-      btcDom,
-      volume,
-      ts: Date.now()
-    };
-
-    if (TELEGRAM_CHANNEL_ID && shouldBroadcast(nextState)) {
-      const text = buildPrettyAlert({
-        title: "WojakMeter Market Update",
-        emotion,
-        score,
-        change,
-        btcDom,
-        volume,
-        narrative: getEmotionNarrative(emotion.key)
-      });
-
-      await sendMessageToChannel(text);
-
-      lastBroadcastState = nextState;
-    }
-
-    // Trading runs on its own serialized scheduler, independently of broadcasts.
-  } catch (err) {
-    console.error("Broadcast loop error:", err.message);
-  }
+    const ev = await evaluateSmartSignals();
+    if (ev.error) return;
+    const nextState={emotionKey:ev.marketMood,score:ev.strategyScore,ts:Date.now()};
+    if (!TELEGRAM_CHANNEL_ID || Date.now()-lastBroadcastState.ts < MIN_BROADCAST_GAP_MS || !shouldBroadcast(nextState)) return;
+    await sendMessageToChannel(`<b>WojakMeter — Binance market watch</b>\nParticipation: ${ev.strategyScore}/100 · ${escapeHTML(ev.marketMood)}\n` + ev.details.map(escapeHTML).join("\n") + "\nBinance contracts only; this is not the global WojakMeter index.");
+    lastBroadcastState=nextState;
+  } catch(err) {console.warn("[Hybrid broadcast]",err.message);}
 }
 
-// ===============================
-// CONFIRM / CANCEL / CLOSE COMMANDS
-// ===============================
+
 bot.command("confirmar", async (ctx) => {
   if (!isPrivateOwner(ctx)) return replyOwnerOnly(ctx);
 
@@ -3406,7 +3332,7 @@ process.on("uncaughtException", (err) => {
 // ===============================
 async function warmUpCache() {
   try {
-    const results = await Promise.allSettled([getMarkets(), getTrending(), getGlobal()]);
+    const results = await Promise.allSettled([hybridMarket.read(SMART_AT)]);
     logCacheResults("Warmup", results);
   } catch (err) {
     console.error("Warm cache failed:", err.message);
@@ -3421,7 +3347,7 @@ function logCacheResults(label, results) {
 setInterval(async () => {
   try {
     const results = await Promise.allSettled([
-      getMarkets(), getTrending(), getGlobal()
+      hybridMarket.read(SMART_AT)
     ]);
     logCacheResults("Refresh", results);
   } catch (err) {
@@ -3438,7 +3364,7 @@ setInterval(() => { if (runtime.state.ready) scanMarketPersonalSignals(); }, MAR
 // ===============================
 
 const SMART_AT = {
-  autoExecuteOnTriple:  !AUTO_TRADE_CONFIRM,
+  autoExecuteOnTriple:  !AUTO_TRADE_CONFIRM && process.env.HYBRID_AUTO_EXECUTION === "true",
   globalLong:           Number(process.env.AUTO_TRADE_SCORE_LONG        || 65),
   globalShort:          Number(process.env.AUTO_TRADE_SCORE_SHORT       || 35),
   btcMomentumThreshold: Number(process.env.AT_BTC_MOMENTUM_PCT          || 1.0),
@@ -3469,115 +3395,11 @@ let smartAtState = {
 };
 
 async function evaluateSmartSignals() {
-  const result = {
-    globalSignal:     null,
-    btcSignal:        null,
-    confluenceSignal: null,
-    globalScore:      null,
-    btcChange1h:      null,
-    confluenceCount:  0,
-    alignedCount:     0,
-    direction:        null,
-    confidence:       "none",
-    details:          []
-  };
-
-  try {
-    // ── Signal 1: Global Market Score ──
-    const global    = await getGlobal();
-    const change24h = global?.data?.market_cap_change_percentage_24h_usd;
-    if (typeof change24h !== "number" || !Number.isFinite(change24h)) throw new Error("Global market data unavailable");
-    result.globalScore = scoreFromChange(change24h);
-
-    if (result.globalScore >= SMART_AT.globalLong) {
-      result.globalSignal = "LONG";
-      result.details.push(`✅ Global score ${result.globalScore}/100 ≥ ${SMART_AT.globalLong} → LONG`);
-    } else if (result.globalScore <= SMART_AT.globalShort) {
-      result.globalSignal = "SHORT";
-      result.details.push(`✅ Global score ${result.globalScore}/100 ≤ ${SMART_AT.globalShort} → SHORT`);
-    } else {
-      result.details.push(`⚪ Global score ${result.globalScore}/100 — neutral`);
-    }
-
-    // ── Signal 2: BTC 1h Momentum ──
-    const markets = await getMarkets();
-    const btc = markets.find(c => (c.symbol || "").toLowerCase() === "btc");
-
-    if (btc && Number.isFinite(btc.price_change_percentage_1h_in_currency) && Number.isFinite(btc.price_change_percentage_24h)) {
-      const btc1h  = safe(btc.price_change_percentage_1h_in_currency, 0);
-      const btc24h = safe(btc.price_change_percentage_24h, 0);
-      result.btcChange1h = btc1h;
-      const btcScore = scoreFromChange(btc24h);
-
-      if (btc1h >= SMART_AT.btcMomentumThreshold && btcScore >= 58) {
-        result.btcSignal = "LONG";
-        result.details.push(`✅ BTC 1h +${btc1h.toFixed(2)}% momentum → LONG`);
-      } else if (btc1h <= -SMART_AT.btcMomentumThreshold && btcScore <= 42) {
-        result.btcSignal = "SHORT";
-        result.details.push(`✅ BTC 1h ${btc1h.toFixed(2)}% momentum → SHORT`);
-      } else {
-        result.details.push(`⚪ BTC 1h ${btc1h.toFixed(2)}% — no clear momentum`);
-      }
-    } else {
-      throw new Error("BTC momentum data unavailable");
-    }
-
-    // ── Signal 3: Scanner Confluence ──
-    const allowedBases = MARKET_SCAN_SYMBOLS.map(s =>
-      String(s).replace("USDT", "").toUpperCase()
-    );
-    const scannedCoins = (await getMarkets()).filter(coin =>
-      allowedBases.includes((coin.symbol || "").toUpperCase())
-    );
-    const signals = scannedCoins.map(detectMarketSetup).filter(Boolean);
-    const longSigs  = signals.filter(s => s.direction.includes("LONG")  && s.score >= SMART_AT.confluenceScoreMin);
-    const shortSigs = signals.filter(s => s.direction.includes("SHORT") && s.score >= SMART_AT.confluenceScoreMin);
-
-    if (longSigs.length >= SMART_AT.confluenceMin) {
-      result.confluenceSignal = "LONG";
-      result.confluenceCount  = longSigs.length;
-      result.details.push(`✅ Confluence: ${longSigs.length} coins LONG → LONG`);
-    } else if (shortSigs.length >= SMART_AT.confluenceMin) {
-      result.confluenceSignal = "SHORT";
-      result.confluenceCount  = shortSigs.length;
-      result.details.push(`✅ Confluence: ${shortSigs.length} coins SHORT → SHORT`);
-    } else {
-      result.confluenceCount = Math.max(longSigs.length, shortSigs.length);
-      result.details.push(`⚪ Confluence: ${longSigs.length}L / ${shortSigs.length}S (need ${SMART_AT.confluenceMin})`);
-    }
-
-    // ── Align ──
-    const all        = [result.globalSignal, result.btcSignal, result.confluenceSignal];
-    const longCount  = all.filter(s => s === "LONG").length;
-    const shortCount = all.filter(s => s === "SHORT").length;
-    result.alignedCount = Math.max(longCount, shortCount);
-
-    // SAFETY: if signals point in opposite directions, there is no
-    // edge — do not resolve the tie arbitrarily. Previously a 1-vs-1
-    // split silently became LONG because of a `>=` comparison, which
-    // meant the bot could open a leveraged position on a coin flip.
-    if (longCount > 0 && shortCount > 0) {
-      result.direction  = null;
-      result.confidence = "none";
-      result.conflict   = true;
-      result.details.push(
-        `⛔ Conflicting signals (${longCount} LONG vs ${shortCount} SHORT) — standing down`
-      );
-    } else if (longCount >= SMART_AT.minSignalsRequired) {
-      result.direction  = "LONG";
-      result.confidence = longCount === 3 ? "high" : longCount === 2 ? "medium" : "low";
-    } else if (shortCount >= SMART_AT.minSignalsRequired) {
-      result.direction  = "SHORT";
-      result.confidence = shortCount === 3 ? "high" : shortCount === 2 ? "medium" : "low";
-    }
-
-  } catch (err) {
-    result.error = err.message; result.direction = null; result.confidence = "none";
-    console.error("[SmartAT] evaluateSmartSignals error:", err.message);
-    result.details.push(`❌ Error: ${err.message}`);
+  try { return await hybridMarket.read(SMART_AT); }
+  catch (err) {
+    console.warn("[Hybrid]",err.message);
+    return {error:err.message,source:"Binance USD-M perpetuals",strategy:"hybrid-v1",direction:null,confidence:"none",alignedCount:0,globalScore:null,details:["Market data unavailable: "+err.message]};
   }
-
-  return result;
 }
 
 async function smartEvaluateAndTrade(ev) {
@@ -3592,7 +3414,7 @@ async function smartEvaluateAndTrade(ev) {
     if (!ev || ev.error || !ev.direction) return;
 
     console.log(
-      `[SmartAT] Score:${ev.globalScore} BTC:${ev.btcSignal} ` +
+      `[SmartAT] Score:${ev.strategyScore} BTC:${ev.btcSignal} ` +
       `Confluence:${ev.confluenceSignal} Dir:${ev.direction} ` +
       `Confidence:${ev.confidence} Aligned:${ev.alignedCount}/3`
     );
@@ -3606,7 +3428,7 @@ async function smartEvaluateAndTrade(ev) {
     if (ev.confidence === "high" && SMART_AT.autoExecuteOnTriple) {
       console.log(`[SmartAT] HIGH 3/3 ${side} — attempting execution`);
 
-      const executed = await smartExecuteAuto(symbol, side, ev.globalScore, ev);
+      const executed = await smartExecuteAuto(symbol, side, ev.strategyScore, ev);
 
       // Only burn the cooldown and count the trade if it really executed
       if (executed) {
@@ -3621,7 +3443,7 @@ async function smartEvaluateAndTrade(ev) {
       if (SMART_AT.autoOnMedium && SMART_AT.autoExecuteOnTriple) {
         console.log(`[SmartAT] MEDIUM ${ev.alignedCount}/3 ${side} — attempting execution`);
 
-        const executed = await smartExecuteAuto(symbol, side, ev.globalScore, ev);
+        const executed = await smartExecuteAuto(symbol, side, ev.strategyScore, ev);
 
         if (executed) {
           smartAtState.lastExecutionTs = Date.now();
@@ -3633,7 +3455,7 @@ async function smartEvaluateAndTrade(ev) {
       // Binance call fails, the user is told to /confirmar an
       // order that was never created.
       } else if (!pendingConfirm) {
-        await atExecuteTrade(side, symbol, ev.globalScore);
+        await atExecuteTrade(side, symbol, ev.strategyScore);
 
         if (pendingConfirm) {
           pendingConfirm.smartEvaluation = ev;
@@ -3663,7 +3485,7 @@ async function smartEvaluateAndTrade(ev) {
       if (SMART_AT.autoOnLow && SMART_AT.autoExecuteOnTriple) {
         console.log(`[SmartAT] LOW 1/3 ${side} — attempting execution`);
 
-        const executed = await smartExecuteAuto(symbol, side, ev.globalScore, ev);
+        const executed = await smartExecuteAuto(symbol, side, ev.strategyScore, ev);
 
         if (executed) {
           smartAtState.lastExecutionTs = Date.now();
@@ -3671,7 +3493,7 @@ async function smartEvaluateAndTrade(ev) {
         }
 
       } else if (!pendingConfirm) {
-        await atExecuteTrade(side, symbol, ev.globalScore);
+        await atExecuteTrade(side, symbol, ev.strategyScore);
 
         if (pendingConfirm) {
           pendingConfirm.smartEvaluation = ev;

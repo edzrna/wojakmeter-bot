@@ -4,9 +4,10 @@ function createMarketClient({fetcher=global.fetch,now=Date.now,sleep=ms=>new Pro
   let tail=Promise.resolve(),next=0,blockedUntil=0,strikes=0;
   const error=(path,status,until=0)=>Object.assign(new Error(`CoinGecko ${path}: HTTP ${status}${until ? ' — retry after '+new Date(until).toISOString() : ''}`),{status,retryAt:until});
   function get(url,{timeoutMs=15000}={}) {
+    if(process.env.COINGECKO_LEGACY_ENABLED !== "true") return Promise.reject(Error("CoinGecko direct access is disabled in hybrid mode; global context comes from the website."));
     const u=new URL(url);
     if(u.origin!=='https://api.coingecko.com')return Promise.reject(Error('Unsupported market data origin'));
-    const ttl=u.pathname.endsWith('/search/trending')?300000:120000;
+    const ttl=6*60*60*1000; // Optional legacy commands: at most one refresh per endpoint every six hours.
     const hit=cache.get(url);
     if(hit && now()-hit.ts<ttl)return Promise.resolve(hit.data);
     if(pending.has(url))return pending.get(url);
