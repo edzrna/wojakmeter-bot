@@ -147,6 +147,7 @@ function mount(app, deps) {
         executionBusy: Boolean(s.runtime?.executionBusy),
         mode: s.SMART_AT?.autoExecuteOnTriple ? "Automatic" : "Confirmation required",
         blockers: [
+          s.smartAtState?.lastEntrySkip && Date.now() - s.smartAtState.lastEntrySkip.at < 120000 && s.smartAtState.lastEntrySkip.reason,
           !s.runtime?.ready && "Account recovery is not complete",
           !s.autoTradeActive && "AutoTrade is OFF — enable it in the owner Telegram controls",
           s.smartAtState?.paused && (s.smartAtState.pauseReason || "Paused"),

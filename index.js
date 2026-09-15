@@ -1351,29 +1351,34 @@ async function atCancelAllOrders(symbol) {
   );
 }
 
+function quantitySkip(message) {
+  const error = new Error(message); error.code = "ENTRY_SIZE_SKIP"; return error;
+}
 function calculateQtyByRisk({ markPrice, symbolInfo, riskUsd, slPct }) {
+  if (![markPrice, riskUsd, slPct].every(v => Number.isFinite(v) && v > 0) || slPct >= 100) {
+    throw new Error("Invalid sizing configuration: price/risk must be positive and stop must be between 0 and 100 percent");
+  }
   const stopDistanceUsd = markPrice * (slPct / 100);
   const rawQty = riskUsd / stopDistanceUsd;
   const stepSize = atGetLotStepSize(symbolInfo);
   const minQty = atGetMinQty(symbolInfo);
   const minNotional = atGetMinNotional(symbolInfo);
+  if (!Number.isFinite(stepSize) || stepSize <= 0 || !Number.isFinite(minQty) || minQty < 0 || !Number.isFinite(minNotional) || minNotional < 0) {
+    throw new Error("Invalid exchange quantity filters");
+  }
   const qty = atRoundQty(rawQty, stepSize);
   const notional = qty * markPrice;
 
   if (qty <= 0) {
-    throw new Error("Calculated qty is 0 — check riskPerTrade");
+    throw quantitySkip(`Trade skipped: quantity below one lot step (${stepSize}). Configured risk $${riskUsd}, stop ${slPct}%. No order sent; continuing signal evaluation.`);
   }
 
   if (minQty && qty < minQty) {
-    throw new Error(`Qty too small. Qty=${qty}, minQty=${minQty}`);
+    throw quantitySkip(`Trade skipped: quantity ${qty} below minimum ${minQty} at configured risk $${riskUsd}. No order sent; continuing signal evaluation.`);
   }
 
   if (minNotional && notional < minNotional) {
-    throw new Error(
-      `Notional too small: ${formatUsd(notional)}. Minimum approx: ${formatUsd(
-        minNotional
-      )}`
-    );
+    throw quantitySkip(`Trade skipped: order value ${formatUsd(notional)} below minimum ${formatUsd(minNotional)} at configured risk $${riskUsd}. No order sent; continuing signal evaluation.`);
   }
 
   return {
@@ -3383,6 +3388,7 @@ async function evaluateSmartSignals() {
 }
 
 async function smartEvaluateAndTrade(ev) {
+  smartAtState.lastEntrySkip = null;
   try {
     if (!autoTradeActive || !canOpenTrade()) return;
     if (smartAtState.paused) {
@@ -3499,9 +3505,6 @@ async function executeAutoInternal(symbol, side, score, ev) {
     const leverage = AT_LEVERAGE;
     const riskUsd  = PERSONAL_PLAN.riskPerTrade;
 
-    executionStage = "set leverage";
-    await atSetLeverage(symbol, leverage);
-
     executionStage = "market data";
     const [markPrice, symbolInfo] = await Promise.all([
       atGetMarkPrice(symbol),
@@ -3515,6 +3518,10 @@ async function executeAutoInternal(symbol, side, score, ev) {
     const { qty, notional } = calculateQtyByRisk({
       markPrice, symbolInfo, riskUsd, slPct: SL_PCT
     });
+
+    if (!entryAllowed("smart")) return false;
+    executionStage = "set leverage";
+    await atSetLeverage(symbol, leverage);
 
     await sendPrivate(
       `⏳ <b>Executing ${side === "BUY" ? "LONG" : "SHORT"}...</b>\n` +
@@ -3567,6 +3574,12 @@ async function executeAutoInternal(symbol, side, score, ev) {
     return true;
 
   } catch (err) {
+    // Only our local sizing rejection, before any private mutation, is recoverable.
+    if (executionStage === "quantity calculation" && err.code === "ENTRY_SIZE_SKIP") {
+      smartAtState.lastEntrySkip = {at: Date.now(), symbol, reason: err.message};
+      console.log("[SmartAT] Entry skipped:", symbol, err.message);
+      return false;
+    }
     smartAtState.paused = true;
     smartAtState.pauseReason = `Execution interrupted at ${executionStage}: ${String(err.message).slice(0,240)} — verify exchange state before resuming`;
     console.error("[SmartAT] smartExecuteAuto error:", executionStage, err.message);
