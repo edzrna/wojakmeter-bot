@@ -7,6 +7,7 @@ const crypto = require("crypto");
 const emotionTrader = require("./emotion-trader");
 const runtime = require("./desk-runtime").createRuntime();
 let latestEvaluation = null;
+const deskTelemetry = require("./desk-telemetry").createTelemetry();
 const hybridMarket = require("./binance-market");
 
 // ===============================
@@ -4025,6 +4026,7 @@ const deskRecovery = createRecovery({
 });
 
 deskApi.mount(app, {
+  getTelemetry: () => deskTelemetry.read(),
   readAccount: readDeskAccount,
   recoverAccount: () => deskRecovery.start(),
   getState: () => ({
@@ -4081,6 +4083,11 @@ deskApi.mount(app, {
       latestEvaluation = await evaluateSmartSignals();
       latestEvaluation.ts = Date.now();
       await smartEvaluateAndTrade(latestEvaluation);
+      deskTelemetry.record(latestEvaluation, {
+        context: runtime.state.context, ready:runtime.state.ready, paused:smartAtState.paused,
+        active:autoTradeActive, position:openPosition || emotionTrader.getEmoPosition(),
+        pending:pendingConfirm || emotionTrader.getPending()
+      });
     });
     // launch() owns the long-polling loop; all initialization must precede it.
     await bot.launch({dropPendingUpdates: true});
