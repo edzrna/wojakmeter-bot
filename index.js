@@ -1173,8 +1173,9 @@ async function sendPrivateError(key, text) {
     return;
   }
 
-  lastErrorSent.set(key, Date.now());
-  return sendPrivate(text);
+  const delivered = await sendPrivate(text);
+  if (delivered) lastErrorSent.set(key, Date.now());
+  return delivered;
 }
 
 // Informational chatter — suppressed while QUIET_MODE is on.
@@ -1184,15 +1185,17 @@ async function sendPrivateInfo(text) {
 }
 
 async function sendPrivate(text) {
-  if (!PRIVATE_TELEGRAM_USER_ID) return;
+  if (!PRIVATE_TELEGRAM_USER_ID) { console.error("[Private] notification skipped: missing recipient"); return false; }
 
   try {
     await emergencyTimeout(bot.telegram.sendMessage(PRIVATE_TELEGRAM_USER_ID, text, {
       parse_mode: "HTML",
       disable_web_page_preview: true
     }), 10000, "Telegram notification timeout");
+    return true;
   } catch (err) {
     console.error("[Private] send error:", err.message);
+    return false;
   }
 }
 
@@ -1207,7 +1210,7 @@ function futuresCall(task) {
 
 async function atSetLeverage(symbol, leverage = AT_LEVERAGE) {
   return futuresCall(() =>
-    binanceClient.futuresLeverage(symbol, leverage)
+    signedBinanceFuturesRequest("/fapi/v1/leverage", {symbol, leverage: String(leverage)}, 14000, "POST")
   );
 }
 
@@ -1281,13 +1284,9 @@ function atRoundPrice(price, tickSize) {
 
 async function atPlaceMarketOrder(symbol, side, qty) {
   return futuresCall(() =>
-    binanceClient.futuresOrder(
-      side,
-      symbol,
-      qty,
-      false,
-      { type: "MARKET", newOrderRespType: "RESULT" }
-    )
+    signedBinanceFuturesRequest("/fapi/v1/order", {
+      symbol, side, quantity: String(qty), type: "MARKET", newOrderRespType: "RESULT"
+    }, 14000, "POST")
   );
 }
 
@@ -1337,7 +1336,7 @@ async function atCancelOrder(symbol, orderId) {
       }, 14000, "DELETE"));
     }
     return await futuresCall(() =>
-      binanceClient.futuresCancel(symbol, { orderId })
+      signedBinanceFuturesRequest("/fapi/v1/order", {symbol, orderId}, 14000, "DELETE")
     );
   } catch (err) {
     console.error("[Binance] cancel order error:", err.message);
@@ -1348,7 +1347,7 @@ async function atCancelOrder(symbol, orderId) {
 async function atCancelAllOrders(symbol) {
   await futuresCall(() => signedBinanceFuturesRequest("/fapi/v1/algoOpenOrders", {symbol}, 14000, "DELETE"));
   return futuresCall(() =>
-    binanceClient.futuresCancelAll(symbol)
+    signedBinanceFuturesRequest("/fapi/v1/allOpenOrders", {symbol}, 14000, "DELETE")
   );
 }
 
@@ -3495,12 +3494,15 @@ async function smartEvaluateAndTrade(ev) {
 }
 
 async function executeAutoInternal(symbol, side, score, ev) {
+  let executionStage = "preparation";
   try {
     const leverage = AT_LEVERAGE;
     const riskUsd  = PERSONAL_PLAN.riskPerTrade;
 
+    executionStage = "set leverage";
     await atSetLeverage(symbol, leverage);
 
+    executionStage = "market data";
     const [markPrice, symbolInfo] = await Promise.all([
       atGetMarkPrice(symbol),
       atGetExchangeInfo(symbol)
@@ -3509,6 +3511,7 @@ async function executeAutoInternal(symbol, side, score, ev) {
     if (!markPrice || markPrice <= 0) throw new Error("Could not get mark price");
     if (!symbolInfo)                  throw new Error(`No exchange info for ${symbol}`);
 
+    executionStage = "quantity calculation";
     const { qty, notional } = calculateQtyByRisk({
       markPrice, symbolInfo, riskUsd, slPct: SL_PCT
     });
@@ -3519,6 +3522,7 @@ async function executeAutoInternal(symbol, side, score, ev) {
     );
 
     if (!entryAllowed("smart")) throw new Error("Entry gate changed during preparation");
+    executionStage = "market entry";
     const order     = await atPlaceMarketOrder(symbol, side, qty);
     if (!order?.orderId) throw new Error("Entry response has no orderId; reconcile exchange state");
     const fillPrice = parseFloat(order.avgPrice || order.price || markPrice);
@@ -3528,6 +3532,7 @@ async function executeAutoInternal(symbol, side, score, ev) {
     personalTradingState.tradesToday++;
     await sleep(500);
 
+    executionStage = "stop-loss / take-profit";
     const { slPrice, tpPrice, slOrderId, tpOrderId } =
       await atPlaceSlTpOrders(symbol, side, qty, fillPrice);
 
@@ -3563,13 +3568,13 @@ async function executeAutoInternal(symbol, side, score, ev) {
 
   } catch (err) {
     smartAtState.paused = true;
-    smartAtState.pauseReason = "Execution interrupted — verify exchange position and protection before resuming";
-    console.error("[SmartAT] smartExecuteAuto error:", err.message);
+    smartAtState.pauseReason = `Execution interrupted at ${executionStage}: ${String(err.message).slice(0,240)} — verify exchange state before resuming`;
+    console.error("[SmartAT] smartExecuteAuto error:", executionStage, err.message);
 
     await sendPrivateError(
-      "auto_exec_failed",
+      "auto_exec_failed:" + crypto.createHash("sha256").update(executionStage + ":" + err.message).digest("hex").slice(0,16),
       `⚠️ <b>Auto-execution FAILED</b>\n\n` +
-      `${escapeHTML(err.message)}\n\n` +
+      `Stage: ${escapeHTML(executionStage)}\n${escapeHTML(err.message)}\n\n` +
       `Execution state must be verified on Binance. An entry may exist without complete protection. Further entries are paused.\n` +
       `<i>This alert is muted for 1h to avoid spam.</i>`
     );
