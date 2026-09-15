@@ -154,7 +154,7 @@ function getBinanceFuturesBaseUrl() {
     : "https://fapi.binance.com";
 }
 
-async function signedBinanceFuturesRequest(path, params = {}, timeoutMs = 15000) {
+async function signedBinanceFuturesRequest(path, params = {}, timeoutMs = 15000, method = "GET") {
   if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
     throw new Error("Missing BINANCE_API_KEY or BINANCE_API_SECRET");
   }
@@ -175,7 +175,7 @@ async function signedBinanceFuturesRequest(path, params = {}, timeoutMs = 15000)
 
   try {
     const res = await fetch(`${baseUrl}${path}?${query}&signature=${signature}`, {
-      method: "GET",
+      method,
       headers: {
         "X-MBX-APIKEY": BINANCE_API_KEY,
         "User-Agent": "WojakMeterBot/1.0",
@@ -1187,46 +1187,41 @@ async function sendPrivate(text) {
   if (!PRIVATE_TELEGRAM_USER_ID) return;
 
   try {
-    await bot.telegram.sendMessage(PRIVATE_TELEGRAM_USER_ID, text, {
+    await emergencyTimeout(bot.telegram.sendMessage(PRIVATE_TELEGRAM_USER_ID, text, {
       parse_mode: "HTML",
       disable_web_page_preview: true
-    });
+    }), 10000, "Telegram notification timeout");
   } catch (err) {
     console.error("[Private] send error:", err.message);
   }
 }
 
-function promisifyBinance(fn) {
-  return new Promise((resolve, reject) => {
-    fn((err, res) => {
-      if (err) {
-        return reject(
-          new Error(err.body || err.message || JSON.stringify(err))
-        );
-      }
-
-      resolve(res);
-    });
-  });
+function futuresCall(task) {
+  return require("./futures-call").callFutures(task, {onTimeout: (err) => {
+    runtime.state.ready = false;
+    runtime.state.bootError = err.message;
+    smartAtState.paused = true;
+    smartAtState.pauseReason = err.message;
+  }});
 }
 
 async function atSetLeverage(symbol, leverage = AT_LEVERAGE) {
-  return promisifyBinance((cb) =>
-    binanceClient.futuresLeverage(symbol, leverage, cb)
+  return futuresCall(() =>
+    binanceClient.futuresLeverage(symbol, leverage)
   );
 }
 
 async function atGetMarkPrice(symbol) {
-  const res = await promisifyBinance((cb) =>
-    binanceClient.futuresMarkPrice(symbol, cb)
+  const res = await futuresCall(() =>
+    binanceClient.futuresMarkPrice(symbol)
   );
 
   return parseFloat(res?.markPrice || res?.price || 0);
 }
 
 async function atGetExchangeInfo(symbol) {
-  const info = await promisifyBinance((cb) =>
-    binanceClient.futuresExchangeInfo(cb)
+  const info = await futuresCall(() =>
+    binanceClient.futuresExchangeInfo()
   );
 
   return (info?.symbols || []).find((s) => s.symbol === symbol) || null;
@@ -1285,14 +1280,13 @@ function atRoundPrice(price, tickSize) {
 }
 
 async function atPlaceMarketOrder(symbol, side, qty) {
-  return promisifyBinance((cb) =>
+  return futuresCall(() =>
     binanceClient.futuresOrder(
       side,
       symbol,
       qty,
       false,
-      { type: "MARKET" },
-      cb
+      { type: "MARKET", newOrderRespType: "RESULT" }
     )
   );
 }
@@ -1315,37 +1309,17 @@ async function atPlaceSlTpOrders(symbol, side, qty, entryPrice) {
   slPrice = atRoundPrice(slPrice, tickSize);
   tpPrice = atRoundPrice(tpPrice, tickSize);
 
-  const slOrder = await promisifyBinance((cb) =>
-    binanceClient.futuresOrder(
-      oppositeSide,
-      symbol,
-      qty,
-      slPrice,
-      {
-        type: "STOP_MARKET",
-        stopPrice: slPrice,
-        reduceOnly: true,
-        workingType: "MARK_PRICE"
-      },
-      cb
-    )
-  );
-
-  const tpOrder = await promisifyBinance((cb) =>
-    binanceClient.futuresOrder(
-      oppositeSide,
-      symbol,
-      qty,
-      tpPrice,
-      {
-        type: "TAKE_PROFIT_MARKET",
-        stopPrice: tpPrice,
-        reduceOnly: true,
-        workingType: "MARK_PRICE"
-      },
-      cb
-    )
-  );
+  const placeProtection = async (type, triggerPrice) => {
+    const order = await futuresCall(() => signedBinanceFuturesRequest("/fapi/v1/algoOrder", {
+      algoType: "CONDITIONAL", symbol, side: oppositeSide, type,
+      quantity: String(qty), triggerPrice: String(triggerPrice),
+      reduceOnly: "true", workingType: "MARK_PRICE"
+    }, 14000, "POST"));
+    if (!order?.algoId) throw new Error("Protection response has no algoId");
+    return {orderId: `algo:${order.algoId}`};
+  };
+  const slOrder = await placeProtection("STOP_MARKET", slPrice);
+  const tpOrder = await placeProtection("TAKE_PROFIT_MARKET", tpPrice);
 
   return {
     slPrice,
@@ -1357,8 +1331,13 @@ async function atPlaceSlTpOrders(symbol, side, qty, entryPrice) {
 
 async function atCancelOrder(symbol, orderId) {
   try {
-    return await promisifyBinance((cb) =>
-      binanceClient.futuresCancel(symbol, { orderId }, cb)
+    if (String(orderId).startsWith("algo:")) {
+      return await futuresCall(() => signedBinanceFuturesRequest("/fapi/v1/algoOrder", {
+        algoId: String(orderId).slice(5)
+      }, 14000, "DELETE"));
+    }
+    return await futuresCall(() =>
+      binanceClient.futuresCancel(symbol, { orderId })
     );
   } catch (err) {
     console.error("[Binance] cancel order error:", err.message);
@@ -1367,8 +1346,9 @@ async function atCancelOrder(symbol, orderId) {
 }
 
 async function atCancelAllOrders(symbol) {
-  return promisifyBinance((cb) =>
-    binanceClient.futuresCancelAll(symbol, cb)
+  await futuresCall(() => signedBinanceFuturesRequest("/fapi/v1/algoOpenOrders", {symbol}, 14000, "DELETE"));
+  return futuresCall(() =>
+    binanceClient.futuresCancelAll(symbol)
   );
 }
 
@@ -3249,14 +3229,14 @@ bot.on("text", async (ctx, next) => {
 
     return ctx.reply(
       `🤖 <b>AutoTrade ACTIVATED</b>\n\n` +
-        `Mode: <b>Manual confirmation required ✅</b>\n` +
+        `Mode: <b>${SMART_AT.autoExecuteOnTriple ? (SMART_AT.autoOnMedium ? "Automatic: 2 of 3 aligned" : "Automatic: 3 of 3 aligned") : "Manual confirmation required"}</b>\n` +
         `Score LONG: ≥${SCORE_LONG_MIN}/100\n` +
         `Score SHORT: ≤${SCORE_SHORT_MAX}/100\n` +
         `Leverage: <b>${AT_LEVERAGE}x 🔥</b>\n` +
         `SL: <b>${SL_PCT}%</b> | TP: <b>${TP_PCT}%</b>\n` +
         `R/R: <b>1:${(TP_PCT / SL_PCT).toFixed(1)}</b>\n` +
         `Testnet: <b>${USE_TESTNET ? "Yes" : "❗ REAL MONEY"}</b>\n\n` +
-        `The bot sends proposals only. Use /confirmar to execute.`,
+        `Automatic entries depend on signal alignment, account readiness and risk checks.`,
       {
         parse_mode: "HTML",
         reply_markup: buildMainKeyboard().reply_markup
@@ -3378,7 +3358,7 @@ const SMART_AT = {
   // FULL AUTONOMOUS MODE
   // When true, 2/3 signals also execute without asking.
   // When false, only 3/3 auto-executes and 2/3 asks for /confirmar.
-  autoOnMedium:         process.env.AT_AUTO_ON_MEDIUM === "true",
+  autoOnMedium:         process.env.AT_AUTO_ON_MEDIUM !== "false",
 
   // Aggressive: allow single-signal (1/3) trades.
   // Off by default because one signal has no cross-confirmation.
@@ -3412,7 +3392,7 @@ async function smartEvaluateAndTrade(ev) {
     }
     if (Date.now() - smartAtState.lastExecutionTs < SMART_AT.cooldownMs) return;
 
-    if (!ev || ev.error || !ev.direction) return;
+    if (!ev || ev.error || !ev.direction || ev.conflict || !Number.isFinite(ev.ts) || Date.now() - ev.ts > 120000 || ev.alignedCount < 2) return;
 
     console.log(
       `[SmartAT] Score:${ev.strategyScore} BTC:${ev.btcSignal} ` +
@@ -3538,7 +3518,9 @@ async function executeAutoInternal(symbol, side, score, ev) {
       `${escapeHTML(symbol)} | Qty: ${qty} | Leverage: ${leverage}x | Price ≈ ${formatUsd(markPrice)}`
     );
 
+    if (!entryAllowed("smart")) throw new Error("Entry gate changed during preparation");
     const order     = await atPlaceMarketOrder(symbol, side, qty);
+    if (!order?.orderId) throw new Error("Entry response has no orderId; reconcile exchange state");
     const fillPrice = parseFloat(order.avgPrice || order.price || markPrice);
     openPosition = {side, symbol, qty, entryPrice: fillPrice, score, leverage, riskUsd,
       ts: Date.now(), protectionPending: true};
@@ -3895,12 +3877,15 @@ async function reconcileStateOnBoot() {
     let protectionNote = "";
 
     try {
-      const openOrders = await signedBinanceFuturesRequest(
+      let openOrders = await signedBinanceFuturesRequest(
         "/fapi/v1/openOrders",
         { symbol: p.symbol },
         15000
       );
 
+      const algoOrders = await signedBinanceFuturesRequest("/fapi/v1/openAlgoOrders", {symbol:p.symbol});
+      if (!Array.isArray(algoOrders)) throw new Error("Invalid conditional orders response");
+      openOrders = [...(Array.isArray(openOrders) ? openOrders : []), ...algoOrders.map(o => ({...o, type:o.orderType || o.type, orderId:`algo:${o.algoId}`}))];
       const hasStop = Array.isArray(openOrders) &&
         openOrders.some((o) => String(o.type).includes("STOP"));
 
@@ -3908,6 +3893,8 @@ async function reconcileStateOnBoot() {
         openOrders.some((o) => String(o.type).includes("TAKE_PROFIT"));
 
       if (hasStop && hasTp) {
+        openPosition.slOrderId = openOrders.find(o => String(o.type).includes("STOP"))?.orderId || null;
+        openPosition.tpOrderId = openOrders.find(o => String(o.type).includes("TAKE_PROFIT"))?.orderId || null;
         protectionNote = "✅ SL and TP orders are still live on Binance.";
       } else {
         // Naked position — rebuild protection immediately
@@ -4078,11 +4065,20 @@ deskApi.mount(app, {
       console.error(runtime.state.bootError);
     }
     startEmotionEngine();
+    const decisions = require("./futures-call").createDecisionRunner({
+      onError: err => console.error("[Decision]", err.message),
+      onStall: err => {
+        smartAtState.paused = true;
+        smartAtState.pauseReason = err.message;
+        console.error("[Decision]", err.message);
+      }
+    });
     runtime.start(async () => {
       await runtime.refreshContext();
       latestEvaluation = await evaluateSmartSignals();
       latestEvaluation.ts = Date.now();
-      await smartEvaluateAndTrade(latestEvaluation);
+      const observed = latestEvaluation;
+      decisions.run(() => smartEvaluateAndTrade(observed));
       deskTelemetry.record(latestEvaluation, {
         context: runtime.state.context, ready:runtime.state.ready, paused:smartAtState.paused,
         active:autoTradeActive, position:openPosition || emotionTrader.getEmoPosition(),

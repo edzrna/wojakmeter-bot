@@ -41,24 +41,24 @@ function engineContext(extra={}) {
 }
 test('high alignment with confirmation enabled stages once; never auto-executes',async()=>{
   let staged=0;let orders=0;const ctx=engineContext({atExecuteTrade:async()=>{staged++;},smartExecuteAuto:async()=>{orders++;}});
-  await ctx.smartEvaluateAndTrade({direction:'LONG',confidence:'high',alignedCount:3,globalScore:70,details:[]});
+  await ctx.smartEvaluateAndTrade({ts:Date.now(),direction:'LONG',confidence:'high',alignedCount:3,globalScore:70,details:[]});
   assert.equal(staged,1);assert.equal(orders,0);
 });
 test('explicit auto mode executes high alignment and records only success',async()=>{
   let orders=0;const ctx=engineContext({SMART_AT:{cooldownMs:0,autoExecuteOnTriple:true},smartExecuteAuto:async()=>{orders++;return true;}});
-  await ctx.smartEvaluateAndTrade({direction:'LONG',confidence:'high',alignedCount:3});
+  await ctx.smartEvaluateAndTrade({ts:Date.now(),direction:'LONG',confidence:'high',alignedCount:3});
   assert.equal(orders,1);assert.equal(ctx.smartAtState.totalAutoTrades,1);
 });
 test('invalid evaluation and paused engine never execute',async()=>{
   let orders=0;const ctx=engineContext({smartExecuteAuto:async()=>{orders++;}});
   await ctx.smartEvaluateAndTrade({error:'missing input',direction:'LONG',confidence:'high'});
   ctx.smartAtState.paused=true;
-  await ctx.smartEvaluateAndTrade({direction:'LONG',confidence:'high'});assert.equal(orders,0);
+  await ctx.smartEvaluateAndTrade({ts:Date.now(),direction:'LONG',confidence:'high'});assert.equal(orders,0);
 });
 test('protection failure retains the actual entry and pauses further entries',async()=>{
   const ctx={console:{log(){},error(){}},Date,AT_LEVERAGE:2,PERSONAL_PLAN:{riskPerTrade:2},SL_PCT:1,TP_PCT:2,
-    atSetLeverage:async()=>{},atGetMarkPrice:async()=>100,atGetExchangeInfo:async()=>({}),calculateQtyByRisk:()=>({qty:1}),
-    sendPrivate:async()=>{},sendPrivateError:async()=>{},atPlaceMarketOrder:async()=>({avgPrice:'100'}),sleep:async()=>{},
+    entryAllowed:()=>true,atSetLeverage:async()=>{},atGetMarkPrice:async()=>100,atGetExchangeInfo:async()=>({}),calculateQtyByRisk:()=>({qty:1}),
+    sendPrivate:async()=>{},sendPrivateError:async()=>{},atPlaceMarketOrder:async()=>({orderId:1,avgPrice:'100'}),sleep:async()=>{},
     atPlaceSlTpOrders:async()=>{throw Error('protection rejected');},openPosition:null,lastTradeSignalTs:0,personalTradingState:{tradesToday:0},smartAtState:{},escapeHTML:x=>x,formatUsd:x=>x};
   vm.createContext(ctx);
   vm.runInContext(source.slice(source.indexOf('async function executeAutoInternal('),source.indexOf('function recordSmartTradeResult(')),ctx);
@@ -75,4 +75,12 @@ test('startup gate, cross-engine positions and daily limit block new entries',()
   ctx.runtime.state.ready=true;assert.equal(ctx.entryAllowed('smart'),true);
   ctx.emotionTrader.getEmoPosition=()=>({symbol:'ETHUSDT'});assert.equal(ctx.entryAllowed('smart'),false);
   ctx.emotionTrader.getEmoPosition=()=>null;ctx.personalTradingState.tradesToday=5;assert.equal(ctx.entryAllowed('smart'),false);
+});
+test('two aligned signals execute only when enabled, and conflict/stale signals never execute',async()=>{
+ let orders=0;const ctx=engineContext({SMART_AT:{cooldownMs:0,autoExecuteOnTriple:true,autoOnMedium:true},smartExecuteAuto:async()=>{orders++;return true;}});
+ const ev={ts:Date.now(),direction:'SHORT',confidence:'medium',alignedCount:2};
+ await ctx.smartEvaluateAndTrade(ev);assert.equal(orders,1);
+ await ctx.smartEvaluateAndTrade({...ev,conflict:true});
+ await ctx.smartEvaluateAndTrade({...ev,ts:Date.now()-121000});
+ await ctx.smartEvaluateAndTrade({...ev,alignedCount:1});assert.equal(orders,1);
 });
