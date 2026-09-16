@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
@@ -59,7 +60,7 @@ test('protection failure retains the actual entry and pauses further entries',as
   const ctx={console:{log(){},error(){}},Date,AT_LEVERAGE:2,PERSONAL_PLAN:{riskPerTrade:2},SL_PCT:1,TP_PCT:2,
     entryAllowed:()=>true,atSetLeverage:async()=>{},atGetMarkPrice:async()=>100,atGetExchangeInfo:async()=>({}),calculateQtyByRisk:()=>({qty:1}),
     sendPrivate:async()=>{},sendPrivateError:async()=>{},atPlaceMarketOrder:async()=>({orderId:1,avgPrice:'100'}),sleep:async()=>{},
-    atPlaceSlTpOrders:async()=>{throw Error('protection rejected');},openPosition:null,lastTradeSignalTs:0,personalTradingState:{tradesToday:0},smartAtState:{},escapeHTML:x=>x,formatUsd:x=>x};
+    atPlaceSlTpOrders:async()=>{throw Error('protection rejected');},openPosition:null,lastTradeSignalTs:0,personalTradingState:{tradesToday:0},smartAtState:{},escapeHTML:x=>x,formatUsd:x=>x,crypto};
   vm.createContext(ctx);
   vm.runInContext(source.slice(source.indexOf('async function executeAutoInternal('),source.indexOf('function recordSmartTradeResult(')),ctx);
   assert.equal(await ctx.executeAutoInternal('BTCUSDT','BUY',70,{}),false);
