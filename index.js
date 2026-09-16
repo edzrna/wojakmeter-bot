@@ -4038,9 +4038,25 @@ const deskRecovery = createRecovery({
 // what price actually did. This is measurement, not trading —
 // the numbers in TRANSITION_RULES were reasoned, not observed.
 // ===============================
+// Neon keeps the dataset across redeploys. Without it the lab
+// falls back to a local file, which Railway wipes on every deploy —
+// fatal for research that needs weeks of continuous data.
+let labSql = null;
+
+if (process.env.DATABASE_URL) {
+  try {
+    const { neon } = require("@neondatabase/serverless");
+    labSql = neon(process.env.DATABASE_URL);
+  } catch (err) {
+    console.error("[Lab] Neon unavailable, falling back to file:", err.message);
+  }
+} else {
+  console.warn("[Lab] DATABASE_URL not set — using file storage, data will not survive a redeploy");
+}
+
 const lab = createEmotionLab({
-  getPrice: atGetMarkPrice
-  // sql: neonClient   ← swap in Neon so data survives a redeploy
+  getPrice: atGetMarkPrice,
+  sql: labSql
 });
 
 // Writes down the outcome once each horizon has elapsed
