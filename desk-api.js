@@ -27,6 +27,7 @@
 // ===============================
 
 const crypto = require("crypto");
+const { normalizePositions } = require("./desk-positions");
 
 // Requests older than this are rejected, so a captured request
 // cannot be replayed hours later.
@@ -115,27 +116,18 @@ function mount(app, deps) {
     const s = getState();
     const account = await deps.readAccount();
 
-    let livePnl = null;
-    let markPrice = null;
-
-    // If a position is open, price it right now so the Wojak
-    // on screen reflects the actual unrealized PnL.
-    if (s.openPosition) {
-      try {
-        markPrice = await getMarkPrice(s.openPosition.symbol);
-
-        const diff = s.openPosition.side === "BUY"
-          ? markPrice - s.openPosition.entryPrice
-          : s.openPosition.entryPrice - markPrice;
-
-        livePnl = parseFloat((diff * s.openPosition.qty).toFixed(2));
-      } catch (_) {}
-    }
+    let positions = null, positionsError = null, positionsUpdatedAt = null;
+    try {
+      positions = normalizePositions(await getOpenPositions(), s.openPosition);
+      positionsUpdatedAt = Date.now();
+    } catch (err) { positionsError = err.message; }
+    res.setHeader("Cache-Control", "private, no-store");
 
     res.json({
       ok: true,
       ts: Date.now(),
       account,
+      positions, positionsError, positionsUpdatedAt,
       engine: {
         recovering: Boolean(s.runtime?.recovering),
         recoveryError: s.runtime?.recoveryError || null,
@@ -146,12 +138,15 @@ function mount(app, deps) {
         lastEvaluation: s.runtime?.lastEvaluation || null,
         executionBusy: Boolean(s.runtime?.executionBusy),
         mode: s.SMART_AT?.autoExecuteOnTriple ? "Automatic" : "Confirmation required",
+        entryRequirement: Math.max(2, Math.min(3, Number(s.SMART_AT?.minSignalsRequired) || 2)),
+        automaticRequirement: s.SMART_AT?.autoExecuteOnTriple ? (s.SMART_AT.autoOnMedium ? Math.max(2, Math.min(3, Number(s.SMART_AT.minSignalsRequired)||2)) : 3) : null,
         blockers: [
           s.smartAtState?.lastEntrySkip && Date.now() - s.smartAtState.lastEntrySkip.at < 120000 && s.smartAtState.lastEntrySkip.reason,
           !s.runtime?.ready && "Account recovery is not complete",
           !s.autoTradeActive && "AutoTrade is OFF — enable it in the owner Telegram controls",
           s.smartAtState?.paused && (s.smartAtState.pauseReason || "Paused"),
-          (s.openPosition || s.emotion?.position) && "Position already open",
+          positionsError && "Exchange positions unavailable — verify account connection",
+          (positions?.length || s.openPosition || s.emotion?.position) && "Position already open",
           (s.pendingConfirm || s.emotion?.pending) && "Waiting for Telegram confirmation",
           s.personalTradingState?.coolingDown && "Daily risk lock",
           s.personalTradingState?.tradesToday >= s.PERSONAL_PLAN?.maxTradesPerDay && "Daily trade limit reached",
@@ -171,20 +166,7 @@ function mount(app, deps) {
         maxConsecutiveLosses: s.SMART_AT?.maxConsecutiveLosses || 2,
         totalTrades: s.smartAtState?.totalAutoTrades || 0
       },
-      position: s.openPosition
-        ? {
-            symbol: s.openPosition.symbol,
-            side: s.openPosition.side,
-            entryPrice: s.openPosition.entryPrice,
-            qty: s.openPosition.qty,
-            leverage: s.openPosition.leverage,
-            riskUsd: s.openPosition.riskUsd,
-            protectionPending: Boolean(s.openPosition.protectionPending),
-            markPrice,
-            livePnl,
-            openedAt: s.openPosition.ts
-          }
-        : null,
+      position: positions?.[0] || null,
       pending: s.pendingConfirm
         ? { symbol: s.pendingConfirm.symbol, side: s.pendingConfirm.side }
         : null,
@@ -274,6 +256,9 @@ function mount(app, deps) {
       return res.status(400).json({ ok: false, error: "No open position" });
     }
 
+    const positions = normalizePositions(await getOpenPositions(), s.openPosition);
+    const target = positions.find(p => p.id === req.body?.positionId);
+    if (!target?.canClose) return res.status(409).json({ok:false, error:"Selected position changed or is not managed by AutoTrade. Refresh and manage external positions in Binance or Telegram."});
     await closePosition("Closed from desk");
     res.json({ ok: true });
   }));

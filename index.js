@@ -222,9 +222,9 @@ async function atGetOpenPositions() {
     15000
   );
 
-  return Array.isArray(positions)
-    ? positions.filter((p) => Number(p.positionAmt) !== 0)
-    : [];
+  if (!Array.isArray(positions)) throw new Error("Invalid Binance positions response");
+  if (positions.some(p => p.positionAmt == null || !Number.isFinite(Number(p.positionAmt)))) throw new Error("Invalid Binance position amount");
+  return positions.filter(p => Number(p.positionAmt) !== 0);
 }
 
 async function atGetRealizedPnl(symbol, sinceTs) {
