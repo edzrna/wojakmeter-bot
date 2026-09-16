@@ -9,6 +9,8 @@ const runtime = require("./desk-runtime").createRuntime();
 let latestEvaluation = null;
 const deskTelemetry = require("./desk-telemetry").createTelemetry();
 const hybridMarket = require("./binance-market");
+const { createEmotionLab } = require("./emotion-lab");
+const deskLab = require("./desk-lab-routes");
 
 // ===============================
 // WOJAKMETER BOT — INDEX
@@ -4030,6 +4032,24 @@ const deskRecovery = createRecovery({
   }
 });
 
+// ===============================
+// EMOTION LAB
+// Records every emotional transition and comes back later to see
+// what price actually did. This is measurement, not trading —
+// the numbers in TRANSITION_RULES were reasoned, not observed.
+// ===============================
+const lab = createEmotionLab({
+  getPrice: atGetMarkPrice
+  // sql: neonClient   ← swap in Neon so data survives a redeploy
+});
+
+// Writes down the outcome once each horizon has elapsed
+setInterval(() => {
+  lab.resolveOutcomes().catch(err => console.error("[Lab]", err.message));
+}, 15 * 60 * 1000);
+
+deskLab.mount(app, { lab });
+
 deskApi.mount(app, {
   getTelemetry: () => deskTelemetry.read(),
   readAccount: readDeskAccount,
@@ -4096,6 +4116,12 @@ deskApi.mount(app, {
       latestEvaluation = await evaluateSmartSignals();
       latestEvaluation.ts = Date.now();
       const observed = latestEvaluation;
+
+      // Log the emotional state. Only writes a row when the mood
+      // actually changes, so this is cheap on every other tick.
+      lab.recordSnapshot(latestEvaluation).catch(err =>
+        console.error("[Lab]", err.message)
+      );
       decisions.run(() => smartEvaluateAndTrade(observed));
       deskTelemetry.record(latestEvaluation, {
         context: runtime.state.context, ready:runtime.state.ready, paused:smartAtState.paused,
