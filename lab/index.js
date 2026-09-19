@@ -105,6 +105,7 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
   let reportVersion = -1;
   let lastReportAt = 0;
   let lastAuditAt = 0;
+  let savedBlockUntil = null;
 
   let timer = null;
   let running = false;
@@ -251,6 +252,14 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
       const done = await store.getMeta('backfill:done');
       if (Array.isArray(done)) for (const m of done) doneMonths.add(m);
 
+      // A ban Binance sent before a restart still stands
+      const block = await store.getMeta('binance:block');
+      const until = Number(block?.until);
+      if (until > t && typeof rest?.blockUntil === 'function') {
+        rest.blockUntil(until, `${block.reason || 'Binance block'} (from before the restart)`);
+        savedBlockUntil = until;
+      }
+
       const rows = await store.loadSeries();
       for (const r of rows) put(r);
       dirty = true;
@@ -356,6 +365,7 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
     if (!backfillMonths) {
       backfillMonths = fromMonth <= currentMonth ? monthsBetween(fromMonth, currentMonth).reverse() : [];
       b.total = backfillMonths.length;
+      b.done = backfillMonths.filter(m => doneMonths.has(m)).length; // months finished before a restart
     }
 
     if (!universesReady) {
@@ -403,6 +413,15 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
       b.state = 'done';
       b.current = null;
     }
+  }
+
+  // Keep Binance's block across restarts (read back in ensureReady)
+  async function persistBlock() {
+    const s = typeof rest?.stats === 'function' ? rest.stats() : null;
+    const until = s && Number.isFinite(s.blockedUntil) ? s.blockedUntil : null;
+    if (!until || until === savedBlockUntil) return;
+    savedBlockUntil = until;
+    await store.setMeta('binance:block', { until, reason: s.blockReason }, now());
   }
 
   function contextForReport() {
@@ -485,6 +504,11 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
       await step('gaps', fillGaps);
       await step('audit', auditLive);
       await step('backfill', backfillStep);
+      try {
+        await persistBlock();
+      } catch (err) {
+        log.error(`[Lab] could not save the Binance block: ${err.message}`);
+      }
       await refreshReports();
       updateUniverseStatus();
       return { ready: true };
