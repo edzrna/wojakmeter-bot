@@ -80,3 +80,24 @@ test('day-block bootstrap: seeded, and honest when there is nothing to compare',
   const same = S.blockBootstrapCorrDiff({ ...args, x2: args.x1 });
   assert.equal(same.p, 1);
 });
+
+test('bootstrap p comes from the standard error: below 1/reps, and not at the mercy of the seed', () => {
+  const rnd = S.mulberry32(3);
+  const x1 = [], x2 = [], y = [], block = [];
+  for (let i = 0; i < 2000; i++) {
+    const g = rnd() - 0.5;
+    y.push(g);
+    x1.push(0.3 * g + 0.5 * (rnd() - 0.5));
+    x2.push(0.2 * g + 0.5 * (rnd() - 0.5));
+    block.push(Math.floor(i / 5));
+  }
+  const args = { x1: S.ranks(x1), x2: S.ranks(x2), y: S.ranks(y), block };
+  const a = S.blockBootstrapCorrDiff({ ...args, reps: 1000, seed: 1 });
+  const b = S.blockBootstrapCorrDiff({ ...args, reps: 4000, seed: 2 });
+
+  assert.ok(a.estimate > 0);
+  assert.ok(a.p < 1 / a.reps, `resolved below 1/reps: ${a.p}`);
+  assert.ok(Math.abs(Math.log10(a.p) - Math.log10(b.p)) < 0.3, `seed and reps barely matter: ${a.p} vs ${b.p}`);
+  assert.ok(a.pUp < a.pDown);
+  assert.equal(a.p, S.erfc(Math.abs(a.estimate / a.se) / Math.SQRT2));
+});

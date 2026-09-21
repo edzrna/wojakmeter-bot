@@ -101,6 +101,28 @@ test('451 (restricted location) fails fast and says where the problem is', async
   assert.match(rest.stats().blockReason, /HTTP 451/);
 });
 
+test('a block restored after a restart is honoured, and never shortened', async () => {
+  const clock = fakeClock();
+  let calls = 0;
+  const rest = createBinanceRest({
+    fetcher: async () => { calls++; return response({ ok: true }); },
+    now: clock.now,
+    sleep: clock.sleep,
+    minGapMs: 0
+  });
+  assert.equal(rest.stats().weightBudget, 600, 'a quarter of the IP limit');
+
+  rest.blockUntil(clock.now() + 60 * 60_000, 'HTTP 418 (from before the restart)');
+  await assert.rejects(rest.request('/x'), err => err.code === 'BLOCKED' && /before the restart/.test(err.message));
+  rest.blockUntil(clock.now() + 1000, 'shorter');
+  assert.match(rest.stats().blockReason, /before the restart/);
+  assert.equal(calls, 0);
+
+  clock.advance(60 * 60_000);
+  await rest.request('/x');
+  assert.equal(calls, 1);
+});
+
 test('bad symbols and bad rows are errors with a cause', async () => {
   const clock = fakeClock();
   const rest = createBinanceRest({
@@ -185,4 +207,36 @@ test('no secret on the service is a 503, not an open door', () => {
   const r = auth.verify(signed({ url: '/desk/x', ts: Date.now() }));
   assert.equal(r.status, 503);
   assert.match(r.error, /BOT_API_SECRET is not set/);
+});
+
+test('the database wrapper retries a dropped connection and nothing else', async () => {
+  const { withRetry } = require('../lib/db-retry');
+  const waits = [];
+  const sleep = async ms => { waits.push(ms); };
+
+  let calls = 0;
+  const flaky = async () => {
+    calls++;
+    if (calls < 3) throw new Error('Error connecting to database: TypeError: fetch failed');
+    return [{ ok: 1 }];
+  };
+  const sql = withRetry(flaky, { sleep });
+  assert.deepEqual(await sql`SELECT 1`, [{ ok: 1 }]);
+  assert.equal(calls, 3);
+  assert.deepEqual(waits, [500, 2000]);
+
+  let bad = 0;
+  const broken = withRetry(async () => { bad++; throw new Error('syntax error at or near "SELEC"'); }, { sleep });
+  await assert.rejects(broken`SELEC 1`, /syntax error/);
+  assert.equal(bad, 1, 'a real SQL error is not retried');
+
+  let down = 0;
+  const dead = withRetry(async () => { down++; throw new Error('fetch failed'); }, { sleep });
+  await assert.rejects(dead`SELECT 1`, /fetch failed/);
+  assert.equal(down, 3, 'three tries, then the error goes up with its message');
+
+  let seen = null;
+  const passthrough = withRetry(async (strings, ...values) => { seen = { strings: [...strings], values }; return []; }, { sleep });
+  await passthrough`SELECT ${1} + ${2}`;
+  assert.deepEqual(seen, { strings: ['SELECT ', ' + ', ''], values: [1, 2] }, 'the tagged template reaches the driver intact');
 });

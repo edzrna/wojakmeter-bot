@@ -81,7 +81,7 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
     },
     recorder: { lastLiveTs: null, lastRunAt: null, lastResult: null, lastError: null },
     gaps: { lastRunAt: null, filled: 0, failing: 0, lastError: null },
-    audit: { lastRunAt: null, checked: 0, lastError: null },
+    audit: { lastRunAt: null, checked: 0, lastError: null, lastErrorAt: null },
     backfill: { state: 'waiting', from: fromMonth, total: 0, done: 0, current: null, lastError: null, skipped: {} },
     universe: { month: null, basis: null, symbols: [], survivorship: null, lastError: null },
     reports: { computing: false, computedAt: null, lastError: null }
@@ -105,6 +105,7 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
   let reportVersion = -1;
   let lastReportAt = 0;
   let lastAuditAt = 0;
+  let savedBlockUntil = null;
 
   let timer = null;
   let running = false;
@@ -251,6 +252,14 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
       const done = await store.getMeta('backfill:done');
       if (Array.isArray(done)) for (const m of done) doneMonths.add(m);
 
+      // A ban Binance sent before a restart still stands
+      const block = await store.getMeta('binance:block');
+      const until = Number(block?.until);
+      if (until > t && typeof rest?.blockUntil === 'function') {
+        rest.blockUntil(until, `${block.reason || 'Binance block'} (from before the restart)`);
+        savedBlockUntil = until;
+      }
+
       const rows = await store.loadSeries();
       for (const r of rows) put(r);
       dirty = true;
@@ -337,13 +346,25 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
     if (!due.length) return;
 
     const pick = due.sort((a, b) => b - a).slice(0, cfg.auditBatch).sort((a, b) => a - b);
-    const { snapshots, invalid } = await reconstructor.build(pick);
-    if (snapshots.length) {
-      await store.upsertSnapshots('backfill', snapshots, t);
-      merge('backfill', snapshots);
+
+    let snapshots;
+    let invalid;
+    try {
+      ({ snapshots, invalid } = await reconstructor.build(pick));
+      if (snapshots.length) {
+        await store.upsertSnapshots('backfill', snapshots, t);
+        merge('backfill', snapshots);
+      }
+    } catch (err) {
+      // Binance or the database had a bad minute: try again in five,
+      // not in an hour
+      lastAuditAt = t - cfg.auditEveryMs + 5 * MINUTE;
+      throw err;
     }
+
     status.audit.checked += snapshots.length;
     status.audit.lastError = invalid.length ? `${iso(invalid[0].ts)}: ${invalid[0].reason}` : null;
+    status.audit.lastErrorAt = invalid.length ? t : null;
   }
 
   async function backfillStep() {
@@ -356,6 +377,7 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
     if (!backfillMonths) {
       backfillMonths = fromMonth <= currentMonth ? monthsBetween(fromMonth, currentMonth).reverse() : [];
       b.total = backfillMonths.length;
+      b.done = backfillMonths.filter(m => doneMonths.has(m)).length; // months finished before a restart
     }
 
     if (!universesReady) {
@@ -397,12 +419,22 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
     doneMonths.add(next);
     await store.setMeta('backfill:done', [...doneMonths].sort(), now());
     b.done = backfillMonths.filter(m => doneMonths.has(m)).length;
+    b.current = backfillMonths.find(m => !doneMonths.has(m)) || null; // the month up next, not the one just finished
     b.lastError = null;
 
     if (b.done === b.total) {
       b.state = 'done';
       b.current = null;
     }
+  }
+
+  // Keep Binance's block across restarts (read back in ensureReady)
+  async function persistBlock() {
+    const s = typeof rest?.stats === 'function' ? rest.stats() : null;
+    const until = s && Number.isFinite(s.blockedUntil) ? s.blockedUntil : null;
+    if (!until || until === savedBlockUntil) return;
+    savedBlockUntil = until;
+    await store.setMeta('binance:block', { until, reason: s.blockReason }, now());
   }
 
   function contextForReport() {
@@ -467,11 +499,14 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
     }
   }
 
+  // Errors carry the time they happened: a task that runs once an hour
+  // would otherwise show an old failure as if it were current
   async function step(name, fn) {
     try {
       await fn();
     } catch (err) {
       status[name].lastError = err.message;
+      status[name].lastErrorAt = now();
       log.error(`[Lab] ${name}: ${err.message}`);
     }
   }
@@ -485,6 +520,11 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
       await step('gaps', fillGaps);
       await step('audit', auditLive);
       await step('backfill', backfillStep);
+      try {
+        await persistBlock();
+      } catch (err) {
+        log.error(`[Lab] could not save the Binance block: ${err.message}`);
+      }
       await refreshReports();
       updateUniverseStatus();
       return { ready: true };
@@ -555,8 +595,9 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
 
   // The lattice: where the market is now, where it has been today,
   // and how the last 30 days split across the cells.
-  function state() {
-    const model = MODELS.hex;
+  function state(modelName = 'hex') {
+    const model = MODELS[modelName];
+    if (!model || modelName === 'linear') return { ok: false, error: `No lattice for model: ${modelName}` };
     const geometry = topology.geometry();
     const series = unified();
 
@@ -579,7 +620,7 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
     const indices = [];
     for (let i = 0; i < slice.length; i++) if (slice[i].ts > windowFrom) indices.push(i);
 
-    const states = computeStates(slice, 'hex', { indices });
+    const states = computeStates(slice, modelName, { indices });
     const recent = indices.map(i => states[i]);
     const latest = states[slice.length - 1];
     const snap = slice[slice.length - 1];

@@ -153,3 +153,51 @@ test('insufficient data says how much is missing', () => {
   const row = r.screen.rows[0];
   assert.match(row.h24.reason, /history has \d+ independent events; 30 needed/);
 });
+
+test('history is frozen: data arriving after the freeze never moves a history number', () => {
+  const short = synthetic({ days: 100, seed: 17 });
+  const long = synthetic({ days: 120, seed: 17 }); // the same 100 days, then 20 more
+  const freezeTs = short[95 * 96 - 1].ts;          // five days before it ends, inside its last month
+
+  const a = A.analyze({ series: short, modelName: 'hex', freezeTs, reps: 200 });
+  const b = A.analyze({ series: long, modelName: 'hex', freezeTs, reps: 200 });
+
+  const keys = ['h1', 'h4', 'h24'];
+  assert.deepEqual(
+    b.hypotheses.list.map(hy => keys.map(k => [hy[k].history.estimate, hy[k].history.p])),
+    a.hypotheses.list.map(hy => keys.map(k => [hy[k].history.estimate, hy[k].history.p]))
+  );
+
+  // rows are sorted by total count, live included: match them by name
+  const rowsOf = r => new Map(r.screen.rows.map(row => [row.transition, row]));
+  const ra = rowsOf(a);
+  for (const [name, row] of rowsOf(b)) {
+    const before = ra.get(name);
+    for (const k of keys) {
+      if (!before) {
+        assert.equal(row[k].history.n, 0, `${name} only exists after the freeze`);
+        continue;
+      }
+      const x = before[k].history;
+      const y = row[k].history;
+      assert.deepEqual([y.mean, y.p, y.nEff, y.pHolm], [x.mean, x.p, x.nEff, x.pHolm], `${name} ${k}`);
+    }
+  }
+  assert.ok(b.samples.live.snapshots > a.samples.live.snapshots, 'B really has more after the freeze');
+});
+
+test('a clear result against the statement is a candidate that says which way it runs', () => {
+  const def = A.HYPOTHESES.find(h => h.id === 'H3');
+  const history = { testable: true, estimate: -0.026, pHolm: 0.01, detail: {} };
+  const live = { testable: false, reason: 'needs 20 days with transitions; has 0' };
+  const v = A.judgeHypothesis(def, { history, live });
+  assert.equal(v.verdict, 'pending');
+  assert.equal(v.opposite, true);
+  assert.match(v.reason, /the opposite of the statement/);
+
+  const same = A.judgeHypothesis(def, { history: { ...history, estimate: 0.026 }, live });
+  assert.equal(same.opposite, false);
+
+  const nan = A.judgeHypothesis(def, { history: { ...history, pHolm: NaN }, live });
+  assert.equal(nan.verdict, 'noise', 'a p that could not be computed is never a candidate');
+});

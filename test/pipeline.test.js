@@ -87,6 +87,7 @@ test('pipeline: live, gaps, history, reports and the signed desk API', async t =
   assert.equal(st.recorder.lastLiveTs, Date.UTC(2026, 2, 10, 12, 0));
   assert.equal(st.backfill.done, 1);
   assert.equal(st.backfill.total, 2);
+  assert.equal(st.backfill.current, '2026-02', 'the month up next, not the one just finished');
   const freeze = st.freeze['hex-v1'];
   assert.equal(freeze, Date.UTC(2026, 2, 10, 12, 5, 30), 'frozen at first start');
 
@@ -225,7 +226,7 @@ test('pipeline: live, gaps, history, reports and the signed desk API', async t =
 
       const bogus = await get('/desk/lab/report?model=bogus');
       assert.equal(bogus.status, 400);
-      assert.match(bogus.body.error, /model: Expected one of hex, linear/);
+      assert.match(bogus.body.error, /model: Expected one of hex, hex2, linear/);
 
       const twice = await get('/desk/lab/report?model=hex&model=linear');
       assert.equal(twice.status, 400);
@@ -243,6 +244,18 @@ test('pipeline: live, gaps, history, reports and the signed desk API', async t =
       assert.equal((await get('/desk/lab/status', {})).status, 401);
       assert.deepEqual((await get('/health', {})).body, { ok: true, ready: true });
       assert.equal((await get('/nope', {})).status, 404);
+
+      const v2 = await get('/desk/lab/report?model=hex2');
+      assert.equal(v2.status, 200);
+      assert.equal(v2.body.model.version, 'hex-v2');
+      const lattice2 = await get('/desk/lab/state?model=hex2');
+      assert.equal(lattice2.status, 200);
+      assert.equal(lattice2.body.model, 'hex-v2');
+      assert.equal((await get('/desk/lab/state?model=linear')).status, 400, 'there is no lattice for the linear scale');
+
+      const freeze = (await get('/desk/lab/status')).body.freeze;
+      assert.ok(Number.isFinite(freeze['hex-v2']), 'hex-v2 has its own freeze');
+      assert.ok(Number.isFinite(freeze['hex-v1']));
     } finally {
       await new Promise(resolve => server.close(resolve));
     }
@@ -274,4 +287,91 @@ test('without a database the lab says so everywhere', async () => {
   assert.match(lab.state().reason, /DATABASE_URL is not set/);
   const st = lab.status();
   assert.match(st.config.warning, /"1999-13" is not YYYY-MM; using 2024-01/);
+});
+
+test('a Binance ban survives a restart: the new process does not knock, then resumes on its own', async () => {
+  const { market, info } = world();
+  let clock = Date.UTC(2026, 2, 10, 12, 5, 30);
+  const ban = { until: null };
+  const sql = await createTestSql();
+  const fake = createFakeBinance(market, { exchangeSymbols: info, now: () => clock, ban });
+  const make = () => createLab({
+    sql,
+    rest: createBinanceRest({ fetcher: fake.fetcher, now: () => clock, sleep: async ms => { clock += ms; }, minGapMs: 0 }),
+    now: () => clock,
+    backfillFrom: '2026-02',
+    log: quietLog
+  });
+
+  const first = make();
+  await first.tick();
+  assert.equal(first.status().backfill.done, 1, 'March first');
+
+  ban.until = clock + 90 * MIN;
+  clock += MIN;
+  await first.tick();
+  let s = first.status();
+  assert.match(s.backfill.lastError, /HTTP 418/);
+  assert.equal(s.binance.blockedUntil, ban.until, 'Retry-After honoured');
+
+  // a redeploy: new process, new client, same database
+  const knocks = fake.calls.length;
+  const second = make();
+  await second.tick();
+  s = second.status();
+  assert.equal(fake.calls.length, knocks, 'not one request during the ban');
+  assert.equal(s.binance.blockedUntil, ban.until);
+  assert.match(s.binance.blockReason, /HTTP 418 \(from before the restart\)/);
+  assert.equal(s.backfill.done, 1, 'months finished before the restart still count');
+  assert.equal(s.backfill.total, 2);
+
+  clock = ban.until + MIN;
+  await second.tick();
+  s = second.status();
+  assert.equal(s.binance.blockedUntil, null);
+  assert.equal(s.backfill.state, 'done');
+  assert.equal(s.backfill.done, 2);
+  assert.equal(s.recorder.lastLiveTs, Date.UTC(2026, 2, 10, 13, 30));
+  assert.equal(s.data.snapshots, 3606, 'the hour lost to the ban is rebuilt: no holes');
+  await sql.db.close();
+});
+
+test('a bad minute at the database delays the audit by five minutes, not by an hour, and says when it failed', async () => {
+  const { market, info } = world();
+  let clock = Date.UTC(2026, 2, 10, 12, 5, 30);
+  const real = await createTestSql();
+  const broken = { on: false };
+  const sql = (...args) => {
+    if (broken.on) throw new Error('Error connecting to database: TypeError: fetch failed');
+    return real(...args);
+  };
+  sql.db = real.db;
+
+  const fake = createFakeBinance(market, { exchangeSymbols: info, now: () => clock });
+  const lab = createLab({
+    sql,
+    rest: createBinanceRest({ fetcher: fake.fetcher, now: () => clock, sleep: async ms => { clock += ms; }, minGapMs: 0 }),
+    now: () => clock,
+    backfillFrom: '2026-03',
+    log: quietLog
+  });
+
+  await lab.tick();                       // first tick: nothing to audit yet
+  clock = Date.UTC(2026, 2, 10, 13, 20, 30);
+  broken.on = true;
+  await lab.tick();
+  let s = lab.status();
+  assert.match(s.audit.lastError, /Error connecting to database/);
+  assert.equal(s.audit.lastErrorAt, clock, 'the error carries its time');
+  assert.equal(s.audit.checked, 0);
+
+  broken.on = false;
+  clock += 6 * MIN;
+  await lab.tick();
+  s = lab.status();
+  assert.ok(s.audit.checked > 0, 'it tried again within the hour');
+  assert.equal(s.audit.lastError, null);
+  assert.equal(s.audit.lastErrorAt, null);
+  assert.equal(s.data.liveVsBackfill.mismatches, 0);
+  await real.db.close();
 });

@@ -9,6 +9,12 @@
 //              lattice has something to beat.
 //   hex-v1     direction (breadth) × intensity (activation) → the
 //              nearest cell of the lattice.
+//   hex-v2     the same axes with a steadier intensity. hex-v1 crossed
+//              cells about fourteen times a day, most of them the
+//              intensity of a single hour wobbling across a boundary.
+//              v2 reads the intensity over four hours, keeps a cell
+//              until the point is clearly out of it, and asks a state
+//              to last an hour before it counts.
 //
 // Nothing is stored per model. States, transitions and routes are
 // recomputed from raw snapshots every time, so a model can change
@@ -25,7 +31,7 @@
 // ===============================
 
 const {
-  CENTRE, LINEAR, hexDistance, linearDistance, rimDistance, classifyPoint, transitionKind
+  CENTRE, LINEAR, hexDistance, linearDistance, rimDistance, classifyPoint, classifyPointSticky, transitionKind
 } = require('./hex-topology');
 const { INTERVAL_MS } = require('./metrics');
 
@@ -53,8 +59,49 @@ const MODELS = {
       'Direction = 2·breadth − 1. Intensity = 2·p − 1, where p is the percentile of the median 1 h high–low range ' +
       'against the same hour (±1 h) over the previous 30 days. The point (direction, intensity) / D belongs to the ' +
       'nearest lattice centre.'
+  },
+  hex2: {
+    name: 'hex2',
+    version: 'hex-v2',
+    params: {
+      D: 0.6,
+      windowDays: 30,
+      slotHalfWidth: 4,
+      minHistory: 63,
+      minDwell: 4,      // a state counts after an hour, not half an hour
+      smoothSteps: 16,  // intensity from the median of the last 4 h
+      margin: 0.15      // a cell is kept until the point is clearly out
+    },
+    description:
+      'Same axes as hex-v1 with a steadier intensity: the percentile is taken on the median of the last 4 h of ' +
+      '1 h ranges, a cell is only left once the point is 0.15 past the boundary, and a state counts after an hour.'
   }
 };
+
+// Trailing median of the last `steps` readings. A hole leaves the
+// window short and the value unknown: nothing is invented across
+// missing snapshots. Only ts and actRaw are needed downstream.
+function smoothedSeries(series, steps) {
+  const out = new Array(series.length);
+  const win = [];
+
+  for (let i = 0; i < series.length; i++) {
+    const s = series[i];
+    if (i > 0 && s.ts - series[i - 1].ts !== INTERVAL_MS) win.length = 0;
+    win.push(Number.isFinite(s.actRaw) ? s.actRaw : NaN);
+    if (win.length > steps) win.shift();
+
+    let value = NaN;
+    if (win.length === steps && win.every(Number.isFinite)) {
+      const sorted = win.slice().sort((a, b) => a - b);
+      const half = steps >> 1;
+      value = steps % 2 ? sorted[half] : (sorted[half - 1] + sorted[half]) / 2;
+    }
+    out[i] = { ts: s.ts, actRaw: value };
+  }
+
+  return out;
+}
 
 function linearMood(breadth, thresholds = MODELS.linear.params.thresholds) {
   const score = Math.round(breadth * 100);
@@ -132,19 +179,37 @@ function computeStates(series, modelName, { indices = null } = {}) {
     });
   }
 
-  const pct = activationPercentiles(series, { ...model.params, indices });
-  const wanted = indices ? new Set(indices) : null;
-  const D = model.params.D;
+  const p = model.params;
+  const source = p.smoothSteps > 1 ? smoothedSeries(series, p.smoothSteps) : series;
+
+  // A dead band needs an unbroken chain of states, so a model that has
+  // one computes every snapshot: `indices` would leave holes in it
+  const targets = p.margin > 0 ? null : indices;
+  const pct = activationPercentiles(source, { ...p, indices: targets });
+  const wanted = targets ? new Set(targets) : null;
+  const D = p.D;
+
+  let prevMood = null;
+  let prevTs = null;
 
   return series.map((s, i) => {
     if (wanted && !wanted.has(i)) return { ts: s.ts, mood: null, reason: 'not computed' };
+
     const a = pct[i];
     if (!Number.isFinite(a) || !Number.isFinite(s.breadth)) {
+      prevMood = null;
+      prevTs = null;
       return { ts: s.ts, mood: null, reason: 'intensity needs 7 days of comparable history' };
     }
+
     const x = (2 * s.breadth - 1) / D;
     const y = (2 * a - 1) / D;
-    return { ts: s.ts, mood: classifyPoint(x, y), x, y, activationPct: a };
+    const chained = prevTs !== null && s.ts - prevTs === INTERVAL_MS;
+    const mood = p.margin > 0 ? classifyPointSticky(x, y, chained ? prevMood : null, p.margin) : classifyPoint(x, y);
+
+    prevMood = mood;
+    prevTs = s.ts;
+    return { ts: s.ts, mood, x, y, activationPct: a };
   });
 }
 

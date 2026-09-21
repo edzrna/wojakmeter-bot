@@ -134,6 +134,33 @@ function classifyPoint(x, y) {
   return best.p <= NEUTRAL_LIMIT + EPS ? CENTRE : best.d.mood;
 }
 
+// The same classifier with a dead band: a cell is kept until the point
+// is `margin` past the boundary, measured on the same projection the
+// classifier uses. Without it, a reading sitting on a seam flips cell
+// on measurement noise alone and every flip counts as a transition.
+function classifyPointSticky(x, y, previous, margin = 0) {
+  const fresh = classifyPoint(x, y);
+  if (!margin || fresh === null || !isValid(previous) || fresh === previous) return fresh;
+
+  let best = null;
+  for (const d of DIRECTIONS) {
+    const p = x * d.x + y * d.y;
+    if (!best || p > best.p) best = { p, mood: d.mood };
+  }
+
+  // Inside the neutral region: leave a rim cell only once clearly in
+  if (best.p <= NEUTRAL_LIMIT + EPS) {
+    return best.p <= NEUTRAL_LIMIT - margin ? CENTRE : previous;
+  }
+
+  // Coming out of neutral: the point must be clearly out
+  if (previous === CENTRE) return best.p > NEUTRAL_LIMIT + margin ? best.mood : CENTRE;
+
+  const c = centre(previous);
+  const pPrev = x * c.x + y * c.y;
+  return best.p > pPrev + margin ? best.mood : previous;
+}
+
 // ===============================
 // TRANSITIONS
 // ===============================
@@ -181,6 +208,7 @@ module.exports = {
   linearDistance,
   rimDistance,
   classifyPoint,
+  classifyPointSticky,
   transitionKind,
   geometry
 };

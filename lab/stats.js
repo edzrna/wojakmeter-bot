@@ -253,6 +253,15 @@ function blockBootstrapCorrDiff({ x1, x2, y, block, reps = 1000, seed = 1 }) {
   const next = mulberry32(seed);
   const diffs = [];
 
+  // The observed difference, on all the data
+  let n0 = 0, a1 = 0, a2 = 0, ay = 0, a11 = 0, a22 = 0, ayy = 0, a1y = 0, a2y = 0;
+  for (let i = 0; i < y.length; i++) {
+    const a = x1[i], b = x2[i], c = y[i];
+    n0++; a1 += a; a2 += b; ay += c;
+    a11 += a * a; a22 += b * b; ayy += c * c; a1y += a * c; a2y += b * c;
+  }
+  const estimate = corrFromSums(n0, a1, ay, a11, ayy, a1y) - corrFromSums(n0, a2, ay, a22, ayy, a2y);
+
   for (let r = 0; r < reps; r++) {
     let n = 0, s1 = 0, s2 = 0, sy = 0, s11 = 0, s22 = 0, syy = 0, s1y = 0, s2y = 0;
     for (let k = 0; k < keys.length; k++) {
@@ -267,20 +276,35 @@ function blockBootstrapCorrDiff({ x1, x2, y, block, reps = 1000, seed = 1 }) {
     if (Number.isFinite(r1) && Number.isFinite(r2)) diffs.push(r1 - r2);
   }
 
-  if (!diffs.length) return { lo: NaN, hi: NaN, p: NaN, pUp: NaN, pDown: NaN, reps: 0 };
+  if (!diffs.length) return { lo: NaN, hi: NaN, estimate, se: NaN, p: NaN, pUp: NaN, pDown: NaN, reps: 0 };
 
   diffs.sort((a, b) => a - b);
   const R = diffs.length;
-  const le = diffs.filter(d => d <= 0).length / R;
-  const ge = diffs.filter(d => d >= 0).length / R;
-  const floor = 1 / R;
+  const mean = diffs.reduce((s, d) => s + d, 0) / R;
+  const se = R > 1 ? Math.sqrt(diffs.reduce((s, d) => s + (d - mean) ** 2, 0) / (R - 1)) : NaN;
+  const lo = quantile(diffs, 0.025);
+  const hi = quantile(diffs, 0.975);
 
+  // Nothing varies: no evidence either way (or nothing to test)
+  if (!(se > 0)) {
+    const none = estimate === 0 ? 1 : NaN;
+    return { lo, hi, estimate, se, p: none, pUp: none, pDown: none, reps: R };
+  }
+
+  // p from the normal tail of estimate / bootstrap standard error.
+  // Counting resamples beyond zero cannot go below 1/R and is Monte
+  // Carlo noise exactly where Holm decides: 0.05/12 ≈ 0.004 is four
+  // resamples in 1,000, so the seed could make or break a candidate.
+  // The standard error from 1,000 resamples is good to a few percent.
+  const z = estimate / se;
   return {
-    lo: quantile(diffs, 0.025),
-    hi: quantile(diffs, 0.975),
-    p: Math.min(1, Math.max(floor, 2 * Math.min(le, ge))),
-    pUp: Math.max(floor, le),   // evidence that the difference is > 0
-    pDown: Math.max(floor, ge), // evidence that the difference is < 0
+    lo,
+    hi,
+    estimate,
+    se,
+    p: zTwoSided(z),
+    pUp: zOneSided(z, 1),    // evidence that the difference is > 0
+    pDown: zOneSided(z, -1), // evidence that the difference is < 0
     reps: R
   };
 }

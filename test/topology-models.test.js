@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const H = require('../lab/hex-topology');
 const Mo = require('../lab/models');
-const { mulberry32 } = require('./helpers');
+const { mulberry32, monthKey } = require('./helpers');
 
 const I = 15 * 60 * 1000;
 const DAY = 24 * 60 * 60 * 1000;
@@ -164,4 +164,75 @@ test('rim arrivals: through the centre, straight across, or back to the same sid
     ['euphoria', 'euphoria', 'return', 0],
     ['euphoria', 'frustration', 'rim', 1]
   ]);
+});
+
+test('the dead band keeps a cell until the point is clearly out of it', () => {
+  const m = 0.15;
+  assert.equal(H.classifyPointSticky(0.02, -1.0, 'doubt', m), 'doubt', 'a point on the seam does not change cell');
+  assert.equal(H.classifyPointSticky(0.35, -1.0, 'doubt', m), 'optimism', 'clearly across, it does');
+  assert.equal(H.classifyPointSticky(0.55, 0, 'neutral', m), 'neutral', 'leaving neutral needs more than grazing it');
+  assert.equal(H.classifyPointSticky(0.72, 0, 'neutral', m), 'content');
+  assert.equal(H.classifyPointSticky(0.45, 0, 'content', m), 'content', 'entering neutral needs to be clearly inside');
+  assert.equal(H.classifyPointSticky(0.30, 0, 'content', m), 'neutral');
+  assert.equal(H.classifyPointSticky(0.02, -1.0, null, m), H.classifyPoint(0.02, -1.0), 'with no previous cell it is the plain classifier');
+  assert.equal(H.classifyPointSticky(0.02, -1.0, 'doubt', 0), H.classifyPoint(0.02, -1.0), 'margin 0 is the plain classifier');
+});
+
+test('hex-v2 follows the market and ignores the wobble that hex-v1 counts as transitions', () => {
+  // 40 days of snapshots: breadth steady, intensity swinging hard every
+  // half hour. Runs of two survive hex-v1's dwell filter, which is what
+  // made real flicker count as transitions; pure alternation would not.
+  const start = Date.UTC(2025, 0, 1);
+  const series = [];
+  for (let i = 0; i < 40 * 96; i++) {
+    const ts = start + (i + 1) * 15 * 60 * 1000;
+    series.push({
+      ts,
+      month: monthKey(ts - 1),
+      breadth: 0.8,
+      actRaw: i % 4 < 2 ? 0.4 : 2.6,     // two calm readings, two violent, forever
+      coverage: 20,
+      universeN: 20,
+      btcClose: 50000
+    });
+  }
+
+  const count = name => {
+    const states = Mo.computeStates(series, name);
+    const { transitions } = Mo.buildTransitions(Mo.buildEpisodes(states, { minDwell: Mo.MODELS[name].params.minDwell }), states);
+    return { transitions: transitions.length, moods: new Set(states.filter(s => s.mood).map(s => s.mood)) };
+  };
+
+  const v1 = count('hex');
+  const v2 = count('hex2');
+
+  assert.ok(v1.transitions > 200, `hex-v1 counts the wobble: ${v1.transitions}`);
+  assert.equal(v2.transitions, 0, `hex-v2 sees one steady state: ${v2.transitions}`);
+  assert.equal(v2.moods.size, 1, 'and one cell only');
+});
+
+test('hex-v2 still moves when the market really moves', () => {
+  const start = Date.UTC(2025, 0, 1);
+  const series = [];
+  for (let i = 0; i < 40 * 96; i++) {
+    const ts = start + (i + 1) * 15 * 60 * 1000;
+    const day = Math.floor(i / 96);
+    series.push({
+      ts,
+      month: monthKey(ts - 1),
+      breadth: day < 30 ? 0.85 : 0.1,        // the market turns on day 30
+      actRaw: 1 + 0.6 * Math.sin(i / 7),
+      coverage: 20,
+      universeN: 20,
+      btcClose: 50000
+    });
+  }
+
+  const states = Mo.computeStates(series, 'hex2');
+  const known = states.filter(s => s.mood);
+  const before = known[Math.floor(known.length * 0.4)].mood;
+  const after = known[known.length - 1].mood;
+  assert.notEqual(before, after, 'a real turn still changes the cell');
+  assert.ok(['optimism', 'content', 'euphoria'].includes(before), `rising side: ${before}`);
+  assert.ok(['doubt', 'concern', 'frustration'].includes(after), `falling side: ${after}`);
 });

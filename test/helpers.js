@@ -101,13 +101,19 @@ function response(body, status = 200, headers = {}) {
 
 // failSymbols: requests for these throw (network failure)
 // lag: Map symbol → ms; that contract publishes its candles late
-function createFakeBinance(market, { exchangeSymbols, now, failSymbols = new Set(), lag = new Map() }) {
+// ban: { until } — while now() < until, every request is a 418 IP ban
+function createFakeBinance(market, { exchangeSymbols, now, failSymbols = new Set(), lag = new Map(), ban = { until: null } }) {
   const calls = [];
   const monthlyCache = new Map();
 
   async function fetcher(url) {
     const u = new URL(url);
     calls.push(u.pathname + u.search);
+
+    if (ban.until && now() < ban.until) {
+      const seconds = Math.ceil((ban.until - now()) / 1000);
+      return response({ code: -1003, msg: `Way too many requests; IP banned until ${ban.until}.` }, 418, { 'retry-after': String(seconds) });
+    }
 
     if (u.pathname === '/fapi/v1/exchangeInfo') return response({ symbols: exchangeSymbols });
 

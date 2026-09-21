@@ -58,7 +58,10 @@ function main() {
 
   if (databaseUrl) {
     const { neon } = require('@neondatabase/serverless');
-    sql = neon(databaseUrl);
+    const { withRetry } = require('./lib/db-retry');
+    sql = withRetry(neon(databaseUrl), {
+      onRetry: (err, attempt) => console.warn(`[DB] retry ${attempt}: ${err.message}`)
+    });
   } else {
     console.error('[bot-v2] DATABASE_URL is not set — the lab will report it and store nothing');
   }

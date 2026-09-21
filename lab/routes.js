@@ -22,13 +22,13 @@ function mountLabRoutes(app, { guard, lab }) {
   }));
 
   app.get('/desk/lab/state', guard(async (req, res) => {
-    const model = parseEnum(req.query.model, ['hex'], 'hex');
+    const model = parseEnum(req.query.model, ['hex', 'hex2'], 'hex');
     if (!model.ok) return res.status(400).json({ ok: false, error: `model: ${model.error}` });
-    res.json(lab.state());
+    res.json(lab.state(model.value));
   }));
 
   app.get('/desk/lab/report', guard(async (req, res) => {
-    const model = parseEnum(req.query.model, ['hex', 'linear'], 'hex');
+    const model = parseEnum(req.query.model, ['hex', 'hex2', 'linear'], 'hex');
     if (!model.ok) return res.status(400).json({ ok: false, error: `model: ${model.error}` });
     res.json(lab.report(model.value));
   }));

@@ -65,7 +65,8 @@ const HYPOTHESES = [
     method:
       'Reversal score = −side × excess return (side +1 euphoria, −1 frustration). Pooled t-test; ' +
       'also requires both extremes to agree in sign.',
-    unit: 'pct'
+    unit: 'pct',
+    expect: 1
   },
   {
     id: 'H3',
@@ -75,8 +76,10 @@ const HYPOTHESES = [
       'better than the same jump measured on the linear scale.',
     method:
       'Spearman correlation of |excess return| with each distance over the same transitions; ' +
-      'difference tested with a day-block bootstrap.',
-    unit: 'rho'
+      'difference tested with a day-block bootstrap (standard error from the resamples, p from ' +
+      'the normal tail).',
+    unit: 'rho',
+    expect: 1
   },
   {
     id: 'H4',
@@ -87,7 +90,8 @@ const HYPOTHESES = [
     method:
       'Signed return −sign(BTC 4 h) × excess, diverging vs aligned snapshots ' +
       '(|BTC 4 h| ≥ 0.5 %, |Δ breadth| ≥ 15 points), Welch t.',
-    unit: 'pct'
+    unit: 'pct',
+    expect: 1
   }
 ];
 
@@ -100,7 +104,10 @@ const verdict = (v, reason) => ({ verdict: v, reason });
 // RETURNS
 // ===============================
 
-function forwardAndExcess(series) {
+// Month means are taken per sample (history / live) so that a history
+// outcome only ever depends on history data: nothing recorded after the
+// freeze can move a history number, which is what freezing means.
+function forwardAndExcess(series, sampleOf = () => 'history') {
   const n = series.length;
   const index = new Map();
   series.forEach((s, i) => index.set(s.ts, i));
@@ -113,19 +120,21 @@ function forwardAndExcess(series) {
       if (j !== undefined) fwd[i] = (series[j].btcClose / series[i].btcClose - 1) * 100;
     }
 
+    const keyOf = i => `${series[i].month}|${sampleOf(series[i].ts, h) || 'straddle'}`;
     const byMonth = new Map();
     for (let i = 0; i < n; i++) {
       if (!Number.isFinite(fwd[i])) continue;
-      const acc = byMonth.get(series[i].month) || { sum: 0, count: 0 };
+      const key = keyOf(i);
+      const acc = byMonth.get(key) || { sum: 0, count: 0 };
       acc.sum += fwd[i];
       acc.count++;
-      byMonth.set(series[i].month, acc);
+      byMonth.set(key, acc);
     }
 
     const excess = new Float64Array(n).fill(NaN);
     for (let i = 0; i < n; i++) {
       if (!Number.isFinite(fwd[i])) continue;
-      const acc = byMonth.get(series[i].month);
+      const acc = byMonth.get(keyOf(i));
       excess[i] = fwd[i] - acc.sum / acc.count;
     }
 
@@ -164,7 +173,7 @@ function judgeMean({ history, live }) {
   if (!Number.isFinite(history.pHolm)) return verdict('insufficient', 'no variation in history');
 
   const base = `history ${fmtPct(history.mean)} (t ${fmtNum(history.t, 2)}, p_holm ${fmtP(history.pHolm)}, n ${history.nEff})`;
-  if (history.pHolm >= ALPHA) return verdict('noise', `${base} — indistinguishable from noise`);
+  if (!(history.pHolm < ALPHA)) return verdict('noise', `${base} — indistinguishable from noise`);
 
   if (!(live.nEff >= MIN_CONFIRM)) {
     return verdict('pending', `${base}; live has ${live.nEff}/${MIN_CONFIRM} independent events`);
@@ -419,14 +428,20 @@ function estimateText(result, unit) {
 function judgeHypothesis(def, { history, live }) {
   if (!history.testable) return verdict('insufficient', `history: ${history.reason}`);
 
-  const base = `history ${estimateText(history, def.unit)} (p_holm ${fmtP(history.pHolm)})`;
-  if (history.pHolm >= ALPHA) return verdict('noise', `${base} — not supported`);
+  let base = `history ${estimateText(history, def.unit)} (p_holm ${fmtP(history.pHolm)})`;
+  if (!(history.pHolm < ALPHA)) return verdict('noise', `${base} — not supported`);
 
   if (def.id === 'H2' && !history.detail.alike) {
     return verdict('noise', `${base}, but the two extremes move in opposite directions — not alike`);
   }
 
-  if (!live.testable) return verdict('pending', `${base}; live: ${live.reason}`);
+  // Tested two-sided: a clear result against the statement is still a
+  // result, but it must say which way it runs
+  const opposite = Boolean(def.expect) && Math.sign(history.estimate) === -def.expect;
+  if (opposite) base += ' — the opposite of the statement';
+  const judged = (v, reason) => ({ ...verdict(v, reason), opposite });
+
+  if (!live.testable) return judged('pending', `${base}; live: ${live.reason}`);
 
   const pOne = history.estimate > 0 ? live.pUp : live.pDown;
   live.pOne = pOne;
@@ -434,8 +449,8 @@ function judgeHypothesis(def, { history, live }) {
   const holds = pOne < ALPHA && (def.id !== 'H2' || live.detail.alike);
 
   return holds
-    ? verdict('confirmed', `${base}; ${liveText}`)
-    : verdict('failed', `${base}; ${liveText} — did not hold after the freeze`);
+    ? judged('confirmed', `${base}; ${liveText}`)
+    : judged('failed', `${base}; ${liveText} — did not hold after the freeze`);
 }
 
 // ===============================
@@ -508,7 +523,7 @@ function analyze({ series, modelName, freezeTs, context = {}, now = Date.now(), 
   if (!model) throw new Error(`Unknown model: ${modelName}`);
 
   const sampleOf = makeSampler(freezeTs);
-  const { index, returns } = forwardAndExcess(series);
+  const { index, returns } = forwardAndExcess(series, sampleOf);
   const states = computeStates(series, modelName);
   const episodes = buildEpisodes(states, { minDwell: model.params.minDwell });
   const { transitions, gapped } = buildTransitions(episodes, states);
@@ -590,6 +605,7 @@ module.exports = {
   DIVERGENCE,
   forwardAndExcess,
   makeSampler,
+  judgeHypothesis,
   analyze,
   clean
 };
