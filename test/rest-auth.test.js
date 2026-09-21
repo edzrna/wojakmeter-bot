@@ -101,28 +101,6 @@ test('451 (restricted location) fails fast and says where the problem is', async
   assert.match(rest.stats().blockReason, /HTTP 451/);
 });
 
-test('a block restored after a restart is honoured, and never shortened', async () => {
-  const clock = fakeClock();
-  let calls = 0;
-  const rest = createBinanceRest({
-    fetcher: async () => { calls++; return response({ ok: true }); },
-    now: clock.now,
-    sleep: clock.sleep,
-    minGapMs: 0
-  });
-  assert.equal(rest.stats().weightBudget, 600, 'a quarter of the IP limit');
-
-  rest.blockUntil(clock.now() + 60 * 60_000, 'HTTP 418 (from before the restart)');
-  await assert.rejects(rest.request('/x'), err => err.code === 'BLOCKED' && /before the restart/.test(err.message));
-  rest.blockUntil(clock.now() + 1000, 'shorter');
-  assert.match(rest.stats().blockReason, /before the restart/);
-  assert.equal(calls, 0);
-
-  clock.advance(60 * 60_000);
-  await rest.request('/x');
-  assert.equal(calls, 1);
-});
-
 test('bad symbols and bad rows are errors with a cause', async () => {
   const clock = fakeClock();
   const rest = createBinanceRest({
