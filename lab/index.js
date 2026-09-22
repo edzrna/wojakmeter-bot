@@ -27,6 +27,7 @@ const { createReconstructor, boundariesBetween, lastClosedBoundary } = require('
 const { analyze, clean } = require('./analysis');
 const { MODELS, computeStates, buildEpisodes } = require('./models');
 const topology = require('./hex-topology');
+const V = require('./validation');
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -88,6 +89,7 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
   };
 
   const freeze = {};
+  const validation = {};
   const byTs = new Map();          // ts → { live?, backfill? }
   let unifiedCache = [];
   let dirty = false;
@@ -169,7 +171,7 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
           const dc = Math.abs(slot.live.btcClose / slot.backfill.btcClose - 1);
           maxBreadthDiff = Math.max(maxBreadthDiff, db);
           maxCloseDiff = Math.max(maxCloseDiff, dc);
-          if (db > 1e-12 || dc > 1e-12) mismatches++;
+          if (db > 1e-12 || dc > 1e-12 || ['universeN','actRaw','rvMed','btcC1','btcC24'].some(k => {const a=slot.live[k],b=slot.backfill[k];return a==null||b==null ? a!==b : Math.abs(a-b)>1e-12;})) mismatches++;
         }
       }
       out.push(slot.live || slot.backfill);
@@ -247,6 +249,7 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
       for (const m of Object.values(MODELS)) {
         const stored = await store.ensureMeta(`freeze:${m.version}`, { ts: t }, t);
         freeze[m.name] = Number(stored?.ts);
+        validation[m.name] = await store.getMeta(`validation:${V.POLICY}:${m.version}`);
       }
 
       const done = await store.getMeta('backfill:done');
@@ -433,8 +436,8 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
     const s = typeof rest?.stats === 'function' ? rest.stats() : null;
     const until = s && Number.isFinite(s.blockedUntil) ? s.blockedUntil : null;
     if (!until || until === savedBlockUntil) return;
-    savedBlockUntil = until;
     await store.setMeta('binance:block', { until, reason: s.blockReason }, now());
+    savedBlockUntil = until;
   }
 
   function contextForReport() {
@@ -468,7 +471,21 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
       const context = contextForReport();
       for (const name of Object.keys(MODELS)) {
         await yieldToLoop();
-        reports[name] = analyze({ series, modelName: name, freezeTs: freeze[name], context, now: t });
+        let blocked=V.quality(comparison,status,t-series[series.length-1].ts<=cfg.staleAfterMs);
+        if(!validation[name]&&!blocked){
+          const start=t;
+          validation[name]=await store.ensureMeta(`validation:${V.POLICY}:${MODELS[name].version}`,{start,end:start+V.WINDOW_MS,baseline:V.digest(series.filter(s=>s.ts<start))},t);
+        }
+        const protocol=validation[name];
+        if(protocol&&V.digest(series.filter(s=>s.ts<protocol.start))!==protocol.baseline)blocked='Historical baseline changed after registration; confirmation blocked';
+        const sample=protocol?series.filter(s=>s.ts<=protocol.end):series;
+        if(protocol&&t>=protocol.end&&!blocked){
+          const hash=V.digest(sample);
+          const locked=await store.ensureMeta(`validation-final:${V.POLICY}:${MODELS[name].version}`,{digest:hash},t);
+          if(locked.digest!==hash)blocked='Validation dataset changed after the terminal evaluation';
+        }
+        const result=analyze({series:sample,modelName:name,freezeTs:protocol?.start??freeze[name],context,now:t});
+        reports[name]=V.applyValidation(result,protocol,t,blocked);
       }
       reportVersion = version;
       lastReportAt = t;
@@ -585,7 +602,14 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
 
   function report(modelName) {
     if (!MODELS[modelName]) return { ok: false, error: `Unknown model: ${modelName}` };
-    if (reports[modelName]) return reports[modelName];
+    if (reports[modelName]) {
+      const series=unified();
+      const reason=V.quality(comparison,status,series.length&&now()-series[series.length-1].ts<=cfg.staleAfterMs);
+      if(!reason)return reports[modelName];
+      const copy=JSON.parse(JSON.stringify(reports[modelName]));
+      for(const row of [...copy.screen.rows,...copy.hypotheses.list])for(const h of ['h1','h4','h24'])if(row[h].verdict==='confirmed'){row[h].verdict='pending';row[h].reason=reason;}
+      copy.validation={...copy.validation,blocked:reason,status:'blocked'};return copy;
+    }
     return {
       ok: true,
       pending: true,
@@ -666,7 +690,10 @@ function createLab({ sql, rest, now = Date.now, backfillFrom, log = console, opt
 
   function health() {
     if (status.fatal) return { ok: false, reason: status.fatal };
-    return { ok: true, ready: status.ready };
+    const series=unified();
+    const last=series.at(-1)?.ts??null;
+    const fresh=last!==null&&now()-last<=cfg.staleAfterMs;
+    return {ok:status.ready&&fresh,ready:status.ready,fresh,lastSnapshot:last,reason:!status.ready?'Lab is starting':!fresh?'No recent market snapshot':null};
   }
 
   return {

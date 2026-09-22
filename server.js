@@ -34,6 +34,8 @@ function createApp({ lab, auth }) {
     verify: (req, _res, buf) => { req.rawBody = buf; }
   }));
 
+  app.get('/live', (_req,res) => res.json({ok:true,service:'wojakmeter-lab',trading:false}));
+
   app.get('/health', (req, res) => {
     const h = lab.health();
     res.status(h.ok ? 200 : 503).json(h);

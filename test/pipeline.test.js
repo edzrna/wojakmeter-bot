@@ -242,7 +242,12 @@ test('pipeline: live, gaps, history, reports and the signed desk API', async t =
       assert.equal(replay.body.error, 'Replayed request');
 
       assert.equal((await get('/desk/lab/status', {})).status, 401);
-      assert.deepEqual((await get('/health', {})).body, { ok: true, ready: true });
+      const health=(await get('/health', {})).body;
+      assert.equal(health.ok,true);assert.equal(health.ready,true);assert.equal(health.fresh,true);
+      assert.equal((await get('/live', {})).body.ok,true);
+      const previousClock=clock;clock+=46*MIN;
+      assert.equal((await get('/health', {})).status,503);
+      assert.equal((await get('/live', {})).status,200);clock=previousClock;
       assert.equal((await get('/nope', {})).status, 404);
 
       const v2 = await get('/desk/lab/report?model=hex2');
@@ -275,6 +280,14 @@ test('pipeline: live, gaps, history, reports and the signed desk API', async t =
 
     await lab.tick();
     assert.equal(lab.status().audit.checked, 4, 'not again within the hour');
+  });
+  await t.test('activation-only audit mismatch survives restart and blocks validation',async()=>{
+    const ts=Date.UTC(2026,2,10,12,0);
+    await sql`UPDATE lab_snapshots SET act_raw=act_raw+1 WHERE ts=${ts} AND source='backfill'`;
+    const restarted=createLab({sql,rest,now:()=>clock,backfillFrom:'2026-02',log:quietLog});
+    await restarted.tick();
+    assert(restarted.status().data.liveVsBackfill.mismatches>=1);
+    assert.equal(restarted.report('hex').validation.status,'blocked');
   });
 });
 
